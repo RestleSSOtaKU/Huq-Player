@@ -43,6 +43,8 @@ jobs:
         shell: pwsh
         run: |
           pyinstaller --noconfirm --windowed --name "HRTF_Spatial_Player" `
+            --collect-data sofar `
+            --collect-data pyfar `
             --add-binary "hrtf_core\target\release\hrtf_core.dll;." `
             --add-binary "player_ui\bin\ffmpeg.exe;bin" `
             --add-binary "player_ui\bin\ffprobe.exe;bin" `
