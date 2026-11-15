@@ -3,6 +3,7 @@ import os
 import subprocess
 import json
 import time
+import random
 import numpy as np
 import sounddevice as sd
 import soundfile as sf
@@ -58,6 +59,16 @@ class ResetSlider(QSlider):
             event.accept()
         else:
             super().mouseDoubleClickEvent(event)
+
+class ClickSeekSlider(QSlider):
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton and self.width() > 0:
+            ratio = max(0.0, min(1.0, event.position().x() / float(self.width())))
+            val = int(round(self.minimum() + ratio * (self.maximum() - self.minimum())))
+            self.setValue(val)
+            self.sliderMoved.emit(val)
+            event.accept()
+        super().mousePressEvent(event)
 
 class DeviceComboBox(QComboBox):
     def __init__(self, parent=None):
@@ -286,6 +297,8 @@ class AudioEngine(QObject):
         self.float_mode = False 
         
         self.selected_device = None
+        self.stream_mode_status = "Tip: Select your DAC directly instead of System Default for native sample-rate switching."
+        self.stream_is_exclusive = False
         
         self.sofa_path = ""
         self.sofa_data = None
@@ -626,6 +639,19 @@ class AudioEngine(QObject):
                 clip_off=True
             )
             self.stream.start()
+            if sys.platform == "darwin":
+                if self.selected_device is not None:
+                    self.stream_is_exclusive = True
+                    self.stream_mode_status = f"Direct Hardware Clock ({self.fs / 1000.0:.1f} kHz native — DAC rate locked)"
+                else:
+                    self.stream_is_exclusive = False
+                    self.stream_mode_status = f"System Default ({self.fs / 1000.0:.1f} kHz — select your DAC directly to guarantee native hardware rate)"
+            elif sys.platform == "win32" and extra_settings is not None:
+                self.stream_is_exclusive = True
+                self.stream_mode_status = f"WASAPI Exclusive Mode ({self.fs / 1000.0:.1f} kHz bit-exact — Windows mixer bypassed)"
+            else:
+                self.stream_is_exclusive = False
+                self.stream_mode_status = "Shared Mode (OS mixer active — select a [WASAPI] device for Exclusive)"
         except Exception as e:
             if sys.platform == "win32" and extra_settings is not None:
                 try:
@@ -641,29 +667,36 @@ class AudioEngine(QObject):
                         clip_off=True
                     )
                     self.stream.start()
+                    self.stream_is_exclusive = False
+                    self.stream_mode_status = "Shared Mode fallback (DAC busy in another app — OS resampling may occur)"
                     return
                 except Exception as e2:
                     print(f"Start fallback error: {e2}")
             print(f"Start error: {e}")
+            self.stream_is_exclusive = False
+            self.stream_mode_status = f"Stream failed: {e}"
             self.is_playing = False
             self.playback_stopped.emit()
     def _on_stream_finished(self):
+        if self.manual_stop:
+            return
         self.is_playing = False
         self.playback_stopped.emit()
-        if not self.manual_stop:
-            self.track_finished.emit()
+        self.track_finished.emit()
 
-    def stop(self):
+    def stop(self, fast=False):
         self.manual_stop = True
         if self.stream is not None:
             try:
-                self.stream.stop()
+                if fast:
+                    self.stream.abort()
+                else:
+                    self.stream.stop()
                 self.stream.close()
             except Exception:
                 pass
             self.stream = None
-            time.sleep(0.2)
-        if self.rust_dsp is not None:
+        if not fast and self.rust_dsp is not None:
             self.rust_dsp.reset()
         self.is_playing = False
 
@@ -745,7 +778,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setAcceptDrops(True)
         self.setWindowTitle("HRTF Audio Player")
-        self.setMinimumSize(1100, 750)
+        self.setMinimumSize(1100, 820)
         
         pg.setConfigOptions(antialias=False, enableExperimental=False)
         
@@ -787,6 +820,8 @@ class MainWindow(QMainWindow):
 
         self.library_tracks = []
         self.current_track_index = -1
+        self.shuffle_enabled = False
+        self._raw_cover_pixmap = None
 
         self.engine = AudioEngine()
         self.engine.playback_stopped.connect(self.on_playback_stopped)
@@ -873,6 +908,7 @@ class MainWindow(QMainWindow):
 
         # --- RIGHT SIDE: PLAYER & DSP ---
         right_layout = QVBoxLayout()
+        right_layout.setSpacing(6)
         
         # Top Controls
         file_layout = QHBoxLayout()
@@ -892,7 +928,7 @@ class MainWindow(QMainWindow):
         dev_layout = QHBoxLayout()
         dev_layout.addWidget(QLabel("Output Device:"))
         self.combo_device = DeviceComboBox()
-        self.combo_device.refresh_callback = self.force_refresh_devices
+        self.combo_device.refresh_callback = self.refresh_devices
         self.refresh_devices(initial=True)
         self.combo_device.currentIndexChanged.connect(self.change_device)
         dev_layout.addWidget(self.combo_device, 1)
@@ -901,6 +937,11 @@ class MainWindow(QMainWindow):
         self.lbl_sr.setStyleSheet("color: #ff9500; font-weight: bold;")
         dev_layout.addWidget(self.lbl_sr)
         right_layout.addLayout(dev_layout)
+
+        self.lbl_dev_status = QLabel("Tip: Select your DAC directly instead of System Default for native sample-rate switching.")
+        self.lbl_dev_status.setWordWrap(True)
+        self.lbl_dev_status.setStyleSheet("color: #8e8e93; font-size: 11px; margin-bottom: 4px;")
+        right_layout.addWidget(self.lbl_dev_status)
 
         # Album Art & Track Info
         info_layout = QHBoxLayout()
@@ -940,7 +981,7 @@ class MainWindow(QMainWindow):
         # Seekbar
         seek_layout = QHBoxLayout()
         self.lbl_time_current = QLabel("00:00")
-        self.slider_seek = QSlider(Qt.Horizontal)
+        self.slider_seek = ClickSeekSlider(Qt.Horizontal)
         self.slider_seek.setRange(0, 1000)
         self.slider_seek.sliderMoved.connect(self.seek_audio)
         self.lbl_time_total = QLabel("00:00")
@@ -954,42 +995,49 @@ class MainWindow(QMainWindow):
         btn_layout = QHBoxLayout()
         self.btn_prev = QPushButton("⏮ Prev")
         self.btn_prev.clicked.connect(self.play_prev_track)
-        
+
         self.btn_play = QPushButton("▶ Play")
         self.btn_play.setObjectName("playBtn")
         self.btn_play.setFixedWidth(120)
         self.btn_play.clicked.connect(self.toggle_play)
-        
+
         self.btn_next = QPushButton("Next ⏭")
         self.btn_next.clicked.connect(self.play_next_track)
-        
+
+        self.btn_shuffle = QPushButton("Shuffle: Off")
+        self.btn_shuffle.setCheckable(True)
+        self.btn_shuffle.clicked.connect(self.toggle_shuffle)
+
+        btn_layout.addWidget(self.btn_prev)
+        btn_layout.addWidget(self.btn_play)
+        btn_layout.addWidget(self.btn_next)
+        btn_layout.addWidget(self.btn_shuffle)
+        right_layout.addLayout(btn_layout)
+
+        dsp_btn_layout = QHBoxLayout()
         self.btn_bypass = QPushButton("Bypass DSP")
         self.btn_bypass.setCheckable(True)
         self.btn_bypass.clicked.connect(self.toggle_bypass)
-        
+
         self.btn_bit_perfect = QPushButton("Bit-Perfect: Off")
         self.btn_bit_perfect.setCheckable(True)
         self.btn_bit_perfect.clicked.connect(self.toggle_bit_perfect)
-        
+
         self.btn_highs = QPushButton("Highs Fix: On")
         self.btn_highs.setCheckable(True)
         self.btn_highs.setChecked(True)
         self.btn_highs.clicked.connect(self.toggle_highs)
-        
+
         self.btn_float_mode = QPushButton("Hard Clip (Exact)")
         self.btn_float_mode.setCheckable(True)
-        self.btn_float_mode.setChecked(False) 
+        self.btn_float_mode.setChecked(False)
         self.btn_float_mode.clicked.connect(self.toggle_float_mode)
-        
-        btn_layout.addWidget(self.btn_prev)
-        btn_layout.addWidget(self.btn_play)
-        btn_layout.addWidget(self.btn_next)
-        btn_layout.addSpacing(20)
-        btn_layout.addWidget(self.btn_bypass)
-        btn_layout.addWidget(self.btn_bit_perfect)
-        btn_layout.addWidget(self.btn_highs)
-        btn_layout.addWidget(self.btn_float_mode)
-        right_layout.addLayout(btn_layout)
+
+        dsp_btn_layout.addWidget(self.btn_bypass)
+        dsp_btn_layout.addWidget(self.btn_bit_perfect)
+        dsp_btn_layout.addWidget(self.btn_highs)
+        dsp_btn_layout.addWidget(self.btn_float_mode)
+        right_layout.addLayout(dsp_btn_layout)
 
         # Peak Meter & FPS
         peak_layout = QHBoxLayout()
@@ -1019,6 +1067,8 @@ class MainWindow(QMainWindow):
 
         # Graph
         self.plot_widget = pg.PlotWidget(title="Real-time Spectrum: Input vs Output")
+        self.plot_widget.setMinimumHeight(150)
+        self.plot_widget.setMaximumHeight(285)
         self.plot_widget.setBackground('#1a1a1a')
         self.plot_widget.showGrid(x=True, y=True, alpha=0.3)
         self.plot_widget.setLogMode(x=True, y=False)
@@ -1059,9 +1109,35 @@ class MainWindow(QMainWindow):
         
         right_layout.addWidget(self.plot_widget, stretch=1)
 
-        # DSP Sliders
-        ctrl_layout = QVBoxLayout()
-        ctrl_layout.setSpacing(10)
+        # DSP Sliders (Collapsible)
+        dsp_header_layout = QHBoxLayout()
+        self.btn_toggle_dsp_panel = QPushButton("DSP Controls ▼")
+        self.btn_toggle_dsp_panel.setCheckable(True)
+        self.btn_toggle_dsp_panel.setChecked(False)
+        self.btn_toggle_dsp_panel.clicked.connect(self.toggle_dsp_panel)
+        dsp_header_layout.addWidget(self.btn_toggle_dsp_panel)
+        dsp_header_layout.addSpacing(20)
+        dsp_header_layout.addWidget(QLabel("Volume:"))
+        self.slider_vol = ResetSlider(44, Qt.Horizontal)
+        self.slider_vol.setRange(0, 100)
+        self.slider_vol.setValue(int(round(self.engine.volume * 100)))
+        self.slider_vol.valueChanged.connect(self.update_volume)
+
+        self.lbl_vol = QLabel(f"{int(round(self.engine.volume * 100))} %")
+        self.lbl_vol.setFixedWidth(45)
+        self.lbl_vol.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+
+        dsp_header_layout.addWidget(self.slider_vol, 1)
+        dsp_header_layout.addWidget(self.lbl_vol)
+        right_layout.addLayout(dsp_header_layout)
+
+        self.dsp_panel = QWidget()
+        from PySide6.QtWidgets import QSizePolicy
+        self.dsp_panel.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        self.dsp_panel.setVisible(False)
+        ctrl_layout = QVBoxLayout(self.dsp_panel)
+        ctrl_layout.setContentsMargins(0, 4, 0, 0)
+        ctrl_layout.setSpacing(6)
         
         az_layout = QHBoxLayout()
         az_layout.addWidget(QLabel("Azimuth:"))
@@ -1127,27 +1203,12 @@ class MainWindow(QMainWindow):
         treble_layout.addWidget(self.lbl_treble)
         ctrl_layout.addLayout(treble_layout)
 
-        vol_layout = QHBoxLayout()
-        vol_layout.addWidget(QLabel("Volume:"))
-        self.slider_vol = ResetSlider(44, Qt.Horizontal)
-        self.slider_vol.setRange(0, 100)
-        self.slider_vol.setValue(int(round(self.engine.volume * 100)))
-        self.slider_vol.valueChanged.connect(self.update_volume)
-
-        self.lbl_vol = QLabel(f"{int(round(self.engine.volume * 100))} %")
-        self.lbl_vol.setFixedWidth(55)
-        self.lbl_vol.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-
-        vol_layout.addWidget(self.slider_vol, 1)
-        vol_layout.addWidget(self.lbl_vol)
-        ctrl_layout.addLayout(vol_layout)
-
         self.chk_tonal = QCheckBox("Tonal Match (Neutralize coloration)")
         self.chk_tonal.setChecked(True)
         self.chk_tonal.stateChanged.connect(self.toggle_tonal_match)
         ctrl_layout.addWidget(self.chk_tonal)
 
-        right_layout.addLayout(ctrl_layout)
+        right_layout.addWidget(self.dsp_panel)
         
         main_layout.addLayout(right_layout, stretch=2)
 
@@ -1197,18 +1258,32 @@ class MainWindow(QMainWindow):
         if cover_bytes:
             pixmap = QPixmap()
             pixmap.loadFromData(cover_bytes)
-            self.lbl_cover.setPixmap(pixmap.scaled(120, 120, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            self._raw_cover_pixmap = pixmap.scaled(340, 340, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            self._last_cover_render_key = None
+            self.update_cover_art_size()
         else:
+            self._raw_cover_pixmap = None
             self.lbl_cover.clear()
             self.lbl_cover.setText("No Cover")
             self.lbl_cover.setAlignment(Qt.AlignCenter)
             
         self.load_audio_file(track['path'])
 
+    def toggle_shuffle(self, state):
+        self.shuffle_enabled = bool(state)
+        self.btn_shuffle.setText("Shuffle: On" if self.shuffle_enabled else "Shuffle: Off")
+        if hasattr(self, 'save_session_state'):
+            self.save_session_state()
+
     def play_next_track(self):
         if not self.library_tracks:
             return
-        self.current_track_index = (self.current_track_index + 1) % len(self.library_tracks)
+        n = len(self.library_tracks)
+        if self.shuffle_enabled and n > 1:
+            candidates = [i for i in range(n) if i != self.current_track_index]
+            self.current_track_index = random.choice(candidates)
+        else:
+            self.current_track_index = (self.current_track_index + 1) % n
         item = self.list_widget.item(self.current_track_index)
         self.list_widget.setCurrentItem(item)
         self.play_selected_item(item)
@@ -1385,8 +1460,19 @@ class MainWindow(QMainWindow):
     def change_device(self):
         self.engine.selected_device = self.combo_device.currentData()
         if self.engine.is_playing:
-            self.engine.stop()
+            self.engine.stop(fast=True)
             self.engine.start()
+            if self.engine.is_playing:
+                self.btn_play.setText("⏸ Pause")
+                if not self.timer.isActive():
+                    self.timer.start()
+                if not self.viz_timer.isActive():
+                    self.viz_timer.start()
+            self.lbl_dev_status.setText(self.engine.stream_mode_status)
+            if self.engine.stream_is_exclusive:
+                self.lbl_dev_status.setStyleSheet("color: #34c759; font-size: 11px; font-weight: bold; margin-bottom: 4px;")
+            else:
+                self.lbl_dev_status.setStyleSheet("color: #ff9500; font-size: 11px; font-weight: bold; margin-bottom: 4px;")
 
     def change_fps(self, index):
         fps_map = {0: 100, 1: 33, 2: 16, 3: 8}
@@ -1576,11 +1662,18 @@ class MainWindow(QMainWindow):
             self.timer.stop()
             self.viz_timer.stop()
             self.smoothed_in = None
+            self.lbl_dev_status.setText("Paused — Select your DAC directly instead of System Default for native sample-rate switching.")
+            self.lbl_dev_status.setStyleSheet("color: #8e8e93; font-size: 11px; margin-bottom: 4px;")
         else:
             self.engine.start()
             self.btn_play.setText("⏸ Pause")
             self.timer.start()
             self.viz_timer.start()
+            self.lbl_dev_status.setText(self.engine.stream_mode_status)
+            if self.engine.stream_is_exclusive:
+                self.lbl_dev_status.setStyleSheet("color: #34c759; font-size: 11px; font-weight: bold; margin-bottom: 4px;")
+            else:
+                self.lbl_dev_status.setStyleSheet("color: #ff9500; font-size: 11px; font-weight: bold; margin-bottom: 4px;")
 
     def seek_audio(self, value):
         if self.engine.audio_data is not None:
@@ -1620,6 +1713,15 @@ class MainWindow(QMainWindow):
         self.timer.stop()
         self.viz_timer.stop()
         self.smoothed_in = None
+        self.lbl_dev_status.setText("Stopped — Select your DAC directly instead of System Default for native sample-rate switching.")
+        self.lbl_dev_status.setStyleSheet("color: #8e8e93; font-size: 11px; margin-bottom: 4px;")
+
+    def toggle_dsp_panel(self, checked):
+        visible = bool(checked)
+        self.dsp_panel.setVisible(visible)
+        self.btn_toggle_dsp_panel.setText("DSP Controls ▲" if visible else "DSP Controls ▼")
+        if hasattr(self, 'save_session_state'):
+            self.save_session_state()
 
     def toggle_tonal_match(self, state):
         self.engine.tonal_match_enabled = bool(state)
@@ -1763,6 +1865,7 @@ class MainWindow(QMainWindow):
             self.current_track_index = -1
             self.lbl_track_title.setText("No Track Playing")
             self.lbl_track_artist.setText("Unknown Artist")
+            self._raw_cover_pixmap = None
             self.lbl_cover.clear()
             self.slider_seek.setValue(0)
             self.lbl_time_current.setText("00:00")
@@ -1786,6 +1889,8 @@ class MainWindow(QMainWindow):
                 "current_index": self.current_track_index,
                 "position_sec": pos_sec,
                 "volume": int(round(self.engine.volume * 100)),
+                "shuffle": self.shuffle_enabled,
+                "dsp_panel_open": self.btn_toggle_dsp_panel.isChecked(),
                 "sofa_path": self.engine.sofa_path if os.path.exists(self.engine.sofa_path) else "",
             }
             with open(self._state_file_path(), "w", encoding="utf-8") as f:
@@ -1804,6 +1909,14 @@ class MainWindow(QMainWindow):
             vol = state.get("volume")
             if isinstance(vol, int) and 0 <= vol <= 100:
                 self.slider_vol.setValue(vol)
+
+            shuf = bool(state.get("shuffle", False))
+            self.btn_shuffle.setChecked(shuf)
+            self.toggle_shuffle(shuf)
+
+            panel_open = bool(state.get("dsp_panel_open", False))
+            self.btn_toggle_dsp_panel.setChecked(panel_open)
+            self.toggle_dsp_panel(panel_open)
 
             sofa = state.get("sofa_path", "")
             if sofa and os.path.exists(sofa) and sofa != self.engine.sofa_path:
@@ -1830,12 +1943,53 @@ class MainWindow(QMainWindow):
                 if cover_bytes:
                     pixmap = QPixmap()
                     pixmap.loadFromData(cover_bytes)
-                    self.lbl_cover.setPixmap(pixmap.scaled(120, 120, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+                    self._raw_cover_pixmap = pixmap.scaled(340, 340, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                    self._last_cover_render_key = None
+                    self.update_cover_art_size()
 
                 self._pending_resume_sec = pos_sec
                 self.load_audio_file(track['path'])
         except Exception as e:
             print(f"Failed to load session: {e}")
+
+    def update_cover_art_size(self):
+        h = self.height()
+        size = max(120, min(340, int(h * 0.31)))
+        stepped_size = (size // 4) * 4
+
+        if self.lbl_cover.width() != stepped_size:
+            self.lbl_cover.setFixedSize(stepped_size, stepped_size)
+
+        raw = getattr(self, "_raw_cover_pixmap", None)
+        render_key = (id(raw), stepped_size)
+        if getattr(self, "_last_cover_render_key", None) != render_key:
+            self._last_cover_render_key = render_key
+            if raw is not None and not raw.isNull():
+                self.lbl_cover.setPixmap(
+                    raw.scaled(stepped_size, stepped_size, Qt.KeepAspectRatio, Qt.FastTransformation)
+                )
+
+        scale = max(1.0, min(1.5, h / 820.0))
+        title_px = int(round(18 * scale))
+        if getattr(self, "_last_title_px", None) == title_px:
+            return
+        self._last_title_px = title_px
+
+        artist_px = int(round(13 * scale))
+        if hasattr(self, "lbl_track_title"):
+            f = self.lbl_track_title.font()
+            f.setPixelSize(title_px)
+            f.setBold(True)
+            self.lbl_track_title.setFont(f)
+        if hasattr(self, "lbl_track_artist"):
+            f = self.lbl_track_artist.font()
+            f.setPixelSize(artist_px)
+            self.lbl_track_artist.setFont(f)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, "lbl_cover"):
+            self.update_cover_art_size()
 
     def closeEvent(self, event):
         self.save_session_state()
