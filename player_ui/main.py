@@ -1069,7 +1069,7 @@ class MainWindow(QMainWindow):
         # Graph
         self.plot_widget = pg.PlotWidget(title="Real-time Spectrum: Input vs Output")
         self.plot_widget.setMinimumHeight(150)
-        self.plot_widget.setMaximumHeight(285)
+        self.plot_widget.setMaximumHeight(420)
         self.plot_widget.setBackground('#1a1a1a')
         self.plot_widget.showGrid(x=True, y=True, alpha=0.3)
         self.plot_widget.setLogMode(x=True, y=False)
@@ -1259,7 +1259,7 @@ class MainWindow(QMainWindow):
         if cover_bytes:
             pixmap = QPixmap()
             pixmap.loadFromData(cover_bytes)
-            self._raw_cover_pixmap = pixmap.scaled(340, 340, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            self._raw_cover_pixmap = pixmap.scaled(440, 440, Qt.KeepAspectRatio, Qt.SmoothTransformation)
             self._last_cover_render_key = None
             self.update_cover_art_size()
         else:
@@ -1946,7 +1946,7 @@ class MainWindow(QMainWindow):
                 if cover_bytes:
                     pixmap = QPixmap()
                     pixmap.loadFromData(cover_bytes)
-                    self._raw_cover_pixmap = pixmap.scaled(340, 340, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                    self._raw_cover_pixmap = pixmap.scaled(440, 440, Qt.KeepAspectRatio, Qt.SmoothTransformation)
                     self._last_cover_render_key = None
                     self.update_cover_art_size()
 
@@ -1956,9 +1956,10 @@ class MainWindow(QMainWindow):
             print(f"Failed to load session: {e}")
 
     def update_cover_art_size(self):
+        h = self.height()
         panel_h = self.dsp_panel.sizeHint().height() if (hasattr(self, "dsp_panel") and self.dsp_panel.isVisible()) else 0
-        h = max(600, self.height() - panel_h)
-        size = max(110, min(340, int(h * 0.27)))
+        free_for_cover = self.height() - panel_h - 535
+        size = max(110, min(440, int(free_for_cover)))
         stepped_size = (size // 4) * 4
 
         if self.lbl_cover.width() != stepped_size:
