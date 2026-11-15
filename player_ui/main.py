@@ -31,11 +31,14 @@ if getattr(sys, 'frozen', False):
     sys.stdout = DummyWriter()
     sys.stderr = DummyWriter()
 
-def get_binary_path(name):
+def get_binary_path(bin_name):
     if getattr(sys, 'frozen', False):
         bundle_dir = getattr(sys, '_MEIPASS', os.path.dirname(sys.executable))
-        return os.path.join(bundle_dir, 'bin', name)
-    return name 
+        exe_name = f"{bin_name}.exe" if sys.platform == "win32" else bin_name
+        bundled = os.path.join(bundle_dir, "bin", exe_name)
+        if os.path.exists(bundled):
+            return bundled
+    return bin_name
 
 def get_resource_path(filename):
     if getattr(sys, 'frozen', False):
