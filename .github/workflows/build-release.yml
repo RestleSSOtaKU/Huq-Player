@@ -63,7 +63,7 @@ jobs:
           files: HRTF_Spatial_Player-Windows.zip
 
   build-macos:
-    runs-on: macos-14
+    runs-on: macos-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
