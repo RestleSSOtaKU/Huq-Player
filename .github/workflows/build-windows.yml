@@ -1,0 +1,56 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build Rust DSP library
+        working-directory: hrtf_core
+        run: cargo build --release
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install numpy scipy sounddevice soundfile pyfar pyqtgraph mutagen PySide6 pyinstaller
+
+      - name: Download Windows FFmpeg & FFprobe
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path player_ui\bin | Out-Null
+          Invoke-WebRequest -Uri "https://gyan.dev" -OutFile "ffmpeg.zip"
+          Expand-Archive -Path "ffmpeg.zip" -DestinationPath "ffmpeg_tmp" -Force
+          $binDir = Get-ChildItem -Path "ffmpeg_tmp" -Directory | Select-Object -First 1
+          Copy-Item "$($binDir.FullName)\bin\ffmpeg.exe" -Destination "player_ui\bin\ffmpeg.exe"
+          Copy-Item "$($binDir.FullName)\bin\ffprobe.exe" -Destination "player_ui\bin\ffprobe.exe"
+
+      - name: Bundle Windows EXE with PyInstaller
+        shell: pwsh
+        run: |
+          pyinstaller --noconfirm --windowed --name "HRTF_Spatial_Player" `
+            --add-binary "hrtf_core\target\release\hrtf_core.dll;." `
+            --add-binary "player_ui\bin\ffmpeg.exe;bin" `
+            --add-binary "player_ui\bin\ffprobe.exe;bin" `
+            --add-data "player_ui\default.sofa;." `
+            player_ui\main.py
+
+      - name: Upload Windows ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: HRTF_Spatial_Player-Windows
+          path: dist/HRTF_Spatial_Player/
