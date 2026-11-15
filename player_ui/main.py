@@ -817,6 +817,7 @@ class MainWindow(QMainWindow):
         self.sys_device_timer.setInterval(1000)
         self.sys_device_timer.timeout.connect(self.check_sys_default)
         self.sys_device_timer.start()
+        self.load_session_state()
 
     def check_sys_default(self):
         try:
@@ -829,7 +830,7 @@ class MainWindow(QMainWindow):
         
         if self.last_sys_default != def_name:
             self.last_sys_default = def_name
-            self._devices()
+            self.refresh_devices()
             if self.engine.selected_device is None and self.engine.is_playing:
                 self.engine.stop()
                 self.engine.start()
@@ -862,6 +863,10 @@ class MainWindow(QMainWindow):
 
         self.list_widget = QListWidget()
         self.list_widget.itemDoubleClicked.connect(self.play_selected_item)
+        self.list_widget.setDragDropMode(QListWidget.InternalMove)
+        self.list_widget.setDefaultDropAction(Qt.MoveAction)
+        self.list_widget.setSelectionMode(QListWidget.ExtendedSelection)
+        self.list_widget.model().rowsMoved.connect(self.on_playlist_reordered)
         left_layout.addWidget(self.list_widget, 1)
         
         main_layout.addLayout(left_layout, stretch=1)
@@ -1156,17 +1161,30 @@ class MainWindow(QMainWindow):
             self.scanner_thread.finished_scanning.connect(self.on_scan_finished)
             self.scanner_thread.start()
 
-    def on_scan_finished(self, tracks):
-        self.library_tracks = tracks
-        self.list_widget.clear()
-        
+    def on_scan_finished(self, tracks, auto_play_if_empty=False):
+        was_empty = len(self.library_tracks) == 0
+        existing_paths = {t['path'] for t in self.library_tracks}
+
+        added = 0
         for track in tracks:
-            item = QListWidgetItem(f"{track['title']} - {track['artist']}")
-            item.setData(Qt.UserRole, track)
-            self.list_widget.addItem(item)
-            
-        self.lbl_lib_info.setText(f"{len(tracks)} tracks found")
+            if track['path'] not in existing_paths:
+                self.library_tracks.append(track)
+                existing_paths.add(track['path'])
+                item = QListWidgetItem(f"{track['title']} - {track['artist']}")
+                item.setData(Qt.UserRole, track)
+                self.list_widget.addItem(item)
+                added += 1
+
+        self.lbl_lib_info.setText(f"{len(self.library_tracks)} tracks in playlist")
         self.btn_scan.setEnabled(True)
+
+        if auto_play_if_empty and was_empty and self.library_tracks:
+            item = self.list_widget.item(0)
+            self.list_widget.setCurrentItem(item)
+            self.play_selected_item(item)
+
+        if hasattr(self, 'save_session_state'):
+            self.save_session_state()
 
     def play_selected_item(self, item):
         track = item.data(Qt.UserRole)
@@ -1250,6 +1268,17 @@ class MainWindow(QMainWindow):
             self.btn_export.setEnabled(True)
             
             self.toggle_play()
+
+            resume_sec = getattr(self, "_pending_resume_sec", 0.0)
+            if resume_sec > 0.0:
+                self._pending_resume_sec = 0.0
+                self.toggle_play()  # Pause on startup
+                target_frame = int(resume_sec * self.engine.fs)
+                self.engine.seek(target_frame)
+                self.lbl_time_current.setText(self.format_time(resume_sec))
+                progress = (target_frame / len(self.engine.audio_data)) * 1000
+                self.slider_seek.setValue(int(progress))
+
         else:
             self.lbl_track_title.setText("Error loading file")
 
@@ -1648,11 +1677,7 @@ class MainWindow(QMainWindow):
             event.acceptProposedAction()
 
     def on_dropped_folder_scanned(self, tracks):
-        self.on_scan_finished(tracks)
-        if self.library_tracks:
-            item = self.list_widget.item(0)
-            self.list_widget.setCurrentItem(item)
-            self.play_selected_item(item)
+        self.on_scan_finished(tracks, auto_play_if_empty=True)
 
     def load_dropped_tracks(self, file_paths):
         tracks = []
@@ -1682,11 +1707,140 @@ class MainWindow(QMainWindow):
                 'artist': artist,
             })
 
-        self.on_scan_finished(tracks)
-        if self.library_tracks:
-            item = self.list_widget.item(0)
-            self.list_widget.setCurrentItem(item)
-            self.play_selected_item(item)
+        self.on_scan_finished(tracks, auto_play_if_empty=True)
+        
+    def _state_file_path(self):
+        state_dir = os.path.join(os.path.expanduser("~"), ".hrtf_audio_player")
+        os.makedirs(state_dir, exist_ok=True)
+        return os.path.join(state_dir, "session.json")
+
+    def on_playlist_reordered(self, *args):
+        current_path = None
+        if 0 <= self.current_track_index < len(self.library_tracks):
+            current_path = self.library_tracks[self.current_track_index]['path']
+
+        new_tracks = []
+        for i in range(self.list_widget.count()):
+            track = self.list_widget.item(i).data(Qt.UserRole)
+            if track:
+                new_tracks.append(track)
+        self.library_tracks = new_tracks
+
+        if current_path:
+            for i, t in enumerate(self.library_tracks):
+                if t['path'] == current_path:
+                    self.current_track_index = i
+                    break
+        self.save_session_state()
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key_Delete, Qt.Key_Backspace) and self.list_widget.hasFocus():
+            self.remove_selected_tracks()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def remove_selected_tracks(self):
+        selected_rows = sorted([self.list_widget.row(item) for item in self.list_widget.selectedItems()], reverse=True)
+        if not selected_rows:
+            return
+
+        current_path = None
+        if 0 <= self.current_track_index < len(self.library_tracks):
+            current_path = self.library_tracks[self.current_track_index]['path']
+
+        playing_removed = self.current_track_index in selected_rows
+
+        for row in selected_rows:
+            self.list_widget.takeItem(row)
+            if 0 <= row < len(self.library_tracks):
+                self.library_tracks.pop(row)
+
+        self.lbl_lib_info.setText(f"{len(self.library_tracks)} tracks" if self.library_tracks else "Library empty")
+
+        if playing_removed:
+            self.engine.stop()
+            self.current_track_index = -1
+            self.lbl_track_title.setText("No Track Playing")
+            self.lbl_track_artist.setText("Unknown Artist")
+            self.lbl_cover.clear()
+            self.slider_seek.setValue(0)
+            self.lbl_time_current.setText("00:00")
+            self.lbl_time_total.setText("00:00")
+        elif current_path:
+            for i, t in enumerate(self.library_tracks):
+                if t['path'] == current_path:
+                    self.current_track_index = i
+                    break
+
+        self.save_session_state()
+
+    def save_session_state(self):
+        try:
+            pos_sec = 0.0
+            if self.engine.audio_data is not None and self.engine.fs:
+                pos_sec = self.engine.current_frame / float(self.engine.fs)
+
+            state = {
+                "tracks": self.library_tracks,
+                "current_index": self.current_track_index,
+                "position_sec": pos_sec,
+                "volume": int(round(self.engine.volume * 100)),
+                "sofa_path": self.engine.sofa_path if os.path.exists(self.engine.sofa_path) else "",
+            }
+            with open(self._state_file_path(), "w", encoding="utf-8") as f:
+                json.dump(state, f, indent=2)
+        except Exception as e:
+            print(f"Failed to save session: {e}")
+
+    def load_session_state(self):
+        state_path = self._state_file_path()
+        if not os.path.exists(state_path):
+            return
+        try:
+            with open(state_path, "r", encoding="utf-8") as f:
+                state = json.load(f)
+
+            vol = state.get("volume")
+            if isinstance(vol, int) and 0 <= vol <= 100:
+                self.slider_vol.setValue(vol)
+
+            sofa = state.get("sofa_path", "")
+            if sofa and os.path.exists(sofa) and sofa != self.engine.sofa_path:
+                self.lbl_sofa_file.setText(os.path.basename(sofa))
+                self.engine.load_sofa(sofa)
+
+            saved_tracks = [t for t in state.get("tracks", []) if os.path.exists(t.get("path", ""))]
+            if not saved_tracks:
+                return
+
+            self.on_scan_finished(saved_tracks)
+            idx = state.get("current_index", -1)
+            pos_sec = float(state.get("position_sec", 0.0))
+
+            if 0 <= idx < len(self.library_tracks):
+                item = self.list_widget.item(idx)
+                self.list_widget.setCurrentItem(item)
+                self.current_track_index = idx
+                track = self.library_tracks[idx]
+                self.lbl_track_title.setText(track['title'])
+                self.lbl_track_artist.setText(track['artist'])
+
+                cover_bytes = _extract_cover_bytes(track['path'])
+                if cover_bytes:
+                    pixmap = QPixmap()
+                    pixmap.loadFromData(cover_bytes)
+                    self.lbl_cover.setPixmap(pixmap.scaled(120, 120, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+
+                self._pending_resume_sec = pos_sec
+                self.load_audio_file(track['path'])
+        except Exception as e:
+            print(f"Failed to load session: {e}")
+
+    def closeEvent(self, event):
+        self.save_session_state()
+        self.engine.stop()
+        event.accept()
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
