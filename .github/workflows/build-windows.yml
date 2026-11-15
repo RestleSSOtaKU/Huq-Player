@@ -29,15 +29,15 @@ jobs:
           python -m pip install --upgrade pip
           pip install numpy scipy sounddevice soundfile pyfar pyqtgraph mutagen PySide6 pyinstaller
 
-      - name: Download Windows FFmpeg & FFprobe
+      - name: Install FFmpeg & FFprobe
+        uses: FedericoCarboni/setup-ffmpeg@v3
+
+      - name: Copy FFmpeg binaries
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path player_ui\bin | Out-Null
-          Invoke-WebRequest -Uri "https://gyan.dev" -OutFile "ffmpeg.zip"
-          Expand-Archive -Path "ffmpeg.zip" -DestinationPath "ffmpeg_tmp" -Force
-          $binDir = Get-ChildItem -Path "ffmpeg_tmp" -Directory | Select-Object -First 1
-          Copy-Item "$($binDir.FullName)\bin\ffmpeg.exe" -Destination "player_ui\bin\ffmpeg.exe"
-          Copy-Item "$($binDir.FullName)\bin\ffprobe.exe" -Destination "player_ui\bin\ffprobe.exe"
+          Copy-Item (Get-Command ffmpeg.exe).Source -Destination "player_ui\bin\ffmpeg.exe"
+          Copy-Item (Get-Command ffprobe.exe).Source -Destination "player_ui\bin\ffprobe.exe"
 
       - name: Bundle Windows EXE with PyInstaller
         shell: pwsh
