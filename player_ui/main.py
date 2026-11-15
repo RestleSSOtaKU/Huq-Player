@@ -23,6 +23,7 @@ from PySide6.QtCore import Qt, QTimer, Signal, QObject, QThread, QSize
 from PySide6.QtGui import QPixmap, QIcon
 from dsp_bridge import RustDspBridge
 
+SUBPROCESS_FLAGS = {"creationflags": 0x08000000} if sys.platform == "win32" else {}
 
 if getattr(sys, 'frozen', False):
     class DummyWriter:
@@ -171,7 +172,7 @@ class LoaderThread(QThread):
             ffmpeg_bin = get_binary_path('ffmpeg')
 
             cmd = [ffprobe_bin, '-v', 'quiet', '-print_format', 'json', '-show_streams', self.filepath]
-            result = subprocess.run(cmd, capture_output=True, text=True)
+            result = subprocess.run(cmd, capture_output=True, text=True, **SUBPROCESS_FLAGS)
             info = json.loads(result.stdout)
             
             audio_stream = next((s for s in info.get('streams', []) if s.get('codec_type') == 'audio'), None)
@@ -181,7 +182,7 @@ class LoaderThread(QThread):
             fs = int(audio_stream.get('sample_rate', 48000))
             
             cmd = [ffmpeg_bin, '-i', self.filepath, '-f', 'f32le', '-ac', '2', '-ar', str(fs), '-']
-            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **SUBPROCESS_FLAGS)
             raw_data, err = process.communicate()
             
             if process.returncode != 0 and not raw_data:
@@ -742,7 +743,8 @@ class AudioEngine(QObject):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("HRTF Spatial Player")
+        self.setAcceptDrops(True)
+        self.setWindowTitle("HRTF Audio Player")
         self.setMinimumSize(1100, 750)
         
         pg.setConfigOptions(antialias=False, enableExperimental=False)
@@ -1368,12 +1370,12 @@ class MainWindow(QMainWindow):
         
     def toggle_dsp_perf(self, state):
         enabled = bool(state)
-        self.engine.avg_dsp_ms = 0.0
-        self.engine.max_dsp_ms = 0.0
+        self.engine.dsp_hist_idx = 0
+        self.engine.dsp_hist_count = 0
         self.btn_dsp_perf.setText("DSP Time: On" if enabled else "DSP Time: Off")
         self.lbl_dsp_perf.setVisible(enabled)
         if not enabled:
-         self.lbl_dsp_perf.setText("")
+            self.lbl_dsp_perf.setText("")
 
     def toggle_float_mode(self, state):
         self.engine.float_mode = bool(state)
@@ -1600,6 +1602,91 @@ class MainWindow(QMainWindow):
         self.engine.volume = val / 100.0
         self.lbl_vol.setText(f"{val} %")
         self.engine._sync_rust_params()
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event):
+        urls = event.mimeData().urls()
+        if not urls:
+            return
+
+        valid_exts = ('.flac', '.wav', '.mp3', '.m4a', '.ogg', '.opus')
+        dropped_files = []
+        dropped_folder = None
+        dropped_sofa = None
+
+        for url in urls:
+            path = url.toLocalFile()
+            if not path or not os.path.exists(path):
+                continue
+            if os.path.isdir(path):
+                dropped_folder = path
+            elif path.lower().endswith('.sofa'):
+                dropped_sofa = path
+            elif path.lower().endswith(valid_exts):
+                dropped_files.append(path)
+
+        if dropped_sofa:
+            self.lbl_sofa_file.setText(os.path.basename(dropped_sofa))
+            self.engine.load_sofa(dropped_sofa)
+
+        if dropped_folder:
+            self.btn_scan.setEnabled(False)
+            self.lbl_lib_info.setText("Scanning...")
+            self.scanner_thread = ScannerThread(dropped_folder)
+            self.scanner_thread.finished_scanning.connect(self.on_dropped_folder_scanned)
+            self.scanner_thread.start()
+            event.acceptProposedAction()
+            return
+
+        if dropped_files:
+            self.load_dropped_tracks(dropped_files)
+            event.acceptProposedAction()
+
+    def on_dropped_folder_scanned(self, tracks):
+        self.on_scan_finished(tracks)
+        if self.library_tracks:
+            item = self.list_widget.item(0)
+            self.list_widget.setCurrentItem(item)
+            self.play_selected_item(item)
+
+    def load_dropped_tracks(self, file_paths):
+        tracks = []
+        for path in sorted(file_paths):
+            file = os.path.basename(path)
+            title = file
+            artist = "Unknown Artist"
+            try:
+                audio = mutagen.File(path)
+                if audio:
+                    if isinstance(audio, FLAC):
+                        title = audio.get('title', [file])[0]
+                        artist = audio.get('artist', ["Unknown Artist"])[0]
+                    elif isinstance(audio, (MP3, MP4)) and audio.tags:
+                        if isinstance(audio.tags, ID3):
+                            title = str(audio.tags.get('TIT2', file))
+                            artist = str(audio.tags.get('TPE1', "Unknown Artist"))
+                        else:
+                            title = audio.tags.get('\xa9nam', [file])[0]
+                            artist = audio.tags.get('\xa9ART', ["Unknown Artist"])[0]
+            except Exception:
+                pass
+
+            tracks.append({
+                'path': path,
+                'title': title,
+                'artist': artist,
+            })
+
+        self.on_scan_finished(tracks)
+        if self.library_tracks:
+            item = self.list_widget.item(0)
+            self.list_widget.setCurrentItem(item)
+            self.play_selected_item(item)
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
