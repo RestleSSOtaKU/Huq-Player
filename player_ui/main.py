@@ -980,6 +980,7 @@ class MainWindow(QMainWindow):
 
         # Seekbar
         seek_layout = QHBoxLayout()
+        seek_layout.setContentsMargins(0, 8, 0, 2)
         self.lbl_time_current = QLabel("00:00")
         self.slider_seek = ClickSeekSlider(Qt.Horizontal)
         self.slider_seek.setRange(0, 1000)
@@ -1720,6 +1721,8 @@ class MainWindow(QMainWindow):
         visible = bool(checked)
         self.dsp_panel.setVisible(visible)
         self.btn_toggle_dsp_panel.setText("DSP Controls ▲" if visible else "DSP Controls ▼")
+        if hasattr(self, "lbl_cover"):
+            self.update_cover_art_size()
         if hasattr(self, 'save_session_state'):
             self.save_session_state()
 
@@ -1953,8 +1956,9 @@ class MainWindow(QMainWindow):
             print(f"Failed to load session: {e}")
 
     def update_cover_art_size(self):
-        h = self.height()
-        size = max(120, min(340, int(h * 0.31)))
+        panel_h = self.dsp_panel.sizeHint().height() if (hasattr(self, "dsp_panel") and self.dsp_panel.isVisible()) else 0
+        h = max(600, self.height() - panel_h)
+        size = max(110, min(340, int(h * 0.27)))
         stepped_size = (size // 4) * 4
 
         if self.lbl_cover.width() != stepped_size:
