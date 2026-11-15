@@ -107,7 +107,9 @@ jobs:
 
       - name: Ad-Hoc Code Sign .app & Create .dmg
         run: |
-          codesign --deep --force --options runtime --sign - "dist/HRTF Audio Player.app"
+          find "dist/HRTF Audio Player.app" -type f \( -name "*.dylib" -o -name "*.so" \) -exec codesign --force --sign - {} \;
+          codesign --force --sign - "dist/HRTF Audio Player.app/Contents/Frameworks/Python.framework/Versions/3.12/Python" || true
+          codesign --deep --force --sign - "dist/HRTF Audio Player.app"
           mkdir -p dmg_stage
           cp -R "dist/HRTF Audio Player.app" dmg_stage/
           ln -s /Applications dmg_stage/Applications
