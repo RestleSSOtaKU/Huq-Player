@@ -340,11 +340,15 @@ class AudioEngine(QObject):
 
     def _ensure_rust_engine(self):
         if self.rust_dsp is None or self._rust_fs != self.fs or self._rust_fft_size != self.N:
-            self.rust_dsp = RustDspBridge(fs=self.fs, block_size=self.block_size, fft_size=self.N)
-            self._rust_fs = self.fs
-            self._rust_fft_size = self.N
-            self._sync_rust_params()
-            self._push_rust_filters()
+            try:
+                self.rust_dsp = RustDspBridge(fs=self.fs, block_size=self.block_size, fft_size=self.N)
+                self._rust_fs = self.fs
+                self._rust_fft_size = self.N
+                self._sync_rust_params()
+                self._push_rust_filters()
+            except Exception as e:
+                print(f"Rust DSP init failed: {e}")
+                QMessageBox.warning(None, "Rust DSP Warning", f"Could not load Rust DSP engine:\n{e}")
 
     def _sync_rust_params(self):
         if self.rust_dsp is not None:

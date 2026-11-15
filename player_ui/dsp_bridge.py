@@ -7,6 +7,8 @@ def _default_lib_path():
     if getattr(sys, "frozen", False):
         bundle_dir = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
         if sys.platform == "win32":
+            if hasattr(os, "add_dll_directory") and os.path.isdir(bundle_dir):
+                os.add_dll_directory(bundle_dir)
             return os.path.join(bundle_dir, "hrtf_core.dll")
         elif sys.platform == "darwin":
             return os.path.join(bundle_dir, "libhrtf_core.dylib")
@@ -18,6 +20,7 @@ def _default_lib_path():
     elif sys.platform == "darwin":
         return os.path.join(base_dir, "libhrtf_core.dylib")
     return os.path.join(base_dir, "libhrtf_core.so")
+
 
 class DspParams(ctypes.Structure):
     _fields_ = [
@@ -32,8 +35,6 @@ class DspParams(ctypes.Structure):
 
 class RustDspBridge:
     def __init__(self, fs, block_size=4096, fft_size=16384, lib_path=None):
-        path = lib_path or _default_lib_path()
-        self.lib = ctypes.CDLL(path)
         path = lib_path or _default_lib_path()
         self.lib = ctypes.CDLL(path)
         print(f"[Rust DSP] Loaded native engine: {path}")
