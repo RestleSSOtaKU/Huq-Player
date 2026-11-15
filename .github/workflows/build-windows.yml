@@ -5,6 +5,9 @@ on:
     branches: [ main ]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: windows-latest
@@ -50,9 +53,11 @@ jobs:
             --add-binary "player_ui\bin\ffprobe.exe;bin" `
             --add-data "player_ui\default.sofa;." `
             player_ui\main.py
+          Compress-Archive -Path "dist\HRTF_Spatial_Player\*" -DestinationPath "HRTF_Spatial_Player-Windows.zip" -Force
 
-      - name: Upload Windows ZIP
-        uses: actions/upload-artifact@v4
+      - name: Publish to GitHub Releases
+        uses: softprops/action-gh-release@v2
         with:
-          name: HRTF_Spatial_Player-Windows
-          path: dist/HRTF_Spatial_Player/
+          tag_name: latest-win
+          name: Windows Build (Latest)
+          files: HRTF_Spatial_Player-Windows.zip
