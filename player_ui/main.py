@@ -596,6 +596,15 @@ class AudioEngine(QObject):
                     change_device_parameters=True,
                     fail_if_conversion_required=True
                 )
+            elif sys.platform == "win32":
+                use_wasapi_excl = True
+                if self.selected_device is not None:
+                    dev_info = sd.query_devices(self.selected_device)
+                    api_name = sd.query_hostapis(dev_info['hostapi'])['name']
+                    use_wasapi_excl = "WASAPI" in api_name
+                if use_wasapi_excl:
+                    extra_settings = sd.WasapiSettings(exclusive=True)
+
             self.stream = sd.OutputStream(
                 samplerate=self.fs,
                 blocksize=self.block_size,
@@ -610,10 +619,26 @@ class AudioEngine(QObject):
             )
             self.stream.start()
         except Exception as e:
+            if sys.platform == "win32" and extra_settings is not None:
+                try:
+                    self.stream = sd.OutputStream(
+                        samplerate=self.fs,
+                        blocksize=self.block_size,
+                        channels=2,
+                        callback=self._audio_callback,
+                        finished_callback=self._on_stream_finished,
+                        dtype='float32',
+                        latency='high',
+                        device=self.selected_device,
+                        clip_off=True
+                    )
+                    self.stream.start()
+                    return
+                except Exception as e2:
+                    print(f"Start fallback error: {e2}")
             print(f"Start error: {e}")
             self.is_playing = False
             self.playback_stopped.emit()
-
     def _on_stream_finished(self):
         self.is_playing = False
         self.playback_stopped.emit()
@@ -795,7 +820,7 @@ class MainWindow(QMainWindow):
         
         if self.last_sys_default != def_name:
             self.last_sys_default = def_name
-            self.refresh_devices()
+            self._devices()
             if self.engine.selected_device is None and self.engine.is_playing:
                 self.engine.stop()
                 self.engine.start()
@@ -1274,17 +1299,26 @@ class MainWindow(QMainWindow):
         self.combo_device.blockSignals(True)
         try:
             devices = sd.query_devices()
-            
+            hostapis = sd.query_hostapis()
             try:
-                sys_def_device = sd.query_devices(kind='output')
-                sys_def_name = sys_def_device['name'] if sys_def_device else "Unknown"
+                sys_def = sd.query_devices(kind='output')
+                sys_def_name = sys_def['name'] if sys_def else "Unknown"
             except Exception:
                 sys_def_name = "Unknown"
-            
-            new_items = [(f"System Default ({sys_def_name})", None)]
-            for i, dev in enumerate(devices):
-                if dev['max_output_channels'] > 0:
-                    new_items.append((dev['name'], i))
+
+            dev_list = []
+            for i, d in enumerate(devices):
+                if d['max_output_channels'] <= 0:
+                    continue
+                if sys.platform == "win32":
+                    api_name = hostapis[d['hostapi']]['name']
+                    if "WASAPI" not in api_name and "ASIO" not in api_name:
+                        continue
+                    dev_list.append((f"[{api_name.replace('Windows ', '')}] {d['name']}", i))
+                else:
+                    dev_list.append((d['name'], i))
+
+            new_items = [(f"System Default ({sys_def_name})", None)] + dev_list
             
             current_items = [(self.combo_device.itemText(i), self.combo_device.itemData(i)) for i in range(self.combo_device.count())]
             
