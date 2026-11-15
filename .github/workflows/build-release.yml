@@ -45,7 +45,7 @@ jobs:
       - name: Bundle Windows EXE with PyInstaller
         shell: pwsh
         run: |
-          pyinstaller --noconfirm --windowed --name "HRTF_Spatial_Player" `
+          pyinstaller --noconfirm --windowed --name "HRTF_Audio_Player" `
             --collect-data sofar `
             --collect-data pyfar `
             --add-binary "hrtf_core\target\release\hrtf_core.dll;." `
@@ -53,14 +53,14 @@ jobs:
             --add-binary "player_ui\bin\ffprobe.exe;bin" `
             --add-data "player_ui\default.sofa;." `
             player_ui\main.py
-          Compress-Archive -Path "dist\HRTF_Spatial_Player\*" -DestinationPath "HRTF_Spatial_Player-Windows.zip" -Force
+          Compress-Archive -Path "dist\HRTF_Audio_Player\*" -DestinationPath "HRTF_Audio_Player-Windows.zip" -Force
 
       - name: Upload Windows Release Asset
         uses: softprops/action-gh-release@v2
         with:
           tag_name: latest
-          name: HRTF Spatial Player (Latest)
-          files: HRTF_Spatial_Player-Windows.zip
+          name: HRTF Audio Player (Latest)
+          files: HRTF_Audio_Player-Windows.zip
 
   build-macos:
     runs-on: macos-latest
@@ -95,7 +95,7 @@ jobs:
 
       - name: Bundle macOS .app with PyInstaller
         run: |
-          pyinstaller --noconfirm --windowed --name "HRTF Spatial Player" \
+          pyinstaller --noconfirm --windowed --name "HRTF Audio Player" \
             --osx-bundle-identifier "com.restlessotaku.hrtfplayer" \
             --collect-data sofar \
             --collect-data pyfar \
@@ -107,18 +107,18 @@ jobs:
 
       - name: Ad-Hoc Code Sign .app & Create .dmg
         run: |
-          codesign --deep --force --options runtime --sign - "dist/HRTF Spatial Player.app"
+          codesign --deep --force --options runtime --sign - "dist/HRTF Audio Player.app"
           mkdir -p dmg_stage
-          cp -R "dist/HRTF Spatial Player.app" dmg_stage/
+          cp -R "dist/HRTF Audio Player.app" dmg_stage/
           ln -s /Applications dmg_stage/Applications
-          hdiutil create -volname "HRTF Spatial Player" \
+          hdiutil create -volname "HRTF Audio Player" \
             -srcfolder dmg_stage \
             -ov -format UDZO \
-            "HRTF_Spatial_Player-macOS-AppleSilicon.dmg"
+            "HRTF_Audio_Player-macOS-AppleSilicon.dmg"
 
       - name: Upload macOS .dmg Release Asset
         uses: softprops/action-gh-release@v2
         with:
           tag_name: latest
-          name: HRTF Spatial Player (Latest)
-          files: HRTF_Spatial_Player-macOS-AppleSilicon.dmg
+          name: HRTF Audio Player (Latest)
+          files: HRTF_Audio_Player-macOS-AppleSilicon.dmg

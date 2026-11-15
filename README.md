@@ -40,8 +40,8 @@ hrtf-player/
 
 Download the latest builds from the [**Releases**](../../releases) page:
 
-* **Windows (`HRTF_Spatial_Player-Windows.zip`):** Extract the full archive and run `HRTF_Spatial_Player.exe`.
-* **macOS Apple Silicon (`HRTF_Spatial_Player-macOS-AppleSilicon.dmg`):** Open the `.dmg`, drag the app to **Applications**, and use **Right-Click → Open** on first launch (ad-hoc signed).
+* **Windows (`HRTF_Audio_Player-Windows.zip`):** Extract the full archive and run `HRTF_Audio_Player.exe`.
+* **macOS Apple Silicon (`HRTF_Audio_Player-macOS-AppleSilicon.dmg`):** Open the `.dmg`, drag the app to **Applications**, and use **Right-Click → Open** on first launch (ad-hoc signed).
 
 ---
 
