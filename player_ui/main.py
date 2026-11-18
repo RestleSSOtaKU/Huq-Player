@@ -6,16 +6,100 @@ import time
 import random
 import numpy as np
 import sounddevice as sd
-import soundfile as sf
-from scipy.signal import fftconvolve, welch, firwin2, resample_poly, sosfilt, butter
-from scipy.ndimage import uniform_filter1d
-import pyfar as pf
 import pyqtgraph as pg
-import mutagen
-from mutagen.flac import FLAC
-from mutagen.id3 import ID3
-from mutagen.mp3 import MP3
-from mutagen.mp4 import MP4
+
+_pf = None
+_resample_poly = None
+_mutagen_mods = None
+
+def _get_pyfar():
+    global _pf
+    if _pf is None:
+        import pyfar as pf
+        _pf = pf
+    return _pf
+
+def _get_resample_poly():
+    global _resample_poly
+    if _resample_poly is None:
+        from scipy.signal import resample_poly
+        _resample_poly = resample_poly
+    return _resample_poly
+
+def _get_mutagen():
+    global _mutagen_mods
+    if _mutagen_mods is None:
+        import mutagen
+        from mutagen.flac import FLAC
+        from mutagen.id3 import ID3
+        from mutagen.mp3 import MP3
+        from mutagen.mp4 import MP4
+        _mutagen_mods = (mutagen, FLAC, ID3, MP3, MP4)
+    return _mutagen_mods
+
+def _fast_fftconvolve(a, b):
+    n = len(a) + len(b) - 1
+    n_fft = 1 << (n - 1).bit_length()
+    return np.fft.irfft(np.fft.rfft(a, n=n_fft) * np.fft.rfft(b, n=n_fft), n=n_fft)[:n]
+
+def _fast_welch(x, fs, nperseg):
+    x = np.asarray(x, dtype=np.float64)
+    nperseg = min(int(nperseg), len(x))
+    if nperseg < 16:
+        return np.fft.rfftfreq(16, 1.0 / fs), np.zeros(9)
+    step = max(1, nperseg // 2)
+    win = np.hanning(nperseg)
+    scale = 1.0 / (fs * np.sum(win * win))
+    n_segs = max(1, (len(x) - nperseg) // step + 1)
+    acc = np.zeros(nperseg // 2 + 1, dtype=np.float64)
+    for idx in range(n_segs):
+        seg = x[idx * step : idx * step + nperseg]
+        if len(seg) < nperseg:
+            break
+        seg = (seg - np.mean(seg)) * win
+        acc += np.abs(np.fft.rfft(seg)) ** 2
+    acc = (acc / n_segs) * scale
+    if len(acc) > 2:
+        acc[1:-1] *= 2.0
+    elif len(acc) == 2:
+        acc *= 2.0
+    return np.fft.rfftfreq(nperseg, 1.0 / fs), acc
+
+def _fast_uniform_filter1d(arr, size):
+    if size <= 1 or len(arr) == 0:
+        return arr.copy()
+    pad_l = size // 2
+    padded = np.pad(arr, (pad_l, size - 1 - pad_l), mode='edge')
+    csum = np.empty(len(padded) + 1, dtype=np.float64)
+    csum[0] = 0.0
+    np.cumsum(padded, dtype=np.float64, out=csum[1:])
+    return (csum[size:] - csum[:-size]) / float(size)
+
+def _fast_firwin2(numtaps, freq, gain):
+    n_fft = 1 << max(12, int(np.ceil(np.log2(numtaps * 4))))
+    f_dense = np.linspace(0.0, 1.0, n_fft // 2 + 1)
+    mag_dense = np.interp(f_dense, freq, gain)
+    k = np.arange(len(f_dense))
+    phase = np.exp(-1j * np.pi * k * (((numtaps - 1) / 2.0) / (n_fft / 2.0)))
+    return np.fft.irfft(mag_dense * phase, n=n_fft)[:numtaps] * np.blackman(numtaps)
+
+def _fast_resample(x, orig_fs, target_fs):
+    if orig_fs == target_fs:
+        return x
+    new_len = max(1, int(round(len(x) * float(target_fs) / float(orig_fs))))
+    return np.interp(np.linspace(0.0, 1.0, new_len, endpoint=False), np.linspace(0.0, 1.0, len(x), endpoint=False), x)
+
+def _fast_sosfilt(sos, x):
+    b0, b1, b2, _, a1, a2 = sos
+    y = np.empty_like(x, dtype=np.float64)
+    z1 = z2 = 0.0
+    for i in range(len(x)):
+        xi = float(x[i])
+        yi = b0 * xi + z1
+        z1 = b1 * xi - a1 * yi + z2
+        z2 = b2 * xi - a2 * yi
+        y[i] = yi
+    return y
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                                QHBoxLayout, QPushButton, QSlider, QLabel, 
                                QFileDialog, QCheckBox, QSpinBox, QMessageBox,
@@ -110,6 +194,7 @@ def _high_shelf_sos(fc, gain_db, Q, fs):
 
 def _extract_cover_bytes(path):
     try:
+        mutagen, FLAC, ID3, MP3, MP4 = _get_mutagen()
         audio = mutagen.File(path)
         if not audio:
             return None
@@ -145,6 +230,7 @@ class ScannerThread(QThread):
                     artist = "Unknown Artist"
                     
                     try:
+                        mutagen, FLAC, ID3, MP3, MP4 = _get_mutagen()
                         audio = mutagen.File(path)
                         if audio:
                             if isinstance(audio, FLAC):
@@ -192,7 +278,7 @@ class LoaderThread(QThread):
                 
             fs = int(audio_stream.get('sample_rate', 48000))
             
-            cmd = [ffmpeg_bin, '-i', self.filepath, '-f', 'f32le', '-ac', '2', '-ar', str(fs), '-']
+            cmd = [ffmpeg_bin, '-nostdin', '-v', 'error', '-i', self.filepath, '-f', 'f32le', '-ac', '2', '-ar', str(fs), '-']
             process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **SUBPROCESS_FLAGS)
             raw_data, err = process.communicate()
             
@@ -205,7 +291,8 @@ class LoaderThread(QThread):
             self.result_fs = fs
             
             self.finished_loading.emit(True, self.filepath)
-        except Exception:
+        except Exception as e:
+            print(f"LoaderThread error: {e}")
             self.finished_loading.emit(False, "")
 
 class ExportThread(QThread):
@@ -223,6 +310,7 @@ class ExportThread(QThread):
 
             if self.engine.bit_perfect:
                 out_data = np.stack([L_in, R_in], axis=1)
+                import soundfile as sf
                 sf.write(self.filename, out_data, self.engine.fs, subtype='PCM_24')
                 self.finished_export.emit(True, self.filename)
                 return
@@ -235,6 +323,7 @@ class ExportThread(QThread):
                     np.clip(R_out, -1.0, 1.0, out=R_out)
                 
                 out_data = np.stack([L_out, R_out], axis=1)
+                import soundfile as sf
                 sf.write(self.filename, out_data, self.engine.fs, subtype='PCM_24')
                 self.finished_export.emit(True, self.filename)
                 return
@@ -244,16 +333,16 @@ class ExportThread(QThread):
             h_LR = np.fft.irfft(self.engine.h_LR_fft, n=self.engine.N)
             h_RR = np.fft.irfft(self.engine.h_RR_fft, n=self.engine.N)
 
-            L_out = fftconvolve(L_in, h_LL) + fftconvolve(R_in, h_RL)
-            R_out = fftconvolve(L_in, h_LR) + fftconvolve(R_in, h_RR)
+            L_out = _fast_fftconvolve(L_in, h_LL) + _fast_fftconvolve(R_in, h_RL)
+            R_out = _fast_fftconvolve(L_in, h_LR) + _fast_fftconvolve(R_in, h_RR)
 
             if self.engine.bass_gain != 0.0:
-                L_out = sosfilt(self.engine.sos_bass, L_out)
-                R_out = sosfilt(self.engine.sos_bass, R_out)
+                L_out = _fast_sosfilt(self.engine.sos_bass, L_out)
+                R_out = _fast_sosfilt(self.engine.sos_bass, R_out)
 
             if self.engine.treble_gain != 0.0:
-                L_out = sosfilt(self.engine.sos_treble, L_out)
-                R_out = sosfilt(self.engine.sos_treble, R_out)
+                L_out = _fast_sosfilt(self.engine.sos_treble, L_out)
+                R_out = _fast_sosfilt(self.engine.sos_treble, R_out)
 
             L_out *= self.engine.volume
             R_out *= self.engine.volume
@@ -295,6 +384,7 @@ class AudioEngine(QObject):
         self.dsp_bypass = False
         self.bit_perfect = False
         self.float_mode = False 
+        self.low_end_mode = False
         
         self.selected_device = None
         self.stream_mode_status = "Tip: Select your DAC directly instead of System Default for native sample-rate switching."
@@ -333,6 +423,7 @@ class AudioEngine(QObject):
         self.viz_ring_out = np.zeros(self.viz_ring_size, dtype=np.float32)
         self.viz_ring_hrir = np.zeros(self.viz_ring_size, dtype=np.float32)
         self.viz_head = 0
+        self.viz_state = (0, self.block_size, 0.0)
         
         self.correction_f = None
         self.correction_db = None
@@ -417,7 +508,7 @@ class AudioEngine(QObject):
                 shutil.copy2(filepath, temp_copy)
                 read_path = temp_copy
 
-            self.sofa_data, self.sofa_coords, _ = pf.io.read_sofa(read_path)
+            self.sofa_data, self.sofa_coords, _ = _get_pyfar().io.read_sofa(read_path)
             self.sofa_path = filepath
             self._update_hrirs()
         except Exception as e:
@@ -438,7 +529,7 @@ class AudioEngine(QObject):
             right_az = -self.azimuth
             
             def get_hrir(az, el):
-                q = pf.Coordinates.from_spherical_elevation(np.deg2rad(az), np.deg2rad(el), 1.0)
+                q = _get_pyfar().Coordinates.from_spherical_elevation(np.deg2rad(az), np.deg2rad(el), 1.0)
                 idx, _ = self.sofa_coords.find_nearest(q)
                 idx = int(np.atleast_1d(idx).ravel()[0])
                 raw = self.sofa_data.time
@@ -453,14 +544,20 @@ class AudioEngine(QObject):
             
             sofa_fs = int(self.sofa_data.sampling_rate)
             if sofa_fs != int(self.fs):
-                from math import gcd
-                g = gcd(sofa_fs, int(self.fs))
-                up = int(self.fs) // g
-                down = sofa_fs // g
-                self.raw_ipsi_L = resample_poly(self.raw_ipsi_L, up, down)
-                self.raw_contra_L = resample_poly(self.raw_contra_L, up, down)
-                self.raw_contra_R = resample_poly(self.raw_contra_R, up, down)
-                self.raw_ipsi_R = resample_poly(self.raw_ipsi_R, up, down)
+                if self.low_end_mode:
+                    self.raw_ipsi_L = _fast_resample(self.raw_ipsi_L, sofa_fs, int(self.fs))
+                    self.raw_contra_L = _fast_resample(self.raw_contra_L, sofa_fs, int(self.fs))
+                    self.raw_contra_R = _fast_resample(self.raw_contra_R, sofa_fs, int(self.fs))
+                    self.raw_ipsi_R = _fast_resample(self.raw_ipsi_R, sofa_fs, int(self.fs))
+                else:
+                    from math import gcd
+                    rp = _get_resample_poly()
+                    g = gcd(sofa_fs, int(self.fs))
+                    up, down = int(self.fs) // g, sofa_fs // g
+                    self.raw_ipsi_L = rp(self.raw_ipsi_L, up, down)
+                    self.raw_contra_L = rp(self.raw_contra_L, up, down)
+                    self.raw_contra_R = rp(self.raw_contra_R, up, down)
+                    self.raw_ipsi_R = rp(self.raw_ipsi_R, up, down)
             
             self._calculate_tonal_match()
             self._update_filters()
@@ -472,12 +569,14 @@ class AudioEngine(QObject):
             return
         
         total_len = len(self.audio_data)
-        window_size = int(self.fs * 3)
+        window_size = int(self.fs * (1.5 if self.low_end_mode else 3.0))
         
         indices = []
-        if total_len > window_size * 3:
+        if self.low_end_mode:
+            indices = [int(total_len * 0.25)] if total_len > window_size * 2 else [0]
+        elif total_len > window_size * 3:
             energy = self.audio_data[:, 0]**2 + self.audio_data[:, 1]**2
-            smooth_energy = uniform_filter1d(energy, size=window_size, mode='nearest')
+            smooth_energy = _fast_uniform_filter1d(energy, window_size)
             peak_idx = int(np.argmax(smooth_energy))
             
             indices = [
@@ -499,16 +598,16 @@ class AudioEngine(QObject):
             if len(L) < 1024:
                 continue
 
-            L_out = fftconvolve(L, self.raw_ipsi_L) + fftconvolve(R, self.raw_contra_R)
-            R_out = fftconvolve(L, self.raw_contra_L) + fftconvolve(R, self.raw_ipsi_R)
+            L_out = _fast_fftconvolve(L, self.raw_ipsi_L) + _fast_fftconvolve(R, self.raw_contra_R)
+            R_out = _fast_fftconvolve(L, self.raw_contra_L) + _fast_fftconvolve(R, self.raw_ipsi_R)
             
-            n_fft = min(8192, len(L))
-            f, P_in_L = welch(L, fs=self.fs, nperseg=n_fft)
-            _, P_in_R = welch(R, fs=self.fs, nperseg=n_fft)
+            n_fft = min(2048 if self.low_end_mode else 8192, len(L))
+            f, P_in_L = _fast_welch(L, fs=self.fs, nperseg=n_fft)
+            _, P_in_R = _fast_welch(R, fs=self.fs, nperseg=n_fft)
             P_in_list.append(0.5 * (P_in_L + P_in_R))
             
-            _, P_out_L = welch(L_out, fs=self.fs, nperseg=n_fft)
-            _, P_out_R = welch(R_out, fs=self.fs, nperseg=n_fft)
+            _, P_out_L = _fast_welch(L_out, fs=self.fs, nperseg=n_fft)
+            _, P_out_R = _fast_welch(R_out, fs=self.fs, nperseg=n_fft)
             P_out_list.append(0.5 * (P_out_L + P_out_R))
 
         if not P_in_list:
@@ -519,7 +618,7 @@ class AudioEngine(QObject):
         
         ratio_db = 10 * np.log10((P_in_avg + 1e-12) / (P_out_avg + 1e-12))
         
-        ratio_db = uniform_filter1d(ratio_db, size=15, mode='nearest')
+        ratio_db = _fast_uniform_filter1d(ratio_db, 15)
         ratio_db = np.clip(ratio_db, -24.0, 12.0)
         
         hf_mask = f > 4000
@@ -547,7 +646,7 @@ class AudioEngine(QObject):
         g_grid = np.interp(f_grid * (self.fs / 2), f, ratio_db)
         mag = 10 ** (g_grid / 20.0)
         
-        self.tonal_filter = firwin2(n_taps, f_grid, mag, window='blackmanharris')
+        self.tonal_filter = _fast_firwin2(n_taps, f_grid, mag)
 
     def _update_filters(self):
         if getattr(self, 'raw_ipsi_L', None) is None or self.fs is None:
@@ -567,10 +666,10 @@ class AudioEngine(QObject):
         self.h_RR_fft_raw = np.fft.rfft(h_RR, n=self.N)
 
         if self.tonal_match_enabled and self.tonal_filter is not None:
-            h_LL = fftconvolve(h_LL, self.tonal_filter)
-            h_RL = fftconvolve(h_RL, self.tonal_filter)
-            h_LR = fftconvolve(h_LR, self.tonal_filter)
-            h_RR = fftconvolve(h_RR, self.tonal_filter)
+            h_LL = _fast_fftconvolve(h_LL, self.tonal_filter)
+            h_RL = _fast_fftconvolve(h_RL, self.tonal_filter)
+            h_LR = _fast_fftconvolve(h_LR, self.tonal_filter)
+            h_RR = _fast_fftconvolve(h_RR, self.tonal_filter)
 
         self.h_LL_fft_norm = np.fft.rfft(h_LL, n=self.N)
         self.h_RL_fft_norm = np.fft.rfft(h_RL, n=self.N)
@@ -776,7 +875,7 @@ class AudioEngine(QObject):
             self.viz_ring_in[h:h+f] = in_block[:, 0]
             self.viz_ring_out[h:h+f] = out_L
             self.viz_ring_hrir[h:h+f] = hrir_L[:f]
-            self.viz_head = (h + f) % b
+            new_h = (h + f) % b
         else:
             wrap = b - h
             self.viz_ring_in[h:] = in_block[:wrap, 0]
@@ -788,14 +887,17 @@ class AudioEngine(QObject):
             self.viz_ring_hrir[h:] = hrir_L[:wrap]
             self.viz_ring_hrir[:f-wrap] = hrir_L[wrap:]
             
-            self.viz_head = f - wrap
+            new_h = f - wrap
+
+        self.viz_head = new_h
+        self.viz_state = (new_h, f, __import__('time').perf_counter())
 
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setAcceptDrops(True)
-        self.setWindowTitle("HRTF Audio Player")
+        self.setWindowTitle("Huq — Anechoic Engine")
         self.setMinimumSize(1100, 820)
         
         pg.setConfigOptions(antialias=False, enableExperimental=False)
@@ -837,7 +939,7 @@ class MainWindow(QMainWindow):
         self.smoothed_in = None
         self.smoothed_hrir = None
         self.smoothed_out = None
-        self.viz_alpha = 0.5 
+        self.viz_alpha = 20.0 
 
         self.library_tracks = []
         self.custom_tracks = []
@@ -868,13 +970,12 @@ class MainWindow(QMainWindow):
         self.last_sys_default = None
         
         self.init_ui()
-        self.load_default_sofa()
         
         self.sys_device_timer = QTimer(self)
         self.sys_device_timer.setInterval(1000)
         self.sys_device_timer.timeout.connect(self.check_sys_default)
         self.sys_device_timer.start()
-        self.load_session_state()
+        QTimer.singleShot(10, self._deferred_startup)
 
     def _get_macos_default_output_name(self):
         try:
@@ -985,6 +1086,56 @@ class MainWindow(QMainWindow):
                 self.lbl_dev_status.setStyleSheet("color: #34c759; font-size: 11px; font-weight: bold; margin-bottom: 4px;")
             else:
                 self.lbl_dev_status.setStyleSheet("color: #ff9500; font-size: 11px; font-weight: bold; margin-bottom: 4px;")
+
+    def _deferred_startup(self):
+        t0 = time.perf_counter()
+        self.load_default_sofa()
+        self.load_session_state()
+        self._check_cpu_benchmark((time.perf_counter() - t0) * 1000.0)
+
+    def _check_cpu_benchmark(self, startup_ms):
+        state_path = self._state_file_path()
+        if os.path.exists(state_path):
+            try:
+                with open(state_path, "r", encoding="utf-8") as f:
+                    if "low_end_mode" in json.load(f):
+                        return
+            except Exception:
+                pass
+        dsp_ms = 0.0
+        if self.engine.rust_dsp is not None:
+            d_in = np.zeros((self.engine.block_size, 2), dtype=np.float32)
+            d_out = np.zeros((self.engine.block_size, 2), dtype=np.float32)
+            d_viz = np.zeros(self.engine.block_size, dtype=np.float32)
+            # 2 warmup runs to fault pages and wake CPU boost clocks
+            for _ in range(2):
+                self.engine.rust_dsp.process(d_in, d_out, d_viz)
+            samples = []
+            for _ in range(16):
+                tb = time.perf_counter()
+                self.engine.rust_dsp.process(d_in, d_out, d_viz)
+                samples.append((time.perf_counter() - tb) * 1000.0)
+            dsp_ms = float(np.median(samples))
+            self.engine.rust_dsp.reset()
+        if dsp_ms > 8.0 or startup_ms > 3500.0:
+            reply = QMessageBox.question(
+                self, "Performance Check",
+                f"Slower hardware detected (startup {startup_ms/1000.0:.1f}s, DSP {dsp_ms:.1f}ms).\nEnable 'Low-End CPU' mode? (Real-time HRTF stays active; switch anytime in DSP Controls.)",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+            if reply == QMessageBox.Yes:
+                self.btn_cpu_mode.setChecked(True)
+                self.toggle_cpu_mode(True)
+                return
+        self.save_session_state()
+
+    def toggle_cpu_mode(self, checked):
+        low = bool(checked)
+        self.engine.low_end_mode = low
+        self.btn_cpu_mode.setText("CPU: Low-End" if low else "CPU: Full Quality")
+        self.combo_fps.setCurrentIndex(0 if low else 2)
+        if self.engine.sofa_data is not None:
+            self.engine._update_hrirs()
+        self.save_session_state()
 
     def load_default_sofa(self):
         default_path = get_resource_path("default.sofa")
@@ -1190,9 +1341,9 @@ class MainWindow(QMainWindow):
         self.combo_fps.currentIndexChanged.connect(self.change_fps)
         peak_layout.addWidget(self.combo_fps)
 
-        peak_layout.addWidget(QLabel("Smoothing:"))
+        peak_layout.addWidget(QLabel("Time Decay:"))
         self.combo_smooth = QComboBox()
-        self.combo_smooth.addItems(["Off", "Low", "Medium", "High"])
+        self.combo_smooth.addItems(["Instant", "Fast", "Medium", "Slow"])
         self.combo_smooth.setCurrentIndex(1) 
         self.combo_smooth.setFixedWidth(120) 
         self.combo_smooth.currentIndexChanged.connect(self.change_smoothing)
@@ -1343,10 +1494,16 @@ class MainWindow(QMainWindow):
         treble_layout.addWidget(self.lbl_treble)
         ctrl_layout.addLayout(treble_layout)
 
+        tonal_cpu_row = QHBoxLayout()
         self.chk_tonal = QCheckBox("Tonal Match (Neutralize coloration)")
         self.chk_tonal.setChecked(True)
         self.chk_tonal.stateChanged.connect(self.toggle_tonal_match)
-        ctrl_layout.addWidget(self.chk_tonal)
+        self.btn_cpu_mode = QPushButton("CPU: Full Quality")
+        self.btn_cpu_mode.setCheckable(True)
+        self.btn_cpu_mode.clicked.connect(self.toggle_cpu_mode)
+        tonal_cpu_row.addWidget(self.chk_tonal, 1)
+        tonal_cpu_row.addWidget(self.btn_cpu_mode)
+        ctrl_layout.addLayout(tonal_cpu_row)
 
         right_layout.addWidget(self.dsp_panel)
         
@@ -1635,17 +1792,17 @@ class MainWindow(QMainWindow):
         self.viz_timer.setInterval(ms)
 
     def change_smoothing(self, index):
-        smooth_map = {0: 0.0, 1: 0.5, 2: 0.75, 3: 0.88}
-        self.viz_alpha = smooth_map.get(index, 0.0)
-        
-    def toggle_dsp_perf(self, state):
-        enabled = bool(state)
-        self.engine.dsp_hist_idx = 0
-        self.engine.dsp_hist_count = 0
+        taus_ms = [0.0, 20.0, 42.0, 70.0]
+        self.viz_alpha = taus_ms[index] if 0 <= index < len(taus_ms) else 20.0
+
+    def toggle_dsp_perf(self, checked):
+        enabled = bool(checked)
         self.btn_dsp_perf.setText("DSP Time: On" if enabled else "DSP Time: Off")
         self.lbl_dsp_perf.setVisible(enabled)
-        if not enabled:
-            self.lbl_dsp_perf.setText("")
+        if enabled:
+            self.engine.dsp_hist_idx = 0
+            self.engine.dsp_hist_count = 0
+            self.lbl_dsp_perf.setText("measuring...")
 
     def toggle_float_mode(self, state):
         self.engine.float_mode = bool(state)
@@ -1735,75 +1892,81 @@ class MainWindow(QMainWindow):
                 
             # Use welch for much smoother, professional-looking graph
             n_fft = 4096
+            w_seg = 2048
             b = self.engine.viz_ring_size
-            h = self.engine.viz_head
-            
+            head, last_frames, write_time = self.engine.viz_state
+            now = time.perf_counter()
+            block_dur = max(1e-4, last_frames / float(self.engine.fs))
+            frac = min(1.0, max(0.0, (now - write_time) / block_dur))
+
             if not hasattr(self, 'chunk_in_buf'):
                 self.chunk_in_buf = np.zeros(n_fft)
                 self.chunk_hrir_buf = np.zeros(n_fft)
                 self.chunk_out_buf = np.zeros(n_fft)
-                
-            if h >= n_fft:
-                np.copyto(self.chunk_in_buf, self.engine.viz_ring_in[h-n_fft:h])
-                np.copyto(self.chunk_hrir_buf, self.engine.viz_ring_hrir[h-n_fft:h])
-                np.copyto(self.chunk_out_buf, self.engine.viz_ring_out[h-n_fft:h])
+
+            lag = int((1.0 - frac) * last_frames)
+            h_audio = (head - lag) % b
+            if h_audio >= n_fft:
+                np.copyto(self.chunk_in_buf, self.engine.viz_ring_in[h_audio-n_fft:h_audio])
+                np.copyto(self.chunk_out_buf, self.engine.viz_ring_out[h_audio-n_fft:h_audio])
             else:
-                wrap = n_fft - h
+                wrap = n_fft - h_audio
                 self.chunk_in_buf[:wrap] = self.engine.viz_ring_in[-wrap:]
-                self.chunk_in_buf[wrap:] = self.engine.viz_ring_in[:h]
-                
-                self.chunk_hrir_buf[:wrap] = self.engine.viz_ring_hrir[-wrap:]
-                self.chunk_hrir_buf[wrap:] = self.engine.viz_ring_hrir[:h]
-                
+                self.chunk_in_buf[wrap:] = self.engine.viz_ring_in[:h_audio]
                 self.chunk_out_buf[:wrap] = self.engine.viz_ring_out[-wrap:]
-                self.chunk_out_buf[wrap:] = self.engine.viz_ring_out[:h]
-            
+                self.chunk_out_buf[wrap:] = self.engine.viz_ring_out[:h_audio]
+
+            f, P_in = _fast_welch(self.chunk_in_buf, fs=self.engine.fs, nperseg=w_seg)
+            _, P_out = _fast_welch(self.chunk_out_buf, fs=self.engine.fs, nperseg=w_seg)
+            P_in_db = 10 * np.log10(P_in + 1e-12)
+            P_out_db = 10 * np.log10(P_out + 1e-12)
+
+            if (
+                self.engine.dsp_bypass
+                or self.engine.bit_perfect
+                or self.engine.h_LL_fft_raw is None
+                or self.engine.h_RL_fft_raw is None
+            ):
+                P_hrir_db = P_in_db.copy()
+            else:
+                # Compute exact raw HRIR response directly from current Input PSD (100% time-aligned, zero seam jumps)
+                if getattr(self, '_cached_raw_hrir_id', None) != id(self.engine.h_LL_fft_raw):
+                    self._cached_raw_hrir_id = id(self.engine.h_LL_fft_raw)
+                    f_raw = np.fft.rfftfreq(self.engine.N, 1.0 / self.engine.fs)
+                    gain_raw = (np.abs(self.engine.h_LL_fft_raw) ** 2) + (np.abs(self.engine.h_RL_fft_raw) ** 2)
+                    self._cached_hrir_gain = np.interp(f, f_raw, gain_raw)
+                P_hrir_db = 10 * np.log10((P_in * self._cached_hrir_gain) + 1e-12)
+
             peak = np.max(np.abs(self.chunk_out_buf))
             peak_db = 20 * np.log10(peak + 1e-12)
-            
             if peak_db > 0.0:
                 self.lbl_peak.setText(f"Peak: {peak_db:.1f} dB (CLIPPING!)")
                 self.lbl_peak.setStyleSheet("color: #ff3b30; font-weight: bold; font-family: 'Helvetica Neue';")
             else:
                 self.lbl_peak.setText(f"Peak: {peak_db:.1f} dB")
                 self.lbl_peak.setStyleSheet("color: #34c759; font-weight: bold; font-family: 'Helvetica Neue';")
-            
-            # Use welch for a smooth frequency response
-            f, P_in = welch(self.chunk_in_buf, fs=self.engine.fs, nperseg=n_fft)
-            _, P_hrir = welch(self.chunk_hrir_buf, fs=self.engine.fs, nperseg=n_fft)
-            _, P_out = welch(self.chunk_out_buf, fs=self.engine.fs, nperseg=n_fft)
-            
-            P_in_db = 10 * np.log10(P_in + 1e-12)
-            P_hrir_db = 10 * np.log10(P_hrir + 1e-12)
-            P_out_db = 10 * np.log10(P_out + 1e-12)
-            
-            # STATIC Y-AXIS (Removed dynamic scaling)
-            
-            if self.smoothed_in is None or len(self.smoothed_in) != len(P_in_db):
-                self.smoothed_in = P_in_db.copy()
-                self.smoothed_hrir = P_hrir_db.copy()
-                self.smoothed_out = P_out_db.copy()
-            else:
-                alpha = self.viz_alpha
-                if alpha == 0.0:
-                    np.copyto(self.smoothed_in, P_in_db)
-                    np.copyto(self.smoothed_hrir, P_hrir_db)
-                    np.copyto(self.smoothed_out, P_out_db)
-                else:
-                    beta = 1.0 - alpha
-                    self.smoothed_in *= alpha
-                    self.smoothed_in += P_in_db * beta
-                    
-                    self.smoothed_hrir *= alpha
-                    self.smoothed_hrir += P_hrir_db * beta
-                    
-                    self.smoothed_out *= alpha
-                    self.smoothed_out += P_out_db * beta
 
-            # Slice from 1 to ignore DC offset
-            self.curve_in.setData(f[1:], self.smoothed_in[1:])
-            self.curve_hrir.setData(f[1:], self.smoothed_hrir[1:])
-            self.curve_out.setData(f[1:], self.smoothed_out[1:])
+            if getattr(self, 'smoothed_in', None) is None:
+                self.smoothed_in = P_in_db
+                self.smoothed_hrir = P_hrir_db
+                self.smoothed_out = P_out_db
+            else:
+                dt_ms = max(1.0, float(self.viz_timer.interval()))
+                tau_ms = self.viz_alpha
+                if tau_ms <= 0.0:
+                    self.smoothed_in = P_in_db
+                    self.smoothed_hrir = P_hrir_db
+                    self.smoothed_out = P_out_db
+                else:
+                    alpha = float(np.exp(-dt_ms / tau_ms))
+                    self.smoothed_in = alpha * self.smoothed_in + (1.0 - alpha) * P_in_db
+                    self.smoothed_hrir = alpha * self.smoothed_hrir + (1.0 - alpha) * P_hrir_db
+                    self.smoothed_out = alpha * self.smoothed_out + (1.0 - alpha) * P_out_db
+
+            # Slice [1:-1] to ignore DC offset and un-doubled Nyquist bin drop
+            self.curve_in.setData(f[1:-1], self.smoothed_in[1:-1])
+            self.curve_hrir.setData(f[1:-1], self.smoothed_hrir[1:-1])
+            self.curve_out.setData(f[1:-1], self.smoothed_out[1:-1])
             
             if self.engine.correction_f is not None:
                 self.curve_corr.setData(self.engine.correction_f, self.engine.correction_db)
@@ -1945,6 +2108,7 @@ class MainWindow(QMainWindow):
             title = file
             artist = "Unknown Artist"
             try:
+                mutagen, FLAC, ID3, MP3, MP4 = _get_mutagen()
                 audio = mutagen.File(path)
                 if audio:
                     if isinstance(audio, FLAC):
@@ -2130,6 +2294,7 @@ class MainWindow(QMainWindow):
                 "volume": int(round(self.engine.volume * 100)),
                 "shuffle": self.shuffle_enabled,
                 "dsp_panel_open": self.btn_toggle_dsp_panel.isChecked(),
+                "low_end_mode": self.engine.low_end_mode,
                 "sofa_path": self.engine.sofa_path if (self.engine.sofa_path and os.path.exists(self.engine.sofa_path) and os.path.abspath(self.engine.sofa_path) != os.path.abspath(get_resource_path("default.sofa"))) else "",
             }
             with open(self._state_file_path(), "w", encoding="utf-8") as f:
@@ -2153,6 +2318,15 @@ class MainWindow(QMainWindow):
             self.btn_shuffle.setChecked(shuf)
             self.toggle_shuffle(shuf)
 
+            low = bool(state.get("low_end_mode", False))
+            self.engine.low_end_mode = low
+            if hasattr(self, "btn_cpu_mode"):
+                self.btn_cpu_mode.blockSignals(True)
+                self.btn_cpu_mode.setChecked(low)
+                self.btn_cpu_mode.setText("CPU: Low-End" if low else "CPU: Full Quality")
+                self.btn_cpu_mode.blockSignals(False)
+                if low:
+                    self.combo_fps.setCurrentIndex(0)
             panel_open = bool(state.get("dsp_panel_open", False))
             self.btn_toggle_dsp_panel.setChecked(panel_open)
             self.toggle_dsp_panel(panel_open)

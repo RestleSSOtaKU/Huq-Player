@@ -2,7 +2,8 @@ name: Build Windows & macOS Releases
 
 on:
   push:
-    branches: [ main ]
+    tags:
+      - 'v*'
   workflow_dispatch:
 
 permissions:
@@ -45,7 +46,7 @@ jobs:
       - name: Bundle Windows EXE with PyInstaller
         shell: pwsh
         run: |
-          pyinstaller --noconfirm --windowed --name "HRTF_Audio_Player" `
+          pyinstaller --noconfirm --windowed --name "Huq" `
             --collect-data sofar `
             --collect-data pyfar `
             --add-binary "hrtf_core\target\release\hrtf_core.dll;." `
@@ -53,14 +54,14 @@ jobs:
             --add-binary "player_ui\bin\ffprobe.exe;bin" `
             --add-data "player_ui\default.sofa;." `
             player_ui\main.py
-          Compress-Archive -Path "dist\HRTF_Audio_Player\*" -DestinationPath "HRTF_Audio_Player-Windows.zip" -Force
+          Compress-Archive -Path "dist\Huq\*" -DestinationPath "Huq-Windows.zip" -Force
 
       - name: Upload Windows Release Asset
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: latest
-          name: HRTF Audio Player (Latest)
-          files: HRTF_Audio_Player-Windows.zip
+          tag_name: ${{ github.ref_name }}
+          name: Huq ${{ github.ref_name }}
+          files: Huq-Windows.zip
 
   build-macos:
     runs-on: macos-latest
@@ -95,8 +96,8 @@ jobs:
 
       - name: Bundle macOS .app with PyInstaller
         run: |
-          pyinstaller --noconfirm --windowed --name "HRTF Audio Player" \
-            --osx-bundle-identifier "com.restlessotaku.hrtfplayer" \
+          pyinstaller --noconfirm --windowed --name "Huq" \
+            --osx-bundle-identifier "com.restlessotaku.huq" \
             --collect-data sofar \
             --collect-data pyfar \
             --add-binary "hrtf_core/target/release/libhrtf_core.dylib:." \
@@ -107,20 +108,20 @@ jobs:
 
       - name: Ad-Hoc Code Sign .app & Create .dmg
         run: |
-          find "dist/HRTF Audio Player.app" -type f \( -name "*.dylib" -o -name "*.so" \) -exec codesign --force --sign - {} \;
-          codesign --force --sign - "dist/HRTF Audio Player.app/Contents/Frameworks/Python.framework/Versions/3.12/Python" || true
-          codesign --deep --force --sign - "dist/HRTF Audio Player.app"
+          find "dist/Huq.app" -type f \( -name "*.dylib" -o -name "*.so" \) -exec codesign --force --sign - {} \;
+          codesign --force --sign - "dist/Huq.app/Contents/Frameworks/Python.framework/Versions/3.12/Python" || true
+          codesign --deep --force --sign - "dist/Huq.app"
           mkdir -p dmg_stage
-          cp -R "dist/HRTF Audio Player.app" dmg_stage/
+          cp -R "dist/Huq.app" dmg_stage/
           ln -s /Applications dmg_stage/Applications
-          hdiutil create -volname "HRTF Audio Player" \
+          hdiutil create -volname "Huq" \
             -srcfolder dmg_stage \
             -ov -format UDZO \
-            "HRTF_Audio_Player-macOS-AppleSilicon.dmg"
+            "Huq-macOS-AppleSilicon.dmg"
 
       - name: Upload macOS .dmg Release Asset
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: latest
-          name: HRTF Audio Player (Latest)
-          files: HRTF_Audio_Player-macOS-AppleSilicon.dmg
+          tag_name: ${{ github.ref_name }}
+          name: Huq ${{ github.ref_name }}
+          files: Huq-macOS-AppleSilicon.dmg
