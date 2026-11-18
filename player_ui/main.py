@@ -19,7 +19,7 @@ from mutagen.mp4 import MP4
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                                QHBoxLayout, QPushButton, QSlider, QLabel, 
                                QFileDialog, QCheckBox, QSpinBox, QMessageBox,
-                               QComboBox, QListWidget, QListWidgetItem, QSplitter)
+                               QComboBox, QListWidget, QListWidgetItem, QSplitter, QLineEdit)
 from PySide6.QtCore import Qt, QTimer, Signal, QObject, QThread, QSize
 from PySide6.QtGui import QPixmap, QIcon
 from dsp_bridge import RustDspBridge
@@ -788,7 +788,10 @@ class MainWindow(QMainWindow):
             QListWidget { background-color: #121212; color: #e0e0e0; border: 1px solid #333; font-family: "Helvetica Neue"; font-size: 13px; }
             QListWidget::item { padding: 8px; border-bottom: 1px solid #222; }
             QListWidget::item:selected { background-color: #007aff; color: white; }
-            QComboBox { background-color: #2c2c2e; color: white; border: none; border-radius: 4px; padding: 4px; font-family: "Helvetica Neue"; }
+            QLineEdit { background-color: #2c2c2e; color: white; border: 1px solid #3a3a3c; border-radius: 4px; padding: 5px 8px; font-family: "Helvetica Neue"; font-size: 13px; }
+            QLineEdit:focus { border: 1px solid #007aff; }
+            QComboBox { background-color: #2c2c2e; color: white; border: none; border-radius: 4px; padding: 5px 24px 5px 8px; font-family: "Helvetica Neue"; }
+            QComboBox::drop-down { subcontrol-origin: padding; subcontrol-position: top right; width: 20px; border: none; }
             QComboBox QAbstractItemView { background-color: #2c2c2e; color: white; selection-background-color: #007aff; }
             QPushButton { 
                 background-color: #2c2c2e; color: white; 
@@ -819,6 +822,7 @@ class MainWindow(QMainWindow):
         self.viz_alpha = 0.5 
 
         self.library_tracks = []
+        self.custom_tracks = []
         self.current_track_index = -1
         self.shuffle_enabled = False
         self._raw_cover_pixmap = None
@@ -854,21 +858,115 @@ class MainWindow(QMainWindow):
         self.sys_device_timer.start()
         self.load_session_state()
 
-    def check_sys_default(self):
+    def _get_macos_default_output_name(self):
         try:
-            current_def = sd.query_devices(kind='output')
-            if not current_def:
-                return
-            def_name = current_def['name']
+            import ctypes, ctypes.util
+            ca = ctypes.CDLL(ctypes.util.find_library("CoreAudio"))
+            cf = ctypes.CDLL(ctypes.util.find_library("CoreFoundation"))
+
+            class AudioObjectPropertyAddress(ctypes.Structure):
+                _fields_ = [
+                    ("mSelector", ctypes.c_uint32),
+                    ("mScope", ctypes.c_uint32),
+                    ("mElement", ctypes.c_uint32),
+                ]
+
+            ca.AudioObjectGetPropertyData.argtypes = [
+                ctypes.c_uint32,
+                ctypes.POINTER(AudioObjectPropertyAddress),
+                ctypes.c_uint32,
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_uint32),
+                ctypes.c_void_p,
+            ]
+            ca.AudioObjectGetPropertyData.restype = ctypes.c_int32
+
+            cf.CFStringGetCString.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_char_p,
+                ctypes.c_long,
+                ctypes.c_uint32,
+            ]
+            cf.CFStringGetCString.restype = ctypes.c_bool
+            cf.CFRelease.argtypes = [ctypes.c_void_p]
+            cf.CFRelease.restype = None
+
+            def fourcc(s):
+                return (ord(s[0]) << 24) | (ord(s[1]) << 16) | (ord(s[2]) << 8) | ord(s[3])
+
+            addr = AudioObjectPropertyAddress(fourcc("dOut"), fourcc("glob"), 0)
+            dev_id = ctypes.c_uint32(0)
+            size = ctypes.c_uint32(ctypes.sizeof(dev_id))
+            if ca.AudioObjectGetPropertyData(1, ctypes.byref(addr), 0, None, ctypes.byref(size), ctypes.byref(dev_id)) != 0:
+                return None
+
+            addr_name = AudioObjectPropertyAddress(fourcc("lnam"), fourcc("glob"), 0)
+            cf_str = ctypes.c_void_p()
+            size_str = ctypes.c_uint32(ctypes.sizeof(cf_str))
+            if ca.AudioObjectGetPropertyData(dev_id.value, ctypes.byref(addr_name), 0, None, ctypes.byref(size_str), ctypes.byref(cf_str)) != 0:
+                return None
+
+            buf = ctypes.create_string_buffer(256)
+            ok = cf.CFStringGetCString(cf_str, buf, 256, 0x08000100)
+            cf.CFRelease(cf_str)
+            return buf.value.decode("utf-8", errors="ignore") if ok else None
         except Exception:
+            return None
+
+    def check_sys_default(self):
+        def_name = None
+        if sys.platform == "darwin":
+            def_name = self._get_macos_default_output_name()
+        if not def_name:
+            try:
+                current_def = sd.query_devices(kind='output')
+                if not current_def:
+                    return
+                def_name = current_def['name']
+            except Exception:
+                return
+
+        if self.last_sys_default is None:
+            self.last_sys_default = def_name
             return
-        
+
         if self.last_sys_default != def_name:
             self.last_sys_default = def_name
-            self.refresh_devices()
-            if self.engine.selected_device is None and self.engine.is_playing:
-                self.engine.stop()
-                self.engine.start()
+            self._switch_to_new_sys_default()
+
+    def _switch_to_new_sys_default(self):
+        was_playing = self.engine.is_playing
+        use_default = (self.engine.selected_device is None)
+
+        if was_playing and use_default:
+            self.engine.stop(fast=True)
+
+        if not self.engine.is_playing:
+            try:
+                sd._terminate()
+                sd._initialize()
+            except Exception:
+                pass
+
+        self.refresh_devices(initial=True)
+
+        if was_playing and use_default:
+            QTimer.singleShot(120, self._resume_after_sys_default_switch)
+
+    def _resume_after_sys_default_switch(self):
+        if self.engine.selected_device is None and not self.engine.is_playing:
+            self.engine.start()
+            if self.engine.is_playing:
+                self.btn_play.setText("⏸ Pause")
+                if not self.timer.isActive():
+                    self.timer.start()
+                if not self.viz_timer.isActive():
+                    self.viz_timer.start()
+            self.lbl_dev_status.setText(self.engine.stream_mode_status)
+            if self.engine.stream_is_exclusive:
+                self.lbl_dev_status.setStyleSheet("color: #34c759; font-size: 11px; font-weight: bold; margin-bottom: 4px;")
+            else:
+                self.lbl_dev_status.setStyleSheet("color: #ff9500; font-size: 11px; font-weight: bold; margin-bottom: 4px;")
 
     def load_default_sofa(self):
         default_path = get_resource_path("default.sofa")
@@ -895,6 +993,29 @@ class MainWindow(QMainWindow):
         lib_top.addWidget(self.btn_scan)
         lib_top.addWidget(self.lbl_lib_info, 1)
         left_layout.addLayout(lib_top)
+
+        filter_layout = QHBoxLayout()
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("Search title or artist...")
+        self.search_input.setClearButtonEnabled(True)
+        self.search_input.textChanged.connect(self.filter_playlist)
+
+        self.combo_sort = QComboBox()
+        self.combo_sort.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+        self.combo_sort.setMinimumWidth(118)
+        self.combo_sort.addItems([
+            "Sort: Custom",
+            "Title (A-Z)",
+            "Title (Z-A)",
+            "Artist (A-Z)",
+            "Artist (Z-A)"
+        ])
+        self.combo_sort.currentIndexChanged.connect(self.sort_playlist)
+
+        filter_layout.setSpacing(6)
+        filter_layout.addWidget(self.search_input, 1)
+        filter_layout.addWidget(self.combo_sort, 0)
+        left_layout.addLayout(filter_layout)
 
         self.list_widget = QListWidget()
         self.list_widget.itemDoubleClicked.connect(self.play_selected_item)
@@ -928,7 +1049,7 @@ class MainWindow(QMainWindow):
         dev_layout = QHBoxLayout()
         dev_layout.addWidget(QLabel("Output Device:"))
         self.combo_device = DeviceComboBox()
-        self.combo_device.refresh_callback = self.refresh_devices
+        self.combo_device.refresh_callback = self._on_device_popup
         self.refresh_devices(initial=True)
         self.combo_device.currentIndexChanged.connect(self.change_device)
         dev_layout.addWidget(self.combo_device, 1)
@@ -1231,14 +1352,20 @@ class MainWindow(QMainWindow):
         for track in tracks:
             if track['path'] not in existing_paths:
                 self.library_tracks.append(track)
+                self.custom_tracks.append(track)
                 existing_paths.add(track['path'])
-                item = QListWidgetItem(f"{track['title']} - {track['artist']}")
+                item = QListWidgetItem(self._format_track_label(track))
                 item.setData(Qt.UserRole, track)
                 self.list_widget.addItem(item)
                 added += 1
 
+        if added > 0 and hasattr(self, "combo_sort") and self.combo_sort.currentIndex() != 0:
+            self.sort_playlist(self.combo_sort.currentIndex())
+
         self.lbl_lib_info.setText(f"{len(self.library_tracks)} tracks in playlist")
         self.btn_scan.setEnabled(True)
+        if hasattr(self, "search_input") and self.search_input.text():
+            self.filter_playlist(self.search_input.text())
 
         if auto_play_if_empty and was_empty and self.library_tracks:
             item = self.list_widget.item(0)
@@ -1406,6 +1533,15 @@ class MainWindow(QMainWindow):
         
         if was_playing:
             self.engine.start()
+
+    def _on_device_popup(self):
+        if not self.engine.is_playing:
+            try:
+                sd._terminate()
+                sd._initialize()
+            except Exception:
+                pass
+        self.refresh_devices(initial=True)
 
     def refresh_devices(self, initial=False):
         current_data = self.combo_device.currentData() 
@@ -1819,6 +1955,76 @@ class MainWindow(QMainWindow):
         os.makedirs(state_dir, exist_ok=True)
         return os.path.join(state_dir, "session.json")
 
+    def filter_playlist(self, text):
+        query = text.strip().lower()
+        visible_count = 0
+        for i in range(self.list_widget.count()):
+            item = self.list_widget.item(i)
+            track = item.data(Qt.UserRole) or {}
+            haystack = f"{track.get('title', '')} {track.get('artist', '')}".lower()
+            match = (query in haystack)
+            item.setHidden(not match)
+            if match:
+                visible_count += 1
+
+        if query:
+            self.list_widget.setDragDropMode(QListWidget.NoDragDrop)
+            self.lbl_lib_info.setText(f"Showing {visible_count} of {len(self.library_tracks)} tracks")
+        else:
+            self.list_widget.setDragDropMode(QListWidget.InternalMove)
+            self.lbl_lib_info.setText(
+                f"{len(self.library_tracks)} tracks in playlist" if self.library_tracks else "Library empty"
+            )
+
+    def sort_playlist(self, index):
+        if not self.library_tracks:
+            return
+
+        current_path = None
+        if 0 <= self.current_track_index < len(self.library_tracks):
+            current_path = self.library_tracks[self.current_track_index]['path']
+
+        if index == 0:
+            self.library_tracks = list(self.custom_tracks)
+        elif index == 1:
+            self.library_tracks.sort(key=lambda t: (t.get('title', '').lower(), t.get('artist', '').lower()))
+        elif index == 2:
+            self.library_tracks.sort(key=lambda t: (t.get('title', '').lower(), t.get('artist', '').lower()), reverse=True)
+        elif index == 3:
+            self.library_tracks.sort(key=lambda t: (t.get('artist', '').lower(), t.get('title', '').lower()))
+        elif index == 4:
+            self.library_tracks.sort(key=lambda t: (t.get('artist', '').lower(), t.get('title', '').lower()), reverse=True)
+
+        self._rebuild_playlist_widget(current_path)
+        self.save_session_state()
+
+    def _format_track_label(self, track):
+        if hasattr(self, "combo_sort") and self.combo_sort.currentIndex() in (3, 4):
+            return f"{track['artist']} - {track['title']}"
+        return f"{track['title']} - {track['artist']}"
+
+    def _refresh_playlist_labels(self):
+        for i in range(self.list_widget.count()):
+            item = self.list_widget.item(i)
+            track = item.data(Qt.UserRole)
+            if track:
+                item.setText(self._format_track_label(track))
+
+    def _rebuild_playlist_widget(self, current_path=None):
+        self.list_widget.blockSignals(True)
+        self.list_widget.clear()
+        self.current_track_index = -1
+        for i, track in enumerate(self.library_tracks):
+            item = QListWidgetItem(self._format_track_label(track))
+            item.setData(Qt.UserRole, track)
+            self.list_widget.addItem(item)
+            if current_path and track['path'] == current_path:
+                self.current_track_index = i
+                self.list_widget.setCurrentItem(item)
+        self.list_widget.blockSignals(False)
+        if hasattr(self, "search_input"):
+            self.filter_playlist(self.search_input.text())
+
     def on_playlist_reordered(self, *args):
         current_path = None
         if 0 <= self.current_track_index < len(self.library_tracks):
@@ -1830,12 +2036,18 @@ class MainWindow(QMainWindow):
             if track:
                 new_tracks.append(track)
         self.library_tracks = new_tracks
+        self.custom_tracks = list(new_tracks)
 
         if current_path:
             for i, t in enumerate(self.library_tracks):
                 if t['path'] == current_path:
                     self.current_track_index = i
                     break
+        if hasattr(self, "combo_sort") and self.combo_sort.currentIndex() != 0:
+            self.combo_sort.blockSignals(True)
+            self.combo_sort.setCurrentIndex(0)
+            self.combo_sort.blockSignals(False)
+            self._refresh_playlist_labels()
         self.save_session_state()
 
     def keyPressEvent(self, event):
@@ -1856,10 +2068,14 @@ class MainWindow(QMainWindow):
 
         playing_removed = self.current_track_index in selected_rows
 
+        removed_paths = set()
         for row in selected_rows:
             self.list_widget.takeItem(row)
             if 0 <= row < len(self.library_tracks):
-                self.library_tracks.pop(row)
+                removed = self.library_tracks.pop(row)
+                removed_paths.add(removed['path'])
+        if removed_paths:
+            self.custom_tracks = [t for t in self.custom_tracks if t['path'] not in removed_paths]
 
         self.lbl_lib_info.setText(f"{len(self.library_tracks)} tracks" if self.library_tracks else "Library empty")
 
@@ -1889,6 +2105,8 @@ class MainWindow(QMainWindow):
 
             state = {
                 "tracks": self.library_tracks,
+                "custom_tracks": self.custom_tracks,
+                "sort_mode": self.combo_sort.currentIndex() if hasattr(self, "combo_sort") else 0,
                 "current_index": self.current_track_index,
                 "position_sec": pos_sec,
                 "volume": int(round(self.engine.volume * 100)),
@@ -1930,7 +2148,16 @@ class MainWindow(QMainWindow):
             if not saved_tracks:
                 return
 
+            saved_custom = [t for t in state.get("custom_tracks", []) if os.path.exists(t.get("path", ""))]
+            sort_mode = state.get("sort_mode", 0)
+            if hasattr(self, "combo_sort") and isinstance(sort_mode, int) and 0 <= sort_mode < self.combo_sort.count():
+                self.combo_sort.blockSignals(True)
+                self.combo_sort.setCurrentIndex(sort_mode)
+                self.combo_sort.blockSignals(False)
+
             self.on_scan_finished(saved_tracks)
+            if saved_custom:
+                self.custom_tracks = saved_custom
             idx = state.get("current_index", -1)
             pos_sec = float(state.get("position_sec", 0.0))
 
