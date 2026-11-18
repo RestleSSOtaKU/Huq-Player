@@ -404,12 +404,30 @@ class AudioEngine(QObject):
 
         
     def load_sofa(self, filepath):
-        self.sofa_path = filepath
+        temp_copy = None
         try:
-            self.sofa_data, self.sofa_coords, _ = pf.io.read_sofa(filepath)
+            read_path = filepath
+            if sys.platform == "win32" and not filepath.isascii():
+                import shutil, tempfile, uuid
+                temp_dir = tempfile.gettempdir()
+                if not temp_dir.isascii():
+                    temp_dir = os.path.join(os.environ.get("PUBLIC", "C:\\Users\\Public"), "hrtf_tmp")
+                    os.makedirs(temp_dir, exist_ok=True)
+                temp_copy = os.path.join(temp_dir, f"hrtf_{uuid.uuid4().hex}.sofa")
+                shutil.copy2(filepath, temp_copy)
+                read_path = temp_copy
+
+            self.sofa_data, self.sofa_coords, _ = pf.io.read_sofa(read_path)
+            self.sofa_path = filepath
             self._update_hrirs()
         except Exception as e:
             QMessageBox.critical(None, "SOFA Load Error", f"Failed to load SOFA file:\n{str(e)}")
+        finally:
+            if temp_copy and os.path.exists(temp_copy):
+                try:
+                    os.remove(temp_copy)
+                except Exception:
+                    pass
 
     def _update_hrirs(self):
         if self.sofa_data is None or self.fs is None:
@@ -2112,7 +2130,7 @@ class MainWindow(QMainWindow):
                 "volume": int(round(self.engine.volume * 100)),
                 "shuffle": self.shuffle_enabled,
                 "dsp_panel_open": self.btn_toggle_dsp_panel.isChecked(),
-                "sofa_path": self.engine.sofa_path if os.path.exists(self.engine.sofa_path) else "",
+                "sofa_path": self.engine.sofa_path if (self.engine.sofa_path and os.path.exists(self.engine.sofa_path) and os.path.abspath(self.engine.sofa_path) != os.path.abspath(get_resource_path("default.sofa"))) else "",
             }
             with open(self._state_file_path(), "w", encoding="utf-8") as f:
                 json.dump(state, f, indent=2)
