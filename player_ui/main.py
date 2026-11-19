@@ -305,12 +305,12 @@ class ExportThread(QThread):
 
     def run(self):
         try:
+            import soundfile as sf
             L_in = self.engine.audio_data[:, 0]
             R_in = self.engine.audio_data[:, 1]
 
             if self.engine.bit_perfect:
                 out_data = np.stack([L_in, R_in], axis=1)
-                import soundfile as sf
                 sf.write(self.filename, out_data, self.engine.fs, subtype='PCM_24')
                 self.finished_export.emit(True, self.filename)
                 return
@@ -323,7 +323,6 @@ class ExportThread(QThread):
                     np.clip(R_out, -1.0, 1.0, out=R_out)
                 
                 out_data = np.stack([L_out, R_out], axis=1)
-                import soundfile as sf
                 sf.write(self.filename, out_data, self.engine.fs, subtype='PCM_24')
                 self.finished_export.emit(True, self.filename)
                 return
@@ -418,7 +417,7 @@ class AudioEngine(QObject):
         self.L_pad = np.zeros(self.N)
         self.R_pad = np.zeros(self.N)
         
-        self.viz_ring_size = 16384
+        self.viz_ring_size = 32768
         self.viz_ring_in = np.zeros(self.viz_ring_size, dtype=np.float32)
         self.viz_ring_out = np.zeros(self.viz_ring_size, dtype=np.float32)
         self.viz_ring_hrir = np.zeros(self.viz_ring_size, dtype=np.float32)
@@ -622,14 +621,14 @@ class AudioEngine(QObject):
         ratio_db = np.clip(ratio_db, -24.0, 12.0)
         
         hf_mask = f > 4000
-        ratio_db[hf_mask] = np.clip(ratio_db[hf_mask], -24.0, 3.0)
+        ratio_db[hf_mask] = np.clip(ratio_db[hf_mask], -24.0, 6.0)
 
         ratio_db[f < 20] = 0.0
         bass_mask = f < 120.0
         ratio_db[bass_mask] = np.clip(ratio_db[bass_mask], -24.0, 0.0)
 
         nyquist = self.fs / 2.0
-        self.bypass_fc = min(18000.0, nyquist * 0.9)
+        self.bypass_fc = min(15500.0, nyquist * 0.85)
         
         taper = np.ones_like(f)
         idx_fade = (f >= self.bypass_fc) & (f <= nyquist)
@@ -686,20 +685,34 @@ class AudioEngine(QObject):
         phase_LR = np.angle(self.h_LR_fft_norm)
         phase_RR = np.angle(self.h_RR_fft_norm)
 
-        self.h_LL_fft_flat = np.exp(1j * phase_LL)
-        self.h_RR_fft_flat = np.exp(1j * phase_RR)
-        self.h_RL_fft_flat = (mag_RL / mag_LL) * np.exp(1j * phase_RL)
-        self.h_LR_fft_flat = (mag_LR / mag_RR) * np.exp(1j * phase_LR)
+        f = np.fft.rfftfreq(self.N, 1.0 / self.fs)
+        # Anchor spatial ILD & crossfeed ratios at 10-13 kHz (before SOFA HF roll-off)
+        anchor_band = (f >= 10000.0) & (f <= 13000.0)
+        if np.any(anchor_band):
+            ipsi_ref_L = float(np.median(mag_LL[anchor_band]))
+            ipsi_ref_R = float(np.median(mag_RR[anchor_band]))
+            xf_ratio_RL = float(np.median(mag_RL[anchor_band] / mag_LL[anchor_band]))
+            xf_ratio_LR = float(np.median(mag_LR[anchor_band] / mag_RR[anchor_band]))
+        else:
+            ipsi_ref_L = ipsi_ref_R = 1.0
+            xf_ratio_RL = xf_ratio_LR = 0.25
 
-        f = np.fft.rfftfreq(self.N, 1/self.fs)
-        hf_mask = 0.5 * (1.0 + np.tanh((f - self.bypass_fc) / 500.0))
+        # Synthesize full-bandwidth HRIR extension with locked spatial ILD, crossfeed, and ITD phase
+        h_LL_ext = ipsi_ref_L * np.exp(1j * phase_LL)
+        h_RR_ext = ipsi_ref_R * np.exp(1j * phase_RR)
+        h_RL_ext = (ipsi_ref_L * xf_ratio_RL) * np.exp(1j * phase_RL)
+        h_LR_ext = (ipsi_ref_R * xf_ratio_LR) * np.exp(1j * phase_LR)
+
+        hf_mask = 0.5 * (1.0 + np.tanh((f - 14000.0) / 1500.0))
         lf_mask = 1.0 - hf_mask
+        self._hf_eq_f = None
+        self._hf_eq_db = None
 
         if self.highs_enabled:
-            self.h_LL_fft = (self.h_LL_fft_norm * lf_mask) + (self.h_LL_fft_flat * hf_mask)
-            self.h_RL_fft = (self.h_RL_fft_norm * lf_mask) + (self.h_RL_fft_flat * hf_mask)
-            self.h_LR_fft = (self.h_LR_fft_norm * lf_mask) + (self.h_LR_fft_flat * hf_mask)
-            self.h_RR_fft = (self.h_RR_fft_norm * lf_mask) + (self.h_RR_fft_flat * hf_mask)
+            self.h_LL_fft = (self.h_LL_fft_norm * lf_mask) + (h_LL_ext * hf_mask)
+            self.h_RL_fft = (self.h_RL_fft_norm * lf_mask) + (h_RL_ext * hf_mask)
+            self.h_LR_fft = (self.h_LR_fft_norm * lf_mask) + (h_LR_ext * hf_mask)
+            self.h_RR_fft = (self.h_RR_fft_norm * lf_mask) + (h_RR_ext * hf_mask)
         else:
             self.h_LL_fft = self.h_LL_fft_norm
             self.h_RL_fft = self.h_RL_fft_norm
@@ -1363,12 +1376,14 @@ class MainWindow(QMainWindow):
         self.plot_widget.setBackground('#1a1a1a')
         self.plot_widget.showGrid(x=True, y=True, alpha=0.3)
         self.plot_widget.setLogMode(x=True, y=False)
+        self.plot_widget.hideButtons()
+        self.plot_widget.setMouseEnabled(x=False, y=False)
         
         # STATIC Y-AXIS RANGE
         self.plot_widget.setYRange(-100, 5) 
         
         self.plot_widget.setLabel('left', 'Amplitude', units='dB')
-        self.plot_widget.setLabel('bottom', 'Frequency', units='Hz')
+        self.plot_widget.setLabel('bottom', 'Frequency (Hz)')
         self.plot_widget.addLegend(offset=(10, 10))
         
         # STATIC X-AXIS RANGE & TICKS
@@ -1891,15 +1906,16 @@ class MainWindow(QMainWindow):
                 return
                 
             # Use welch for much smoother, professional-looking graph
-            n_fft = 4096
-            w_seg = 2048
+            sr_mult = max(1, int(round(float(self.engine.fs) / 48000.0)))
+            n_fft = min(4096 * sr_mult, self.engine.viz_ring_size // 2)
+            w_seg = max(2048, n_fft // 2)
             b = self.engine.viz_ring_size
             head, last_frames, write_time = self.engine.viz_state
             now = time.perf_counter()
             block_dur = max(1e-4, last_frames / float(self.engine.fs))
             frac = min(1.0, max(0.0, (now - write_time) / block_dur))
 
-            if not hasattr(self, 'chunk_in_buf'):
+            if not hasattr(self, 'chunk_in_buf') or len(self.chunk_in_buf) != n_fft:
                 self.chunk_in_buf = np.zeros(n_fft)
                 self.chunk_hrir_buf = np.zeros(n_fft)
                 self.chunk_out_buf = np.zeros(n_fft)
@@ -1963,13 +1979,28 @@ class MainWindow(QMainWindow):
                     self.smoothed_hrir = alpha * self.smoothed_hrir + (1.0 - alpha) * P_hrir_db
                     self.smoothed_out = alpha * self.smoothed_out + (1.0 - alpha) * P_out_db
 
-            # Slice [1:-1] to ignore DC offset and un-doubled Nyquist bin drop
-            self.curve_in.setData(f[1:-1], self.smoothed_in[1:-1])
-            self.curve_hrir.setData(f[1:-1], self.smoothed_hrir[1:-1])
-            self.curve_out.setData(f[1:-1], self.smoothed_out[1:-1])
+            self.plot_widget.setXRange(np.log10(20), np.log10(max(20000.0, float(self.engine.fs) * 0.5)), padding=0)
+            # Slice [1:-1] and anchor at 20 Hz so the curve always touches the left axis border
+            f_vis = f[1:-1]
+            if len(f_vis) > 0 and f_vis[0] > 20.0:
+                f_vis = np.insert(f_vis, 0, 20.0)
+                in_vis = np.insert(self.smoothed_in[1:-1], 0, self.smoothed_in[1])
+                hrir_vis = np.insert(self.smoothed_hrir[1:-1], 0, self.smoothed_hrir[1])
+                out_vis = np.insert(self.smoothed_out[1:-1], 0, self.smoothed_out[1])
+            else:
+                in_vis = self.smoothed_in[1:-1]
+                hrir_vis = self.smoothed_hrir[1:-1]
+                out_vis = self.smoothed_out[1:-1]
+            bypassed = bool(self.engine.dsp_bypass or self.engine.bit_perfect)
+            self.curve_in.setData(f_vis, in_vis)
+            self.curve_hrir.setData([], []) if bypassed else self.curve_hrir.setData(f_vis, hrir_vis)
+            self.curve_out.setData(f_vis, out_vis)
             
             if self.engine.correction_f is not None:
-                self.curve_corr.setData(self.engine.correction_f, self.engine.correction_db)
+                corr_db = self.engine.correction_db
+                if self.engine.highs_enabled and getattr(self.engine, '_hf_eq_f', None) is not None:
+                    corr_db = corr_db + np.interp(self.engine.correction_f, self.engine._hf_eq_f, self.engine._hf_eq_db)
+                self.curve_corr.setData(self.engine.correction_f, corr_db)
         except Exception:
             pass
 
