@@ -91,6 +91,11 @@ jobs:
           cp "$(which ffprobe)" player_ui/bin/ffprobe
           chmod +x player_ui/bin/ffmpeg player_ui/bin/ffprobe
 
+      - name: Build macOS Driver-Free Process Tap Helper
+        run: |
+          clang -dynamiclib -fobjc-arc -O2 -framework Foundation -framework CoreAudio \
+            macos_tap/huq_tap.m -o macos_tap/libhuq_tap.dylib
+
       - name: Bundle macOS .app with PyInstaller
         run: |
           pyinstaller --noconfirm --windowed --name "Huq" \
@@ -98,10 +103,12 @@ jobs:
             --collect-data sofar \
             --collect-data pyfar \
             --add-binary "hrtf_core/target/release/libhrtf_core.dylib:." \
+            --add-binary "macos_tap/libhuq_tap.dylib:." \
             --add-binary "player_ui/bin/ffmpeg:bin" \
             --add-binary "player_ui/bin/ffprobe:bin" \
             --add-data "player_ui/default.sofa:." \
             player_ui/main.py
+          /usr/libexec/PlistBuddy -c "Add :NSAudioCaptureUsageDescription string 'Huq captures system audio to apply real-time binaural HRTF processing.'" "dist/Huq.app/Contents/Info.plist" 
 
       - name: Ad-Hoc Code Sign .app & Create .dmg
         run: |

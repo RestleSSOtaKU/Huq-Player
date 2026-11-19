@@ -104,9 +104,27 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                                QHBoxLayout, QPushButton, QSlider, QLabel, 
                                QFileDialog, QCheckBox, QSpinBox, QMessageBox,
                                QComboBox, QListWidget, QListWidgetItem, QSplitter, QLineEdit)
-from PySide6.QtCore import Qt, QTimer, Signal, QObject, QThread, QSize
+from PySide6.QtCore import Qt, QTimer, Signal, QObject, QThread, QSize, QEvent
 from PySide6.QtGui import QPixmap, QIcon
 from dsp_bridge import RustDspBridge
+
+
+_mac_tap_lib = None
+def _get_mac_tap():
+    global _mac_tap_lib
+    if _mac_tap_lib is None and sys.platform == "darwin":
+        import ctypes
+        dylib = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "macos_tap", "libhuq_tap.dylib")
+        if not os.path.exists(dylib):
+            dylib = get_resource_path("libhuq_tap.dylib")
+        if os.path.exists(dylib):
+            lib = ctypes.CDLL(dylib)
+            lib.huq_tap_start.restype = ctypes.c_double
+            lib.huq_tap_stop.restype = None
+            lib.huq_tap_read.argtypes = [ctypes.POINTER(ctypes.c_float), ctypes.c_uint32]
+            lib.huq_tap_read.restype = ctypes.c_uint32
+            _mac_tap_lib = lib
+    return _mac_tap_lib
 
 SUBPROCESS_FLAGS = {"creationflags": 0x08000000} if sys.platform == "win32" else {}
 
@@ -163,6 +181,15 @@ class DeviceComboBox(QComboBox):
         if self.refresh_callback:
             self.refresh_callback()
         super().showPopup()
+
+class RightClickPushButton(QPushButton):
+    rightClicked = Signal()
+    def mousePressEvent(self, event):
+        if event.button() == Qt.RightButton:
+            self.rightClicked.emit()
+            event.accept()
+            return
+        super().mousePressEvent(event)
 
 def _low_shelf_sos(fc, gain_db, Q, fs):
     A = 10 ** (gain_db / 40.0)
@@ -386,6 +413,13 @@ class AudioEngine(QObject):
         self.low_end_mode = False
         
         self.selected_device = None
+        self.input_device = None
+        self.use_mac_tap = False
+        self.auto_trim_gain = 1.0
+        self.input_stream = None
+        self.live_ring = np.zeros((65536, 2), dtype=np.float32)
+        self.live_write_pos = 0
+        self.live_read_pos = 0
         self.stream_mode_status = "Tip: Select your DAC directly instead of System Default for native sample-rate switching."
         self.stream_is_exclusive = False
         
@@ -466,7 +500,7 @@ class AudioEngine(QObject):
                 tonal_match=self.tonal_match_enabled,
                 bypass=self.dsp_bypass,
                 bit_perfect=self.bit_perfect,
-                hard_clip=not self.float_mode,
+                hard_clip=False,
             )
 
     def _push_rust_filters(self):
@@ -628,13 +662,14 @@ class AudioEngine(QObject):
         ratio_db[bass_mask] = np.clip(ratio_db[bass_mask], -24.0, 0.0)
 
         nyquist = self.fs / 2.0
-        self.bypass_fc = min(15500.0, nyquist * 0.85)
+        self.bypass_fc = min(15500.0 if self.highs_enabled else 12000.0, nyquist * 0.85)
+        end_fc = nyquist if self.highs_enabled else min(15000.0, nyquist * 0.92)
         
         taper = np.ones_like(f)
-        idx_fade = (f >= self.bypass_fc) & (f <= nyquist)
+        idx_fade = (f >= self.bypass_fc) & (f <= end_fc)
         if np.any(idx_fade):
-            taper[idx_fade] = (nyquist - f[idx_fade]) / (nyquist - self.bypass_fc)
-        taper[f > nyquist] = 0.0
+            taper[idx_fade] = (end_fc - f[idx_fade]) / max(1.0, end_fc - self.bypass_fc)
+        taper[f > end_fc] = 0.0
         ratio_db *= taper
 
         self.correction_f = f
@@ -726,8 +761,20 @@ class AudioEngine(QObject):
         self._ensure_rust_engine()
         self._push_rust_filters()
 
+    def _input_callback(self, indata, frames, time_info, status):
+        n = len(indata)
+        cap = len(self.live_ring)
+        w = self.live_write_pos % cap
+        if w + n <= cap:
+            self.live_ring[w:w+n] = indata[:, :2]
+        else:
+            part = cap - w
+            self.live_ring[w:] = indata[:part, :2]
+            self.live_ring[:n-part] = indata[part:, :2]
+        self.live_write_pos += n
+
     def start(self):
-        if self.audio_data is None or self.is_playing or self.fs is None:
+        if (self.audio_data is None and self.input_device is None and not self.use_mac_tap) or self.is_playing or self.fs is None:
             return
 
         self._ensure_rust_engine()
@@ -768,6 +815,28 @@ class AudioEngine(QObject):
                 extra_settings=extra_settings,
                 clip_off=True
             )
+            if self.use_mac_tap:
+                tap = _get_mac_tap()
+                if tap is None:
+                    raise RuntimeError("macOS Process Tap library missing")
+                native_sr = tap.huq_tap_start()
+                if native_sr <= 0.0:
+                    raise RuntimeError("macOS Process Tap unavailable or permission denied")
+                self.tap_native_fs = int(round(native_sr))
+            elif self.input_device is not None:
+                self.live_ring.fill(0)
+                self.live_write_pos = 0
+                self.live_read_pos = 0
+                self.input_stream = sd.InputStream(
+                    samplerate=self.fs,
+                    blocksize=self.block_size,
+                    channels=2,
+                    dtype='float32',
+                    device=self.input_device,
+                    callback=self._input_callback,
+                    latency='low',
+                )
+                self.input_stream.start()
             self.stream.start()
             if sys.platform == "darwin":
                 if self.selected_device is not None:
@@ -816,6 +885,17 @@ class AudioEngine(QObject):
 
     def stop(self, fast=False):
         self.manual_stop = True
+        if self.use_mac_tap:
+            tap = _get_mac_tap()
+            if tap is not None:
+                tap.huq_tap_stop()
+        if self.input_stream is not None:
+            try:
+                self.input_stream.stop()
+                self.input_stream.close()
+            except Exception:
+                pass
+            self.input_stream = None
         if self.stream is not None:
             try:
                 if fast:
@@ -844,20 +924,45 @@ class AudioEngine(QObject):
             self.rust_dsp.reset()
 
     def _audio_callback(self, outdata, frames, time, status):
-        if not self.is_playing or self.audio_data is None:
+        if not self.is_playing or (self.audio_data is None and self.input_device is None and not self.use_mac_tap):
             outdata.fill(0)
             return
-        
-        end_frame = self.current_frame + frames
-        if end_frame > len(self.audio_data):
-            chunk = self.audio_data[self.current_frame:]
-            outdata[:len(chunk)] = chunk
-            outdata[len(chunk):].fill(0)
-            self.is_playing = False
-            raise sd.CallbackStop
-            
-        in_block = self.audio_data[self.current_frame:end_frame]
-        self.current_frame = end_frame
+
+        if self.use_mac_tap:
+            tap = _get_mac_tap()
+            in_block = np.zeros((frames, 2), dtype=np.float32)
+            if tap is not None:
+                import ctypes
+                ptr = in_block.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+                got = tap.huq_tap_read(ptr, frames)
+                if got == 0:
+                    outdata.fill(0)
+                    return
+        elif self.input_device is not None:
+            avail = self.live_write_pos - self.live_read_pos
+            if avail < frames:
+                outdata.fill(0)
+                return
+            if avail > self.block_size * 4:
+                self.live_read_pos = self.live_write_pos - self.block_size * 2
+            cap = len(self.live_ring)
+            r = self.live_read_pos % cap
+            if r + frames <= cap:
+                in_block = self.live_ring[r:r+frames].copy()
+            else:
+                part = cap - r
+                in_block = np.vstack((self.live_ring[r:], self.live_ring[:frames-part]))
+            self.live_read_pos += frames
+        else:
+            end_frame = self.current_frame + frames
+            if end_frame > len(self.audio_data):
+                chunk = self.audio_data[self.current_frame:]
+                outdata[:len(chunk)] = chunk
+                outdata[len(chunk):].fill(0)
+                self.is_playing = False
+                raise sd.CallbackStop
+            in_block = self.audio_data[self.current_frame:end_frame]
+            self.current_frame = end_frame
         
         if self.rust_dsp is not None and frames <= self.block_size:
          out_slice = self.cb_out_buf[:frames]
@@ -871,6 +976,16 @@ class AudioEngine(QObject):
          if self.dsp_hist_count < 4096:
              self.dsp_hist_count += 1
 
+         if not self.float_mode and not self.bit_perfect:
+             ceiling = 0.94406  # -0.5 dBFS headroom ceiling
+             pk = float(np.max(np.abs(out_slice)))
+             if pk * self.auto_trim_gain > ceiling:
+                 self.auto_trim_gain = ceiling / max(pk, 1e-9)
+             elif self.auto_trim_gain < 1.0:
+                 self.auto_trim_gain = min(1.0, self.auto_trim_gain * 1.015)
+             if self.auto_trim_gain < 0.9999:
+                 np.multiply(out_slice, self.auto_trim_gain, out=out_slice)
+             np.clip(out_slice, -1.0, 1.0, out=out_slice)
          np.copyto(outdata, out_slice)
          out_L = out_slice[:, 0]
          hrir_L = viz_slice
@@ -910,6 +1025,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setAcceptDrops(True)
+        QApplication.instance().installEventFilter(self)
         self.setWindowTitle("ɦuk — Anechoic Engine")
         self.setMinimumSize(1100, 820)
         
@@ -976,6 +1092,14 @@ class MainWindow(QMainWindow):
         self.debounce_timer.setSingleShot(True)
         self.debounce_timer.setInterval(150) 
         self.debounce_timer.timeout.connect(self.apply_dsp_params)
+
+        self.live_tonal_timer = QTimer(self)
+        self.live_tonal_timer.setInterval(1500)
+        self.live_tonal_timer.timeout.connect(self._update_live_tonal_match)
+
+        self._bp_ramp_timer = QTimer(self)
+        self._bp_ramp_timer.setInterval(25)
+        self._bp_ramp_timer.timeout.connect(self._step_bit_perfect_ramp)
 
         self.loader_thread = None
         self.export_thread = None
@@ -1169,9 +1293,12 @@ class MainWindow(QMainWindow):
         left_layout = QVBoxLayout()
         
         lib_top = QHBoxLayout()
+        self.btn_open_file = QPushButton("Open File")
+        self.btn_open_file.clicked.connect(self.open_single_file)
         self.btn_scan = QPushButton("Scan Folder")
         self.btn_scan.clicked.connect(self.scan_folder)
         self.lbl_lib_info = QLabel("Library empty")
+        lib_top.addWidget(self.btn_open_file)
         lib_top.addWidget(self.btn_scan)
         lib_top.addWidget(self.lbl_lib_info, 1)
         left_layout.addLayout(lib_top)
@@ -1180,6 +1307,8 @@ class MainWindow(QMainWindow):
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText("Search title or artist...")
         self.search_input.setClearButtonEnabled(True)
+        self.search_input.setFocusPolicy(Qt.ClickFocus)
+        self.search_input.returnPressed.connect(self.setFocus)
         self.search_input.textChanged.connect(self.filter_playlist)
 
         self.combo_sort = QComboBox()
@@ -1223,8 +1352,14 @@ class MainWindow(QMainWindow):
         self.btn_export.clicked.connect(self.export_track)
         self.btn_export.setEnabled(False)
         
+        self.btn_go_live = QPushButton("Go Live")
+        self.btn_go_live.setCheckable(True)
+        self.btn_go_live.setVisible(_get_mac_tap() is not None)
+        self.btn_go_live.clicked.connect(self.toggle_go_live)
+
         file_layout.addWidget(self.btn_load_sofa)
         file_layout.addWidget(self.lbl_sofa_file, 1)
+        file_layout.addWidget(self.btn_go_live)
         file_layout.addWidget(self.btn_export)
         right_layout.addLayout(file_layout)
 
@@ -1303,6 +1438,7 @@ class MainWindow(QMainWindow):
         self.btn_play = QPushButton("▶ Play")
         self.btn_play.setObjectName("playBtn")
         self.btn_play.setFixedWidth(120)
+        self.btn_play.setFocusPolicy(Qt.NoFocus)
         self.btn_play.clicked.connect(self.toggle_play)
 
         self.btn_next = QPushButton("Next ⏭")
@@ -1323,9 +1459,11 @@ class MainWindow(QMainWindow):
         self.btn_bypass.setCheckable(True)
         self.btn_bypass.clicked.connect(self.toggle_bypass)
 
-        self.btn_bit_perfect = QPushButton("Bit-Perfect: Off")
+        self.btn_bit_perfect = RightClickPushButton("Bit-Perfect: Off")
         self.btn_bit_perfect.setCheckable(True)
+        self.btn_bit_perfect.setToolTip("Left-click: Safe gradual volume ramp to 100%\nRight-click: Instant 100% Bit-Perfect")
         self.btn_bit_perfect.clicked.connect(self.toggle_bit_perfect)
+        self.btn_bit_perfect.rightClicked.connect(self.instant_bit_perfect)
 
         self.btn_highs = QPushButton("Highs Fix: On")
         self.btn_highs.setCheckable(True)
@@ -1372,7 +1510,6 @@ class MainWindow(QMainWindow):
         # Graph
         self.plot_widget = pg.PlotWidget(title="Real-time Spectrum: Input vs Output")
         self.plot_widget.setMinimumHeight(150)
-        self.plot_widget.setMaximumHeight(420)
         self.plot_widget.setBackground('#1a1a1a')
         self.plot_widget.showGrid(x=True, y=True, alpha=0.3)
         self.plot_widget.setLogMode(x=True, y=False)
@@ -1566,6 +1703,17 @@ class MainWindow(QMainWindow):
             self.save_session_state()
 
     def play_selected_item(self, item):
+        if getattr(self.engine, "use_mac_tap", False):
+            self.btn_go_live.blockSignals(True)
+            self.btn_go_live.setChecked(False)
+            self.btn_go_live.setText("Go Live")
+            self.btn_go_live.blockSignals(False)
+            self.engine.use_mac_tap = False
+            self.engine.auto_trim_gain = 1.0
+            self.slider_seek.setEnabled(True)
+            self.btn_prev.setEnabled(True)
+            self.btn_next.setEnabled(True)
+            self.btn_export.setEnabled(True)
         track = item.data(Qt.UserRole)
         self.current_track_index = self.list_widget.row(item)
         
@@ -1616,7 +1764,7 @@ class MainWindow(QMainWindow):
 
     # --- PLAYER LOGIC ---
     def load_audio_file(self, filepath):
-        self.engine.stop()
+        self.engine.stop(fast=True)
         self.btn_play.setText("▶ Play")
         self.btn_play.setEnabled(False)
         self.btn_export.setEnabled(False)
@@ -1640,11 +1788,14 @@ class MainWindow(QMainWindow):
         self.loader_thread.start()
 
     def on_audio_loaded(self, success, filepath):
+        if self.sender() is not None and self.sender() is not self.loader_thread:
+            return
         self.btn_play.setEnabled(True)
         
         if success and self.loader_thread is not None:
             self.engine.audio_data = self.loader_thread.result_data
             self.engine.fs = self.loader_thread.result_fs
+            self.engine.file_fs = self.loader_thread.result_fs
             
             sr_khz = self.engine.fs / 1000.0
             self.lbl_sr.setText(f"Stream SR: {sr_khz:.1f} kHz")
@@ -1784,6 +1935,110 @@ class MainWindow(QMainWindow):
             
         self.combo_device.blockSignals(False)
 
+    def toggle_go_live(self, checked):
+        is_live = bool(checked)
+        was_playing = self.engine.is_playing
+        if was_playing:
+            self.engine.stop(fast=True)
+        self.engine.use_mac_tap = is_live
+        if is_live:
+            self.engine.tonal_filter = None
+            self.engine.correction_f = None
+            self.engine.correction_db = None
+            self.curve_corr.setData([], [])
+            self.engine._update_filters()
+        self.engine.input_device = None
+        self.btn_go_live.setText("Live: ON" if is_live else "Go Live")
+        self.slider_vol.default_value = 80 if is_live else 44
+        if is_live:
+            self._pre_live_vol = self.slider_vol.value()
+            if not self.engine.bit_perfect and self.slider_vol.value() < 75:
+                self.slider_vol.setValue(80)
+        elif hasattr(self, "_pre_live_vol") and not self.engine.bit_perfect:
+            self.slider_vol.setValue(self._pre_live_vol)
+        self.slider_vol.default_value = 80 if is_live else 44
+        self.slider_seek.setEnabled(not is_live)
+        self.btn_prev.setEnabled(not is_live)
+        self.btn_next.setEnabled(not is_live)
+        if is_live:
+            self.btn_export.setEnabled(False)
+            if self.engine.selected_device is None:
+                for i in range(1, self.combo_device.count()):
+                    self.combo_device.setCurrentIndex(i)
+                    break
+            from PySide6.QtGui import QPainter, QColor, QFont
+            live_pm = QPixmap(440, 440)
+            live_pm.fill(QColor("#111111"))
+            painter = QPainter(live_pm)
+            painter.setPen(QColor("#0a84ff"))
+            painter.setFont(QFont("Helvetica Neue", 44, QFont.Bold))
+            painter.drawText(live_pm.rect(), Qt.AlignCenter, "LIVE")
+            painter.end()
+            self._raw_cover_pixmap = live_pm
+            self._last_cover_render_key = None
+            self.update_cover_art_size()
+            self.lbl_track_title.setText("Live System Audio")
+            self.lbl_track_artist.setText("macOS Driver-Free Process Tap")
+            self.btn_play.setEnabled(True)
+            tap = _get_mac_tap()
+            if tap is not None:
+                nat_sr = tap.huq_tap_start()
+                if nat_sr > 0.0:
+                    nat = int(round(nat_sr))
+                    self.engine.tap_native_fs = nat
+                    if self.engine.fs != nat:
+                        self.engine.fs = nat
+                        if self.engine.sofa_data is not None:
+                            self.engine._update_hrirs()
+                        else:
+                            self.engine._update_filters()
+            self.smoothed_in = None
+            if not self.engine.is_playing:
+                self.toggle_play()
+            else:
+                self.btn_play.setText("⏸ Pause")
+                if not self.viz_timer.isActive():
+                    self.viz_timer.start()
+            self.live_tonal_timer.start()
+            QTimer.singleShot(450, self._update_live_tonal_match)
+            self.lbl_sr.setText(f"Stream SR: {self.engine.fs / 1000.0:.1f} kHz (Native)")
+        else:
+            self.live_tonal_timer.stop()
+            self.engine.auto_trim_gain = 1.0
+            saved_fs = getattr(self.engine, "file_fs", None)
+            if saved_fs:
+                self.engine.fs = saved_fs
+                if self.engine.sofa_data is not None:
+                    self.engine._update_hrirs()
+                else:
+                    self.engine._update_filters()
+            if self.engine.audio_data is not None and self.engine.fs:
+                self.lbl_sr.setText(f"Stream SR: {self.engine.fs / 1000.0:.1f} kHz")
+            if 0 <= self.current_track_index < len(self.library_tracks):
+                tr = self.library_tracks[self.current_track_index]
+                self.lbl_track_title.setText(tr['title'])
+                self.lbl_track_artist.setText(tr['artist'])
+                cb = _extract_cover_bytes(tr['path'])
+                if cb:
+                    pm = QPixmap()
+                    pm.loadFromData(cb)
+                    self._raw_cover_pixmap = pm.scaled(440, 440, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                    self._last_cover_render_key = None
+                    self.update_cover_art_size()
+                else:
+                    self._raw_cover_pixmap = None
+                    self.lbl_cover.clear()
+                    self.lbl_cover.setText("No Cover")
+            else:
+                self.lbl_track_title.setText("No Track Playing")
+                self.lbl_track_artist.setText("Unknown Artist")
+            self.btn_export.setEnabled(self.engine.audio_data is not None)
+            self.btn_play.setText("▶ Play")
+            self.timer.stop()
+            self.viz_timer.stop()
+            self.lbl_dev_status.setText("Live Stopped — Press Play or select a track.")
+            self.lbl_dev_status.setStyleSheet("color: #8e8e93; font-size: 11px; margin-bottom: 4px;")
+
     def change_device(self):
         self.engine.selected_device = self.combo_device.currentData()
         if self.engine.is_playing:
@@ -1822,7 +2077,7 @@ class MainWindow(QMainWindow):
     def toggle_float_mode(self, state):
         self.engine.float_mode = bool(state)
         if state:
-            self.btn_float_mode.setText("Float (Smooth)")
+            self.btn_float_mode.setText("Float (32-bit Raw)")
         else:
             self.btn_float_mode.setText("Hard Clip (Exact)")
         self.engine._sync_rust_params()
@@ -1837,15 +2092,69 @@ class MainWindow(QMainWindow):
             self.btn_bit_perfect.setText("Bit-Perfect: Off")
         self.engine._sync_rust_params()
 
-    def toggle_bit_perfect(self, state):
-        self.engine.bit_perfect = bool(state)
-        if state:
+    def _step_bit_perfect_ramp(self):
+        cur = getattr(self, "_bp_ramp_float", float(self.slider_vol.value()))
+        if cur < 99.9:
+            nxt_f = min(100.0, cur + getattr(self, "_bp_ramp_step", 0.7))
+            self._bp_ramp_float = nxt_f
+            nxt = int(round(nxt_f))
+            self.slider_vol.blockSignals(True)
+            self.slider_vol.setValue(nxt)
+            self.slider_vol.blockSignals(False)
+            self.engine.volume = nxt_f / 100.0
+            self.lbl_vol.setText(f"{nxt} %")
+            self.engine._sync_rust_params()
+        else:
+            self._bp_ramp_timer.stop()
+            self.slider_vol.blockSignals(True)
+            self.slider_vol.setValue(100)
+            self.slider_vol.blockSignals(False)
+            self.engine.volume = 1.0
+            self.engine.bit_perfect = True
             self.btn_bit_perfect.setText("Bit-Perfect: On")
+            self.lbl_vol.setText("100 %")
+            self.engine._sync_rust_params()
+
+    def instant_bit_perfect(self):
+        turn_on = not self.btn_bit_perfect.isChecked()
+        self.btn_bit_perfect.blockSignals(True)
+        self.btn_bit_perfect.setChecked(turn_on)
+        self.btn_bit_perfect.blockSignals(False)
+        self.toggle_bit_perfect(turn_on, instant=True)
+
+    def toggle_bit_perfect(self, state, instant=False):
+        self._bp_ramp_timer.stop()
+        if state:
+            cur_vol = self.slider_vol.value()
+            self._pre_bp_vol = cur_vol
+            self.engine.auto_trim_gain = 1.0
             self.engine.dsp_bypass = True
             self.btn_bypass.setChecked(True)
             self.btn_bypass.setText("DSP Bypassed")
+            self.slider_vol.setEnabled(False)
+            if instant or cur_vol >= 100:
+                self.engine.bit_perfect = True
+                self.btn_bit_perfect.setText("Bit-Perfect: On")
+                self.slider_vol.blockSignals(True)
+                self.slider_vol.setValue(100)
+                self.slider_vol.blockSignals(False)
+                self.engine.volume = 1.0
+                self.lbl_vol.setText("100 %")
+            else:
+                self.engine.bit_perfect = False
+                self._bp_ramp_float = float(cur_vol)
+                self._bp_ramp_step = max(0.25, (100.0 - float(cur_vol)) / 80.0)  # 80 * 25ms = exact 2.0s ramp
+                self.btn_bit_perfect.setText("Bit-Perfect: Ramp...")
+                self._bp_ramp_timer.start()
         else:
+            self.engine.bit_perfect = False
             self.btn_bit_perfect.setText("Bit-Perfect: Off")
+            self.slider_vol.setEnabled(True)
+            safe_def = 80 if getattr(self.engine, 'use_mac_tap', False) else 44
+            restore_vol = getattr(self, "_pre_bp_vol", safe_def)
+            if restore_vol >= 95:
+                restore_vol = safe_def
+            self.slider_vol.setValue(restore_vol)
         self.engine._sync_rust_params()
 
     def toggle_highs(self, state):
@@ -1854,6 +2163,11 @@ class MainWindow(QMainWindow):
             self.btn_highs.setText("Highs Fix: On")
         else:
             self.btn_highs.setText("Highs Fix: Off")
+        if self.engine.use_mac_tap:
+            self.engine.correction_db = None
+            self._update_live_tonal_match()
+        elif self.engine.audio_data is not None:
+            self.engine._calculate_tonal_match()
         self.engine._update_filters()
 
     def slider_bass_changed(self, value):
@@ -1900,9 +2214,63 @@ class MainWindow(QMainWindow):
             if self.engine.sofa_path:
                 self.engine._update_hrirs()
 
+    def _update_live_tonal_match(self):
+        if not (self.engine.is_playing and self.engine.use_mac_tap and self.engine.tonal_match_enabled):
+            return
+        if self.engine.dsp_bypass or self.engine.bit_perfect or self.engine.h_LL_fft_raw is None:
+            return
+        try:
+            n_win = min(self.engine.viz_ring_size, int(self.engine.fs * 0.65))
+            head = self.engine.viz_head
+            if head >= n_win:
+                seg = self.engine.viz_ring_in[head - n_win:head].copy()
+            else:
+                seg = np.concatenate((self.engine.viz_ring_in[-(n_win - head):], self.engine.viz_ring_in[:head]))
+            if float(np.sqrt(np.mean(seg * seg))) < 1e-4:
+                return  # Silence/paused stream, keep current curve
+
+            n_fft = min(4096, len(seg))
+            f, P_in = _fast_welch(seg, fs=self.engine.fs, nperseg=n_fft)
+            f_raw = np.fft.rfftfreq(self.engine.N, 1.0 / self.engine.fs)
+            gain_raw = (np.abs(self.engine.h_LL_fft_raw) ** 2) + (np.abs(self.engine.h_RL_fft_raw) ** 2)
+            P_out = P_in * np.interp(f, f_raw, gain_raw)
+
+            ratio_db = 10.0 * np.log10((P_in + 1e-12) / (P_out + 1e-12))
+            ratio_db = _fast_uniform_filter1d(ratio_db, 15)
+            ratio_db = np.clip(ratio_db, -24.0, 12.0)
+            ratio_db[f > 4000.0] = np.clip(ratio_db[f > 4000.0], -24.0, 6.0)
+            ratio_db[f < 20.0] = 0.0
+            ratio_db[f < 120.0] = np.clip(ratio_db[f < 120.0], -24.0, 0.0)
+
+            nyquist = self.engine.fs / 2.0
+            fc = min(15500.0 if self.engine.highs_enabled else 12000.0, nyquist * 0.85)
+            end_fc = nyquist if self.engine.highs_enabled else min(15000.0, nyquist * 0.92)
+            taper = np.ones_like(f)
+            idx_fade = (f >= fc) & (f <= end_fc)
+            if np.any(idx_fade):
+                taper[idx_fade] = (end_fc - f[idx_fade]) / max(1.0, end_fc - fc)
+            taper[f > end_fc] = 0.0
+            ratio_db *= taper
+
+            if self.engine.correction_db is not None and len(self.engine.correction_db) == len(ratio_db):
+                ratio_db = 0.65 * self.engine.correction_db + 0.35 * ratio_db
+                if float(np.max(np.abs(ratio_db - self.engine.correction_db))) < 0.25:
+                    return
+
+            self.engine.correction_f = f
+            self.engine.correction_db = ratio_db
+
+            n_taps = 2049
+            f_grid = np.linspace(0, 1.0, n_taps // 2 + 1)
+            g_grid = np.interp(f_grid * (self.engine.fs / 2.0), f, ratio_db)
+            self.engine.tonal_filter = _fast_firwin2(n_taps, f_grid, 10.0 ** (g_grid / 20.0))
+            self.engine._update_filters()
+        except Exception:
+            pass
+
     def update_graph(self):
         try:
-            if not self.engine.is_playing or self.engine.audio_data is None:
+            if not self.engine.is_playing or (self.engine.audio_data is None and self.engine.input_device is None and not self.engine.use_mac_tap):
                 return
                 
             # Use welch for much smoother, professional-looking graph
@@ -1956,11 +2324,21 @@ class MainWindow(QMainWindow):
             peak = np.max(np.abs(self.chunk_out_buf))
             peak_db = 20 * np.log10(peak + 1e-12)
             if peak_db > 0.0:
-                self.lbl_peak.setText(f"Peak: {peak_db:.1f} dB (CLIPPING!)")
-                self.lbl_peak.setStyleSheet("color: #ff3b30; font-weight: bold; font-family: 'Helvetica Neue';")
+                if self.engine.float_mode:
+                    self.lbl_peak.setText(f"Peak: +{peak_db:.1f} dB (32f OVER)")
+                    self.lbl_peak.setStyleSheet("color: #ff9500; font-weight: bold; font-family: 'Helvetica Neue';")
+                else:
+                    self.lbl_peak.setText(f"Peak: +{peak_db:.1f} dB (CLIPPING!)")
+                    self.lbl_peak.setStyleSheet("color: #ff3b30; font-weight: bold; font-family: 'Helvetica Neue';")
             else:
-                self.lbl_peak.setText(f"Peak: {peak_db:.1f} dB")
-                self.lbl_peak.setStyleSheet("color: #34c759; font-weight: bold; font-family: 'Helvetica Neue';")
+                trim = getattr(self.engine, "auto_trim_gain", 1.0)
+                if trim < 0.995 and not self.engine.float_mode and not self.engine.bit_perfect:
+                    gr_db = 20.0 * np.log10(max(trim, 1e-9))
+                    self.lbl_peak.setText(f"Peak: {peak_db:.1f} dB (LIM {gr_db:.1f} dB)")
+                    self.lbl_peak.setStyleSheet("color: #ff9500; font-weight: bold; font-family: 'Helvetica Neue';")
+                else:
+                    self.lbl_peak.setText(f"Peak: {peak_db:.1f} dB")
+                    self.lbl_peak.setStyleSheet("color: #34c759; font-weight: bold; font-family: 'Helvetica Neue';")
 
             if getattr(self, 'smoothed_in', None) is None:
                 self.smoothed_in = P_in_db
@@ -2081,7 +2459,10 @@ class MainWindow(QMainWindow):
             self.engine._update_filters()
 
     def update_volume(self, val):
-        self.engine.volume = val / 100.0
+        new_v = val / 100.0
+        if new_v < self.engine.volume:
+            self.engine.auto_trim_gain = 1.0
+        self.engine.volume = new_v
         self.lbl_vol.setText(f"{val} %")
         self.engine._sync_rust_params()
 
@@ -2263,6 +2644,68 @@ class MainWindow(QMainWindow):
             self._refresh_playlist_labels()
         self.save_session_state()
 
+    def open_single_file(self):
+        files, _ = QFileDialog.getOpenFileNames(
+            self, "Open Audio File(s)", "", "Audio Files (*.flac *.wav *.mp3 *.m4a *.ogg *.opus)"
+        )
+        if files:
+            self.load_dropped_tracks(files)
+
+    def eventFilter(self, obj, event):
+        if event.type() in (QEvent.KeyPress, QEvent.ShortcutOverride):
+            fw = QApplication.focusWidget()
+            if isinstance(fw, (QLineEdit, QSpinBox)):
+                return False
+            key = event.key()
+            handled = (Qt.Key_Space, Qt.Key_Left, Qt.Key_Right, Qt.Key_Up, Qt.Key_Down, Qt.Key_M, Qt.Key_B)
+            if key in handled:
+                if event.type() == QEvent.ShortcutOverride:
+                    event.accept()
+                    return True
+                if key == Qt.Key_Space and self.btn_play.isEnabled():
+                    self.toggle_play()
+                elif key == Qt.Key_Left and self.engine.audio_data is not None:
+                    self.engine.seek(self.engine.current_frame - int(5 * self.engine.fs))
+                    self.smoothed_in = None
+                elif key == Qt.Key_Right and self.engine.audio_data is not None:
+                    self.engine.seek(self.engine.current_frame + int(5 * self.engine.fs))
+                    self.smoothed_in = None
+                elif key == Qt.Key_Up:
+                    self.slider_vol.setValue(min(100, self.slider_vol.value() + 5))
+                elif key == Qt.Key_Down:
+                    self.slider_vol.setValue(max(0, self.slider_vol.value() - 5))
+                elif key == Qt.Key_M:
+                    if self.slider_vol.value() > 0:
+                        self._pre_mute_vol = self.slider_vol.value()
+                        self.slider_vol.setValue(0)
+                    else:
+                        self.slider_vol.setValue(getattr(self, "_pre_mute_vol", 44))
+                elif key == Qt.Key_B:
+                    self.btn_bypass.toggle()
+                    self.toggle_bypass(self.btn_bypass.isChecked())
+                return True
+            ch = event.text().strip().lower()
+            no_cmd = not (event.modifiers() & (Qt.ControlModifier | Qt.MetaModifier | Qt.AltModifier))
+            if len(ch) == 1 and ch.isalnum() and no_cmd:
+                if event.type() == QEvent.ShortcutOverride:
+                    event.accept()
+                    return True
+                matches = [
+                    r for r in range(self.list_widget.count())
+                    if not self.list_widget.item(r).isHidden()
+                    and self.list_widget.item(r).text().lstrip().lower().startswith(ch)
+                ]
+                if matches:
+                    cur = self.list_widget.currentRow()
+                    if cur in matches:
+                        nxt = matches[(matches.index(cur) + 1) % len(matches)]
+                    else:
+                        nxt = matches[0]
+                    self.list_widget.setCurrentRow(nxt)
+                    self.list_widget.scrollToItem(self.list_widget.item(nxt))
+                return True
+        return False
+
     def keyPressEvent(self, event):
         if event.key() in (Qt.Key_Delete, Qt.Key_Backspace) and self.list_widget.hasFocus():
             self.remove_selected_tracks()
@@ -2322,7 +2765,7 @@ class MainWindow(QMainWindow):
                 "sort_mode": self.combo_sort.currentIndex() if hasattr(self, "combo_sort") else 0,
                 "current_index": self.current_track_index,
                 "position_sec": pos_sec,
-                "volume": int(round(self.engine.volume * 100)),
+                "volume": getattr(self, "_pre_bp_vol", getattr(self, "_pre_live_vol", int(round(self.engine.volume * 100)))) if (self.engine.bit_perfect or self._bp_ramp_timer.isActive() or self.engine.use_mac_tap) else int(round(self.engine.volume * 100)),
                 "shuffle": self.shuffle_enabled,
                 "dsp_panel_open": self.btn_toggle_dsp_panel.isChecked(),
                 "low_end_mode": self.engine.low_end_mode,
@@ -2441,12 +2884,18 @@ class MainWindow(QMainWindow):
             f.setPixelSize(artist_px)
             self.lbl_track_artist.setFont(f)
 
+    def changeEvent(self, event):
+        if event.type() == QEvent.WindowStateChange and hasattr(self, "lbl_cover"):
+            self.lbl_cover.setMinimumSize(110, 110)
+        super().changeEvent(event)
+
     def resizeEvent(self, event):
         super().resizeEvent(event)
         if hasattr(self, "lbl_cover"):
             self.update_cover_art_size()
 
     def closeEvent(self, event):
+        QApplication.instance().removeEventFilter(self)
         self.save_session_state()
         self.engine.stop()
         event.accept()

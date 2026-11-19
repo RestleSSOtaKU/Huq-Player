@@ -27,3 +27,14 @@
 
 # Planned Roadmap
 - Refactor into a modular single-repo architecture: `anechoic_core/` (Rust DSP), `anechoic_engine/` (shared Python audio/SOFA bridge), and `editions/` (hot-swappable UI themes + DSP feature profiles, starting with a midnight-black and crimson-ruby theme for `ɦuk`).
+
+# Recent Additions & Architecture Updates (v0.3.8+)
+- **Platform Focus:**
+  - Active release targets are **Windows (`Huq-Windows.zip`)** and **macOS Apple Silicon (`Huq-macOS-AppleSilicon.dmg`)**. Android (`android_app/` + `android_core/`) is paused/experimental until desktop feature parity is complete.
+- **Driver-Free macOS System Audio (`macos_tap/huq_tap.m` -> `libhuq_tap.dylib`):**
+  - Never install experimental HAL plugins in `/Library/Audio/Plug-Ins/HAL/`; use the pure user-space CoreAudio Process Tap (`CATapDescription` with `CATapMuted` and `stereoGlobalTapButExcludeProcesses` excluding `Huq`'s own PID).
+  - Controlled via the single **`Go Live`** button (`toggle_go_live`): locks `engine.fs` to the tap's native sample rate, defaults volume to `80%` (restoring `44%` local volume on exit), disables `Prev/Next/Seek/Export`, and runs `_update_live_tonal_match` every `1.5s` with a `0.25 dB` stability deadband.
+  - `.github/workflows/build-release.yml` compiles `libhuq_tap.dylib`, bundles it via PyInstaller `--add-binary`, and injects `NSAudioCaptureUsageDescription` into `Info.plist`.
+- **Limiter & Bit-Perfect Safeguards (`player_ui/main.py`):**
+  - Rust receives `hard_clip=False` so Python sees true unclipped post-HRTF peaks; when `Hard Clip (Exact)` (`not float_mode`) is active, `auto_trim_gain` enforces a `-0.5 dBFS` (`0.94406`) ceiling (`1.015`/block release, instant reset when lowering volume) and displays live attenuation as `Peak: -X.X dB (LIM -Y.Y dB)`.
+  - `Bit-Perfect` uses `RightClickPushButton`: **Left-Click** runs an exact `2.0s` (`80 x 25ms`) RME-style volume ramp to `100%` before locking `bit_perfect=True`; **Right-Click** jumps instantly to `100%`. Temporary `100%` Bit-Perfect / `80%` Live volumes are never persisted to `session.json`.
