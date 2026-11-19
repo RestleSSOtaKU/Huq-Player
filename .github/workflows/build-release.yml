@@ -149,6 +149,7 @@ jobs:
           cargo install cargo-ndk
           cd android_core
           cargo ndk -t arm64-v8a -o ../android_app/app/src/main/jniLibs build --release
+          find "$ANDROID_NDK_ROOT" -name "libc++_shared.so" | grep "aarch64-linux-android" | head -n 1 | xargs -I {} cp {} ../android_app/app/src/main/jniLibs/arm64-v8a/
 
       - name: Build Android APK
         working-directory: android_app

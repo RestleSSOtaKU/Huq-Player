@@ -2,6 +2,7 @@ package com.restlessotaku.huq
 
 object NativeEngine {
     init {
+        System.loadLibrary("c++_shared")
         System.loadLibrary("huq_android")
     }
 
