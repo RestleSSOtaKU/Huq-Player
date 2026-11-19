@@ -21,3 +21,8 @@ For prebuilt Windows (`Huq-Windows.zip`) and macOS Apple Silicon (`Huq-macOS-App
 
 - **Desktop (Windows & macOS Apple Silicon):** Active primary targets with full feature parity and prebuilt release binaries.
 - **Android (`android_app` / `android_core`):** Early experimental prototype — currently paused and not yet in a usable state for daily listening.
+
+## Status & Platform Focus
+
+- **Desktop (Windows & macOS Apple Silicon):** Active primary targets with full feature parity and prebuilt release binaries.
+- **Android (`android_app` / `android_core`):** Early experimental prototype — currently paused and not yet in a usable state for daily listening.

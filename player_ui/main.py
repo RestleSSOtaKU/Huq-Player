@@ -1111,7 +1111,6 @@ class MainWindow(QMainWindow):
         self.sys_device_timer = QTimer(self)
         self.sys_device_timer.setInterval(1000)
         self.sys_device_timer.timeout.connect(self.check_sys_default)
-        self.sys_device_timer.start()
         QTimer.singleShot(10, self._deferred_startup)
 
     def _get_macos_default_output_name(self):
@@ -1204,7 +1203,7 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
 
-        self.refresh_devices(initial=True)
+        self.combo_device.addItem("System Default", None)
 
         if was_playing and use_default:
             QTimer.singleShot(120, self._resume_after_sys_default_switch)
@@ -1225,6 +1224,8 @@ class MainWindow(QMainWindow):
                 self.lbl_dev_status.setStyleSheet("color: #ff9500; font-size: 11px; font-weight: bold; margin-bottom: 4px;")
 
     def _deferred_startup(self):
+        self.refresh_devices(initial=True)
+        self.sys_device_timer.start()
         t0 = time.perf_counter()
         self.load_default_sofa()
         self.load_session_state()
@@ -1728,10 +1729,7 @@ class MainWindow(QMainWindow):
             self._last_cover_render_key = None
             self.update_cover_art_size()
         else:
-            self._raw_cover_pixmap = None
-            self.lbl_cover.clear()
-            self.lbl_cover.setText("No Cover")
-            self.lbl_cover.setAlignment(Qt.AlignCenter)
+            self._set_cover_badge("No Cover", "#666666", 26)
             
         self.load_audio_file(track['path'])
 
@@ -1966,17 +1964,7 @@ class MainWindow(QMainWindow):
                 for i in range(1, self.combo_device.count()):
                     self.combo_device.setCurrentIndex(i)
                     break
-            from PySide6.QtGui import QPainter, QColor, QFont
-            live_pm = QPixmap(440, 440)
-            live_pm.fill(QColor("#111111"))
-            painter = QPainter(live_pm)
-            painter.setPen(QColor("#0a84ff"))
-            painter.setFont(QFont("Helvetica Neue", 44, QFont.Bold))
-            painter.drawText(live_pm.rect(), Qt.AlignCenter, "LIVE")
-            painter.end()
-            self._raw_cover_pixmap = live_pm
-            self._last_cover_render_key = None
-            self.update_cover_art_size()
+            self._set_cover_badge("LIVE", "#0a84ff", 44)
             self.lbl_track_title.setText("Live System Audio")
             self.lbl_track_artist.setText("macOS Driver-Free Process Tap")
             self.btn_play.setEnabled(True)
@@ -2026,9 +2014,7 @@ class MainWindow(QMainWindow):
                     self._last_cover_render_key = None
                     self.update_cover_art_size()
                 else:
-                    self._raw_cover_pixmap = None
-                    self.lbl_cover.clear()
-                    self.lbl_cover.setText("No Cover")
+                    self._set_cover_badge("No Cover", "#666666", 26)
             else:
                 self.lbl_track_title.setText("No Track Playing")
                 self.lbl_track_artist.setText("Unknown Artist")
@@ -2848,6 +2834,22 @@ class MainWindow(QMainWindow):
         except Exception as e:
             print(f"Failed to load session: {e}")
 
+    def _set_cover_badge(self, text, color_hex="#666666", font_px=28):
+        from PySide6.QtGui import QPainter, QColor, QFont
+        pm = QPixmap(440, 440)
+        pm.fill(QColor("#111111"))
+        painter = QPainter(pm)
+        painter.setPen(QColor(color_hex))
+        painter.setFont(QFont("Helvetica Neue", font_px, QFont.Bold))
+        painter.drawText(pm.rect(), Qt.AlignCenter, text)
+        painter.end()
+        self._raw_cover_pixmap = pm
+        self._last_cover_render_key = None
+        self.update_cover_art_size()
+
+    def minimumSizeHint(self):
+        return QSize(1100, 820)
+
     def update_cover_art_size(self):
         h = self.height()
         panel_h = self.dsp_panel.sizeHint().height() if (hasattr(self, "dsp_panel") and self.dsp_panel.isVisible()) else 0
@@ -2855,8 +2857,10 @@ class MainWindow(QMainWindow):
         size = max(110, min(440, int(free_for_cover)))
         stepped_size = (size // 4) * 4
 
-        if self.lbl_cover.width() != stepped_size:
-            self.lbl_cover.setFixedSize(stepped_size, stepped_size)
+        self.lbl_cover.setMinimumSize(110, 110)
+        if self.lbl_cover.maximumWidth() != stepped_size or self.lbl_cover.width() != stepped_size:
+            self.lbl_cover.setMaximumSize(stepped_size, stepped_size)
+            self.lbl_cover.resize(stepped_size, stepped_size)
 
         raw = getattr(self, "_raw_cover_pixmap", None)
         render_key = (id(raw), stepped_size)
