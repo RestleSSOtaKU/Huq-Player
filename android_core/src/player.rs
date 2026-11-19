@@ -1,4 +1,4 @@
-use crate::hrir::{build_spectra, HrirBank};
+use crate::hrir::{build_spectra, build_tonal_curve, HrirBank};
 use hrtf_core::{DspParams, HrtfEngine};
 use oboe::{
     AudioOutputCallback, AudioOutputStreamSafe, AudioStream, AudioStreamAsync,
@@ -93,6 +93,8 @@ impl AndroidAudioPlayer {
                 build_spectra(bank, self.azimuth, self.elevation, self.fs, 16384);
             if let Ok(mut st) = self.state.lock() {
                 st.engine.load_hrir_spectra(&ll, &rl, &lr, &rr, &ll_r, &rl_r);
+                let curve = build_tonal_curve(bank, self.azimuth, self.elevation, self.fs, 16384);
+                st.engine.set_tonal_match_curve(&curve);
             }
         }
     }

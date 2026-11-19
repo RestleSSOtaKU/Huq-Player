@@ -2,6 +2,7 @@ package com.restlessotaku.huq
 
 import android.app.Activity
 import android.content.pm.ActivityInfo
+import android.graphics.Bitmap
 import android.net.Uri
 import android.os.Bundle
 import android.provider.OpenableColumns
@@ -10,13 +11,16 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
-import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.PagerDefaults
+import androidx.compose.foundation.pager.PagerSnapDistance
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -45,8 +49,8 @@ class MainActivity : ComponentActivity() {
         assets.open("default.hrir").use { NativeEngine.initHrirBank(it.readBytes()) }
         setContent {
             MaterialTheme(colorScheme = darkColorScheme(
-                background = Color(0xFF121212),
-                surface = Color(0xFF1E1E1E),
+                background = Color(0xFF101216),
+                surface = Color(0xFF1A1D24),
                 primary = Color(0xFF0A84FF)
             )) {
                 HuqThreeScreenApp()
@@ -72,6 +76,7 @@ fun HuqThreeScreenApp() {
     var currentIndex by remember { mutableIntStateOf(-1) }
     var title by remember { mutableStateOf("No Track Loaded") }
     var srText by remember { mutableStateOf("Stream SR: -") }
+    var coverArt by remember { mutableStateOf<Bitmap?>(null) }
     var isPlaying by remember { mutableStateOf(false) }
     var progress by remember { mutableFloatStateOf(0f) }
     var durationSec by remember { mutableFloatStateOf(0f) }
@@ -95,13 +100,14 @@ fun HuqThreeScreenApp() {
     fun playUri(uri: Uri, displayName: String) {
         scope.launch {
             title = displayName
-            val path = withContext(Dispatchers.IO) {
+            val (path, bmp) = withContext(Dispatchers.IO) {
                 val tmp = File(ctx.cacheDir, "active_track")
                 ctx.contentResolver.openInputStream(uri)?.use { inp ->
                     tmp.outputStream().use { out -> inp.copyTo(out) }
                 }
-                tmp.absolutePath
+                tmp.absolutePath to extractCoverArt(ctx, uri)
             }
+            coverArt = bmp
             val sr = withContext(Dispatchers.IO) { NativeEngine.loadTrack(path) }
             if (sr > 0) {
                 srText = "Stream SR: ${sr / 1000.0} kHz"
@@ -137,7 +143,7 @@ fun HuqThreeScreenApp() {
                 if (currentIndex + 1 < playlist.size) playAt(currentIndex + 1)
                 else isPlaying = false
             }
-            delay(50)
+            delay(45)
         }
     }
 
@@ -171,7 +177,19 @@ fun HuqThreeScreenApp() {
         }
     }
 
-    HorizontalPager(state = pagerState, modifier = Modifier.fillMaxSize().background(Color(0xFF121212))) { page ->
+    val snapFling = PagerDefaults.flingBehavior(
+        state = pagerState,
+        pagerSnapDistance = PagerSnapDistance.atMost(1),
+        snapPositionalThreshold = 0.25f,
+        snapAnimationSpec = tween(220)
+    )
+
+    HorizontalPager(
+        state = pagerState,
+        flingBehavior = snapFling,
+        userScrollEnabled = pagerState.currentPage != 2,
+        modifier = Modifier.fillMaxSize().background(Color(0xFF101216))
+    ) { page ->
         when (page) {
             0 -> Column(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
@@ -179,7 +197,7 @@ fun HuqThreeScreenApp() {
                     Button(onClick = { folderPicker.launch(null) }) { Text("Open Folder") }
                 }
                 if (playlist.isEmpty()) {
-                    Text("Tap 'Open Folder' to scan FLAC/WAV/MP3 tracks. Swipe left for Player.", color = Color.Gray, fontSize = 13.sp)
+                    Text("Tap 'Open Folder' to load tracks. Swipe left for Player.", color = Color.Gray, fontSize = 13.sp)
                 } else {
                     LazyColumn(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                         itemsIndexed(playlist) { idx, item ->
@@ -190,8 +208,8 @@ fun HuqThreeScreenApp() {
                                 fontWeight = if (active) FontWeight.Bold else FontWeight.Normal,
                                 fontSize = 14.sp,
                                 modifier = Modifier.fillMaxWidth()
-                                    .background(if (active) Color(0xFF1E2633) else Color(0xFF1A1A1C), RoundedCornerShape(6.dp))
-                                    .clickable { playAt(idx) }
+                                    .background(if (active) Color(0xFF1B2536) else Color(0xFF181B22), RoundedCornerShape(8.dp))
+                                    .clickable { playAt(idx); scope.launch { pagerState.animateScrollToPage(1) } }
                                     .padding(10.dp)
                             )
                         }
@@ -201,34 +219,45 @@ fun HuqThreeScreenApp() {
 
             1 -> Column(
                 Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp),
-                verticalArrangement = Arrangement.spacedBy(10.dp)
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
             ) {
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                    Text("ɦuk — Anechoic Engine", color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                    Text("ɦuk — Anechoic", color = Color.White, fontSize = 17.sp, fontWeight = FontWeight.Bold)
                     Text("◀ Lib | Scope ▶", color = Color.Gray, fontSize = 11.sp)
                 }
                 Text(srText, color = Color(0xFF34C759), fontSize = 12.sp)
-                Text(title, color = Color(0xFFE5E5EA), fontSize = 14.sp, maxLines = 1)
+                UappCoverArtCard(coverArt)
+                Text(title, color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
                 MiniGraphsRow(vizSamples)
-                Slider(value = progress, onValueChange = { progress = it; NativeEngine.seek(it) })
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                    Text(fmtTime(progress * durationSec), color = Color.Gray, fontSize = 11.sp)
-                    Text(fmtTime(durationSec), color = Color.Gray, fontSize = 11.sp)
+
+                Column(Modifier.fillMaxWidth()) {
+                    Slider(value = progress, onValueChange = { progress = it; NativeEngine.seek(it) })
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                        Text(fmtTime(progress * durationSec), color = Color.Gray, fontSize = 11.sp)
+                        Text(fmtTime(durationSec), color = Color.Gray, fontSize = 11.sp)
+                    }
                 }
+
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     OutlinedButton(onClick = { playAt((currentIndex - 1).coerceAtLeast(0)) }) { Text("Prev") }
                     Button(onClick = { isPlaying = !isPlaying; NativeEngine.setPlaying(isPlaying) }) { Text(if (isPlaying) "Pause" else "Play") }
                     OutlinedButton(onClick = { playAt(currentIndex + 1) }) { Text("Next") }
                     OutlinedButton(onClick = { filePicker.launch(arrayOf("audio/*")) }) { Text("File") }
                 }
-                Text("Volume: ${(vol * 100).toInt()}%", color = Color.LightGray, fontSize = 12.sp)
-                Slider(value = vol, onValueChange = { vol = it; syncDsp() })
+
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("Vol ${(vol * 100).toInt()}%", color = Color.LightGray, fontSize = 12.sp)
+                    Slider(value = vol, onValueChange = { vol = it; syncDsp() }, modifier = Modifier.weight(1f))
+                }
+
                 FilledTonalButton(onClick = { showDsp = !showDsp }, modifier = Modifier.fillMaxWidth()) {
                     Text(if (showDsp) "DSP & Acoustics ▲" else "DSP & Acoustics ▼")
                 }
-                AnimatedVisibility(visible = showDsp) {
+
+                AnimatedVisibility(visible = showDsp, modifier = Modifier.fillMaxWidth()) {
                     Column(
-                        Modifier.fillMaxWidth().background(Color(0xFF1A1A1C), RoundedCornerShape(10.dp)).padding(12.dp),
+                        Modifier.fillMaxWidth().background(Color(0xFF181B22), RoundedCornerShape(10.dp)).padding(12.dp),
                         verticalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
                         Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -258,7 +287,10 @@ fun HuqThreeScreenApp() {
                     }
                 }
             }
-            2 -> FullscreenGraphPage(vizSamples, title, srText)
+
+            2 -> LandscapeScopeScreen(vizSamples, title, srText) {
+                scope.launch { pagerState.animateScrollToPage(1) }
+            }
         }
     }
 }

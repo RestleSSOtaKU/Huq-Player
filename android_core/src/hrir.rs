@@ -81,3 +81,31 @@ pub fn build_spectra(
     let h_rr = make_fft(1, right_ir);
     [h_ll.clone(), h_rl.clone(), h_lr, h_rr, h_ll, h_rl]
 }
+
+pub fn build_tonal_curve(
+    bank: &HrirBank, az: f32, el: f32, target_fs: u32, fft_size: usize,
+) -> Vec<f32> {
+    let [h_ll, h_rl, _, _, _, _] = build_spectra(bank, az, el, target_fs, fft_size);
+    let [ref_ll, ref_rl, _, _, _, _] = build_spectra(bank, 0.0, 0.0, target_fs, fft_size);
+    let spec_len = fft_size / 2 + 1;
+    let mut raw_gain = vec![1.0f32; spec_len];
+
+    for i in 0..spec_len {
+        let cur_mag = (h_ll[i].norm_sqr() + h_rl[i].norm_sqr()).sqrt().max(1e-5);
+        let ref_mag = (ref_ll[i].norm_sqr() + ref_rl[i].norm_sqr()).sqrt().max(1e-5);
+        let g = (ref_mag / cur_mag).clamp(0.25, 4.0); // +/- 12 dB cap
+        raw_gain[i] = g;
+    }
+
+    // 1/3-octave style moving-window smoothing across bins
+    let mut smooth = vec![1.0f32; spec_len];
+    for i in 0..spec_len {
+        let half_w = (i / 6).max(2);
+        let lo = i.saturating_sub(half_w);
+        let hi = (i + half_w).min(spec_len - 1);
+        let mut sum = 0.0f32;
+        for k in lo..=hi { sum += raw_gain[k]; }
+        smooth[i] = sum / (hi - lo + 1) as f32;
+    }
+    smooth
+}
