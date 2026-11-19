@@ -11,6 +11,7 @@ pub struct SharedState {
     pub samples: Vec<f32>,
     pub frame_pos: usize,
     pub is_playing: bool,
+    pub finished: bool,
     pub viz_buf: Vec<f32>,
 }
 
@@ -37,18 +38,20 @@ impl AudioOutputCallback for OboeCallback {
         let total_frames = st.samples.len() / 2;
         if !st.is_playing || st.frame_pos + n > total_frames {
             frames.fill((0.0, 0.0));
-            if st.frame_pos + n > total_frames { st.is_playing = false; }
+            if st.is_playing && total_frames > 0 && st.frame_pos + n > total_frames {
+                st.is_playing = false;
+                st.finished = true;
+            }
             return DataCallbackResult::Continue;
         }
         let start = st.frame_pos * 2;
         let end = start + n * 2;
-        if st.viz_buf.len() < n { st.viz_buf.resize(n, 0.0); }
-
         let in_slice = st.samples[start..end].to_vec();
         let mut out_slice = vec![0.0f32; n * 2];
         let mut viz = vec![0.0f32; n];
         st.engine.process_interleaved(&in_slice, &mut out_slice, &mut viz);
         st.frame_pos += n;
+        st.viz_buf = viz;
 
         for (i, frame) in frames.iter_mut().enumerate() {
             *frame = (out_slice[i * 2], out_slice[i * 2 + 1]);
@@ -78,7 +81,8 @@ impl AndroidAudioPlayer {
             samples: Vec::new(),
             frame_pos: 0,
             is_playing: false,
-            viz_buf: vec![0.0; 4096],
+            finished: false,
+            viz_buf: vec![0.0; 256],
         }));
         Self { state, stream: None, bank: None, fs: 48000, azimuth: 60.0, elevation: 0.0, params }
     }
