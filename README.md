@@ -1,6 +1,6 @@
  VIBE CODED 🖤
 
-# ɦuk — Anechoic Engine
+# Huq — Anechoic Engine
 
 A zero-echo, real-time **HRTF (Head-Related Transfer Function)** binaural desktop audio player powered by a native **Rust** DSP backend (`hrtf_core`) and a **Python (PySide6)** interface.
 

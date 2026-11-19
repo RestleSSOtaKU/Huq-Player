@@ -60,7 +60,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
-          name: ɦuk ${{ github.ref_name }}
+          name: Huq ${{ github.ref_name }}
           files: Huq-Windows.zip
 
   build-macos:
@@ -123,5 +123,5 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
-          name: ɦuk ${{ github.ref_name }}
+          name: Huq ${{ github.ref_name }}
           files: Huq-macOS-AppleSilicon.dmg
