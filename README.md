@@ -1,4 +1,4 @@
-<3 YES, I VIBE CODED IT ^_^
+ VIBE CODED 🖤
 
 # Huq — Anechoic Engine
 
