@@ -141,7 +141,6 @@ jobs:
       - name: Setup Android NDK & Gradle
         run: |
           echo "ANDROID_NDK_HOME=$ANDROID_NDK_ROOT" >> $GITHUB_ENV
-          sudo apt-get update && sudo apt-get install -y gradle
 
       - name: Install Rust & cargo-ndk
         uses: dtolnay/rust-toolchain@stable
