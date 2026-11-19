@@ -33,9 +33,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install numpy scipy sounddevice soundfile pyfar pyqtgraph mutagen PySide6 pyinstaller
 
-      - name: Copy FFmpeg binaries
+      - name: Install & Copy FFmpeg binaries
         shell: pwsh
         run: |
+          choco install ffmpeg -y --no-progress
+          $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
           New-Item -ItemType Directory -Force -Path player_ui\bin | Out-Null
           Copy-Item (Get-Command ffmpeg.exe).Source -Destination "player_ui\bin\ffmpeg.exe"
           Copy-Item (Get-Command ffprobe.exe).Source -Destination "player_ui\bin\ffprobe.exe"
