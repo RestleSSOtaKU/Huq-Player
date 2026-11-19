@@ -16,3 +16,8 @@ A zero-echo, real-time **HRTF (Head-Related Transfer Function)** binaural deskto
 ## Prebuilt Releases
 
 For prebuilt Windows (`Huq-Windows.zip`) and macOS Apple Silicon (`Huq-macOS-AppleSilicon.dmg`) binaries, visit the project repository Releases page.
+
+## Status & Platform Focus
+
+- **Desktop (Windows & macOS Apple Silicon):** Active primary targets with full feature parity and prebuilt release binaries.
+- **Android (`android_app` / `android_core`):** Early experimental prototype — currently paused and not yet in a usable state for daily listening.
