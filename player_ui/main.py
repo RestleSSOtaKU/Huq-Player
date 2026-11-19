@@ -897,7 +897,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setAcceptDrops(True)
-        self.setWindowTitle("Huq — Anechoic Engine")
+        self.setWindowTitle("ɦuk — Anechoic Engine")
         self.setMinimumSize(1100, 820)
         
         pg.setConfigOptions(antialias=False, enableExperimental=False)
