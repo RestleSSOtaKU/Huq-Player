@@ -34,14 +34,8 @@ jobs:
           pip install numpy scipy sounddevice soundfile pyfar pyqtgraph mutagen PySide6 pyinstaller
 
       - name: Download & Copy FFmpeg binaries
-        shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path player_ui\bin | Out-Null
-          Invoke-WebRequest -Uri "https://github.com" -OutFile "ffmpeg.zip"
-          New-Item -ItemType Directory -Force -Path ffmpeg_tmp | Out-Null; tar -xf ffmpeg.zip -C ffmpeg_tmp
-          $binDir = (Get-ChildItem -Path "ffmpeg_tmp" -Recurse -Filter "ffmpeg.exe").DirectoryName
-          Copy-Item "$binDir\ffmpeg.exe" -Destination "player_ui\bin\ffmpeg.exe"
-          Copy-Item "$binDir\ffprobe.exe" -Destination "player_ui\bin\ffprobe.exe"
+          python -c "import os, urllib.request, zipfile, shutil; os.makedirs('player_ui/bin', exist_ok=True); req = urllib.request.Request('https://gyan.dev', headers={'User-Agent': 'Mozilla/5.0'}); open('ffmpeg.zip', 'wb').write(urllib.request.urlopen(req).read()); zipfile.ZipFile('ffmpeg.zip').extractall('ffmpeg_tmp'); [shutil.copy(os.path.join(r, fn), os.path.join('player_ui/bin', fn)) for r, _, fs in os.walk('ffmpeg_tmp') for fn in fs if fn in ('ffmpeg.exe', 'ffprobe.exe')]"
 
       - name: Bundle Windows EXE with PyInstaller
         shell: pwsh
