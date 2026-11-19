@@ -75,7 +75,8 @@ pub extern "system" fn Java_com_restlessotaku_huq_NativeEngine_setDspFull(
     tonal_match: jboolean, bypass: jboolean, bit_perfect: jboolean, hard_clip: jboolean,
 ) {
     if let Ok(mut p) = PLAYER.lock() {
-        let pos_changed = (p.azimuth - az).abs() > 0.01 || (p.elevation - el).abs() > 0.01;
+        let tm_new = tonal_match != 0;
+        let pos_changed = (p.azimuth - az).abs() > 0.01 || (p.elevation - el).abs() > 0.01 || (p.params.tonal_match != tm_new);
         p.azimuth = az;
         p.elevation = el;
         p.params.volume = vol;

@@ -89,12 +89,16 @@ impl AndroidAudioPlayer {
 
     pub fn apply_hrir(&mut self) {
         if let Some(bank) = &self.bank {
-            let [ll, rl, lr, rr, ll_r, rl_r] =
+            let [mut ll, mut rl, mut lr, mut rr, mut ll_r, mut rl_r] =
                 build_spectra(bank, self.azimuth, self.elevation, self.fs, 16384);
+            if self.params.tonal_match {
+                let curve = build_tonal_curve(bank, self.azimuth, self.elevation, self.fs, 16384);
+                for (i, &g) in curve.iter().enumerate() {
+                    ll[i] *= g; rl[i] *= g; lr[i] *= g; rr[i] *= g; ll_r[i] *= g; rl_r[i] *= g;
+                }
+            }
             if let Ok(mut st) = self.state.lock() {
                 st.engine.load_hrir_spectra(&ll, &rl, &lr, &rr, &ll_r, &rl_r);
-                let curve = build_tonal_curve(bank, self.azimuth, self.elevation, self.fs, 16384);
-                st.engine.set_tonal_match_curve(&curve);
             }
         }
     }
