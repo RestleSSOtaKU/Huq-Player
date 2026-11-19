@@ -906,7 +906,7 @@ class AudioEngine(QObject):
             except Exception:
                 pass
             self.stream = None
-        if not fast and self.rust_dsp is not None:
+        if self.rust_dsp is not None:
             self.rust_dsp.reset()
         self.is_playing = False
 
@@ -1704,6 +1704,8 @@ class MainWindow(QMainWindow):
             self.save_session_state()
 
     def play_selected_item(self, item):
+        self._pending_load_path = None
+        self._pending_resume_sec = 0.0
         if getattr(self.engine, "use_mac_tap", False):
             self.btn_go_live.blockSignals(True)
             self.btn_go_live.setChecked(False)
@@ -1809,17 +1811,15 @@ class MainWindow(QMainWindow):
             self.lbl_time_total.setText(self.format_time(total_sec))
             self.btn_export.setEnabled(True)
             
-            self.toggle_play()
-
             resume_sec = getattr(self, "_pending_resume_sec", 0.0)
             if resume_sec > 0.0:
                 self._pending_resume_sec = 0.0
-                self.toggle_play()  # Pause on startup
                 target_frame = int(resume_sec * self.engine.fs)
                 self.engine.seek(target_frame)
                 self.lbl_time_current.setText(self.format_time(resume_sec))
                 progress = (target_frame / len(self.engine.audio_data)) * 1000
                 self.slider_seek.setValue(int(progress))
+            self.toggle_play()
 
         else:
             self.lbl_track_title.setText("Error loading file")
@@ -2369,6 +2369,12 @@ class MainWindow(QMainWindow):
             pass
 
     def toggle_play(self):
+        pending_path = getattr(self, "_pending_load_path", None)
+        if pending_path and self.engine.audio_data is None and not self.engine.use_mac_tap:
+            self._pending_load_path = None
+            self._auto_play_after_load = True
+            self.load_audio_file(pending_path)
+            return
         if self.engine.is_playing:
             self.engine.stop()
             self.btn_play.setText("▶ Play")
@@ -2741,7 +2747,7 @@ class MainWindow(QMainWindow):
 
     def save_session_state(self):
         try:
-            pos_sec = 0.0
+            pos_sec = getattr(self, "_pending_resume_sec", 0.0)
             if self.engine.audio_data is not None and self.engine.fs:
                 pos_sec = self.engine.current_frame / float(self.engine.fs)
 
@@ -2829,8 +2835,9 @@ class MainWindow(QMainWindow):
                     self._last_cover_render_key = None
                     self.update_cover_art_size()
 
+                self._pending_load_path = track['path']
                 self._pending_resume_sec = pos_sec
-                self.load_audio_file(track['path'])
+                self.lbl_time_current.setText(self.format_time(pos_sec))
         except Exception as e:
             print(f"Failed to load session: {e}")
 
