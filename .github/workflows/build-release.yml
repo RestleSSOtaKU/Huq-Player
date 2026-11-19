@@ -38,7 +38,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path player_ui\bin | Out-Null
           Invoke-WebRequest -Uri "https://github.com" -OutFile "ffmpeg.zip"
-          Expand-Archive -Path "ffmpeg.zip" -DestinationPath "ffmpeg_tmp" -Force
+          New-Item -ItemType Directory -Force -Path ffmpeg_tmp | Out-Null; tar -xf ffmpeg.zip -C ffmpeg_tmp
           $binDir = (Get-ChildItem -Path "ffmpeg_tmp" -Recurse -Filter "ffmpeg.exe").DirectoryName
           Copy-Item "$binDir\ffmpeg.exe" -Destination "player_ui\bin\ffmpeg.exe"
           Copy-Item "$binDir\ffprobe.exe" -Destination "player_ui\bin\ffprobe.exe"
