@@ -1,0 +1,17 @@
+[package]
+name = "huq_android"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "huq_android"
+crate-type = ["cdylib"]
+
+[dependencies]
+hrtf_core = { path = "../hrtf_core" }
+jni = "0.21"
+oboe = "0.6"
+symphonia = { version = "0.5", features = ["all"] }
+realfft = "3.4"
+num-complex = "0.4"
+once_cell = "1.19"

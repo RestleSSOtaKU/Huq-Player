@@ -6,3 +6,11 @@ build/
 dist/
 *.spec
 .DS_Store
+
+# Android build artifacts
+android_core/target/
+android_app/.gradle/
+android_app/build/
+android_app/app/build/
+android_app/app/src/main/jniLibs/
+*.apk

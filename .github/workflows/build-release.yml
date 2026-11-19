@@ -125,3 +125,48 @@ jobs:
           tag_name: ${{ github.ref_name }}
           name: Huq ${{ github.ref_name }}
           files: Huq-macOS-AppleSilicon.dmg
+
+  build-android:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Java 17 & Android SDK/NDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android NDK & Gradle
+        run: |
+          sdkmanager "ndk;26.3.11579264" "build-tools;34.0.0" "platforms;android-34"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/26.3.11579264" >> $GITHUB_ENV
+          sudo apt-get update && sudo apt-get install -y gradle
+
+      - name: Install Rust & cargo-ndk
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Build Android Native DSP (.so)
+        run: |
+          cargo install cargo-ndk
+          cd android_core
+          cargo ndk -t arm64-v8a -o ../android_app/app/src/main/jniLibs build --release
+
+      - name: Build Android APK
+        working-directory: android_app
+        run: |
+          gradle assembleDebug
+          cp app/build/outputs/apk/debug/app-debug.apk ../Huq-Android.apk
+
+      - name: Upload Android APK Release Asset
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Huq ${{ github.ref_name }}
+          files: Huq-Android.apk
