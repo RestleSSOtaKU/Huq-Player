@@ -5,7 +5,7 @@ edition = "2021"
 
 [lib]
 name = "hrtf_core"
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 realfft = "3.4"
