@@ -15,6 +15,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.rememberScrollState
@@ -59,6 +60,7 @@ fun fmtTime(sec: Float): String {
     return "%02d:%02d".format(s / 60, s % 60)
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun HuqThreeScreenApp() {
     val ctx = LocalContext.current
