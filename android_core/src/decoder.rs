@@ -37,12 +37,12 @@ pub fn decode_file(path: &str) -> Result<DecodedAudio, String> {
     while let Ok(packet) = format.next_packet() {
         if packet.track_id() != track_id { continue; }
         if let Ok(decoded) = decoder.decode(&packet) {
+            let ch = decoded.spec().channels.count();
             if sample_buf.is_none() {
                 sample_buf = Some(SampleBuffer::<f32>::new(decoded.capacity() as u64, *decoded.spec()));
             }
             if let Some(buf) = &mut sample_buf {
                 buf.copy_interleaved_ref(decoded);
-                let ch = decoded.spec().channels.count();
                 if ch == 2 {
                     out.extend_from_slice(buf.samples());
                 } else if ch == 1 {
