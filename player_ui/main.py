@@ -1435,7 +1435,10 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setAcceptDrops(True)
         QApplication.instance().installEventFilter(self)
-        self.setWindowTitle("ɦuk — Anechoic Engine")
+        self.setWindowTitle("REXA — Reflectionless Engine for X-dimensional Audio")
+        _ico_path = get_resource_path("assets/icon.png")
+        if os.path.exists(_ico_path):
+            self.setWindowIcon(QIcon(_ico_path))
         self.setAttribute(Qt.WA_TranslucentBackground, windows_transparency_enabled())
         self.setAttribute(Qt.WA_NoSystemBackground, True)
         self.setAttribute(Qt.WA_ContentsMarginsRespectsSafeArea, False)

@@ -43,29 +43,33 @@ jobs:
       - name: Bundle Windows EXE with PyInstaller
         shell: pwsh
         run: |
-          pyinstaller --noconfirm --windowed --name "Huq" `
+          pyinstaller --noconfirm --windowed --name "REXA" `
             --collect-data sofar `
             --collect-data pyfar `
             --add-binary "hrtf_core\target\release\hrtf_core.dll;." `
             --add-binary "player_ui\bin\ffmpeg.exe;bin" `
             --add-binary "player_ui\bin\ffprobe.exe;bin" `
+            --icon "player_ui\assets\icon.ico" `
+            --add-data "player_ui\assets\icon.png;assets" `
+            --icon "player_ui\assets\icon.ico" `
+            --add-data "player_ui\assets\icon.png;assets" `
             --add-data "player_ui\default.sofa;." `
             player_ui\main.py
-          Compress-Archive -Path "dist\Huq\*" -DestinationPath "Huq-Windows.zip" -Force
+          Compress-Archive -Path "dist\REXA\*" -DestinationPath "REXA-Windows.zip" -Force
 
       - name: Upload Windows Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Huq-Windows
-          path: Huq-Windows.zip
+          name: REXA-Windows
+          path: REXA-Windows.zip
 
       - name: Upload Windows Release Asset
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
-          name: Huq ${{ github.ref_name }}
-          files: Huq-Windows.zip
+          name: REXA ${{ github.ref_name }}
+          files: REXA-Windows.zip
 
   build-macos:
     runs-on: macos-latest
@@ -105,42 +109,46 @@ jobs:
 
       - name: Bundle macOS .app with PyInstaller
         run: |
-          pyinstaller --noconfirm --windowed --name "Huq" \
-            --osx-bundle-identifier "com.restlessotaku.huq" \
+          pyinstaller --noconfirm --windowed --name "REXA" \
+            --osx-bundle-identifier "com.restlessotaku.rexa" \
             --collect-data sofar \
             --collect-data pyfar \
             --add-binary "hrtf_core/target/release/libhrtf_core.dylib:." \
             --add-binary "macos_tap/libhuq_tap.dylib:." \
             --add-binary "player_ui/bin/ffmpeg:bin" \
             --add-binary "player_ui/bin/ffprobe:bin" \
+            --icon "player_ui/assets/icon.icns" \
+            --add-data "player_ui/assets/icon.png:assets" \
+            --icon "player_ui/assets/icon.icns" \
+            --add-data "player_ui/assets/icon.png:assets" \
             --add-data "player_ui/default.sofa:." \
             player_ui/main.py
-          /usr/libexec/PlistBuddy -c "Add :NSAudioCaptureUsageDescription string 'Huq captures system audio to apply real-time binaural HRTF processing.'" "dist/Huq.app/Contents/Info.plist" 
+          /usr/libexec/PlistBuddy -c "Add :NSAudioCaptureUsageDescription string 'REXA captures system audio to apply real-time binaural HRTF processing.'" "dist/REXA.app/Contents/Info.plist" 
 
       - name: Ad-Hoc Code Sign .app & Create .dmg
         run: |
-          find "dist/Huq.app" -type f \( -name "*.dylib" -o -name "*.so" \) -exec codesign --force --sign - {} \;
-          codesign --force --sign - "dist/Huq.app/Contents/Frameworks/Python.framework/Versions/3.12/Python" || true
-          codesign --deep --force --sign - "dist/Huq.app"
+          find "dist/REXA.app" -type f \( -name "*.dylib" -o -name "*.so" \) -exec codesign --force --sign - {} \;
+          codesign --force --sign - "dist/REXA.app/Contents/Frameworks/Python.framework/Versions/3.12/Python" || true
+          codesign --deep --force --sign - "dist/REXA.app"
           mkdir -p dmg_stage
-          cp -R "dist/Huq.app" dmg_stage/
+          cp -R "dist/REXA.app" dmg_stage/
           ln -s /Applications dmg_stage/Applications
-          hdiutil create -volname "Huq" \
+          hdiutil create -volname "REXA" \
             -srcfolder dmg_stage \
             -ov -format UDZO \
-            "Huq-macOS-AppleSilicon.dmg"
+            "REXA-macOS-AppleSilicon.dmg"
 
       - name: Upload macOS Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Huq-macOS-AppleSilicon
-          path: Huq-macOS-AppleSilicon.dmg
+          name: REXA-macOS-AppleSilicon
+          path: REXA-macOS-AppleSilicon.dmg
 
       - name: Upload macOS .dmg Release Asset
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
-          name: Huq ${{ github.ref_name }}
-          files: Huq-macOS-AppleSilicon.dmg
+          name: REXA ${{ github.ref_name }}
+          files: REXA-macOS-AppleSilicon.dmg
 
