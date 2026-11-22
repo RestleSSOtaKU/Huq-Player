@@ -53,7 +53,14 @@ jobs:
             player_ui\main.py
           Compress-Archive -Path "dist\Huq\*" -DestinationPath "Huq-Windows.zip" -Force
 
+      - name: Upload Windows Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Huq-Windows
+          path: Huq-Windows.zip
+
       - name: Upload Windows Release Asset
+        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
@@ -81,7 +88,7 @@ jobs:
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install numpy scipy sounddevice soundfile pyfar pyqtgraph mutagen PySide6 pyinstaller
+          pip install numpy scipy sounddevice soundfile pyfar pyqtgraph mutagen PySide6 pyqt-liquidglass pyinstaller
 
       - name: Install & Copy FFmpeg (ARM64)
         run: |
@@ -123,50 +130,17 @@ jobs:
             -ov -format UDZO \
             "Huq-macOS-AppleSilicon.dmg"
 
+      - name: Upload macOS Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Huq-macOS-AppleSilicon
+          path: Huq-macOS-AppleSilicon.dmg
+
       - name: Upload macOS .dmg Release Asset
+        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
           name: Huq ${{ github.ref_name }}
           files: Huq-macOS-AppleSilicon.dmg
 
-  build-android:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install Java 17
-        uses: actions/setup-java@v4
-        with:
-          distribution: 'temurin'
-          java-version: '17'
-
-      - name: Setup Android NDK & Gradle
-        run: |
-          echo "ANDROID_NDK_HOME=$ANDROID_NDK_ROOT" >> $GITHUB_ENV
-
-      - name: Install Rust & cargo-ndk
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-linux-android
-
-      - name: Build Android Native DSP (.so)
-        run: |
-          cargo install cargo-ndk
-          cd android_core
-          cargo ndk -t arm64-v8a -o ../android_app/app/src/main/jniLibs build --release
-          find "$ANDROID_NDK_ROOT" -name "libc++_shared.so" | grep "aarch64-linux-android" | head -n 1 | xargs -I {} cp {} ../android_app/app/src/main/jniLibs/arm64-v8a/
-
-      - name: Build Android APK
-        working-directory: android_app
-        run: |
-          gradle assembleDebug
-          cp app/build/outputs/apk/debug/app-debug.apk ../Huq-Android.apk
-
-      - name: Upload Android APK Release Asset
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.ref_name }}
-          name: Huq ${{ github.ref_name }}
-          files: Huq-Android.apk
