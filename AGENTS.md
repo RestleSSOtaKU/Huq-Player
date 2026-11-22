@@ -1,7 +1,7 @@
 # Project Identity & Branding
-- **Project Name:** **Huq** (`Huq-Player` on GitHub), powered by the **Anechoic Engine** (zero-echo real-time HRIR binaural DSP).
+- **Project Name:** **REXA** (`REXA-Player` on GitHub), powered by the **Anechoic Engine** (zero-echo real-time HRIR binaural DSP).
 - **Naming Split (SEO vs. UI):**
-  - Keep plain ASCII **`Huq`** in search-indexed locations (`README.md` H1, repo name, GitHub Release titles `Huq vX.Y.Z`, PyInstaller `--name "Huq"`, and archive filenames `Huq-Windows.zip` / `Huq-macOS-AppleSilicon.dmg`).
+  - Keep plain ASCII **`REXA`** in search-indexed locations (`README.md` H1, repo name, GitHub Release titles `REXA vX.Y.Z`, PyInstaller `--name "REXA"`, and archive filenames `REXA-Windows.zip` / `REXA-macOS-AppleSilicon.dmg`).
   - Use stylized **`ɦuk — Anechoic Engine`** inside the desktop app UI (`player_ui/main.py` window title).
 
 # Project Architecture
@@ -22,7 +22,7 @@
   - `HRIR Only (Raw)` is computed directly in the frequency domain from `P_in * (|H_LL_raw|^2 + |H_RL_raw|^2)` (and equals `P_in_db` when bypassed) so it stays phase-locked with zero ring-buffer seam jumps.
 
 # Git & Release Workflow
-- Pushing tags matching `v*` (currently `v0.3.5`) triggers `.github/workflows/build-release.yml` to build Windows (`Huq-Windows.zip`) and macOS Apple Silicon (`Huq-macOS-AppleSilicon.dmg`) releases titled `Huq vX.Y.Z`.
+- Pushing tags matching `v*` (currently `v0.3.5`) triggers `.github/workflows/build-release.yml` to build Windows (`REXA-Windows.zip`) and macOS Apple Silicon (`REXA-macOS-AppleSilicon.dmg`) releases titled `REXA vX.Y.Z`.
 - When sharing terminal patches for `player_ui/main.py`, keep scripts compact (under ~60 lines) or split into two parts so they fit cleanly in terminal paste buffers.
 
 # Planned Roadmap
@@ -30,9 +30,9 @@
 
 # Recent Additions & Architecture Updates (v0.3.8+)
 - **Platform Focus:**
-  - Active release targets are **Windows (`Huq-Windows.zip`)** and **macOS Apple Silicon (`Huq-macOS-AppleSilicon.dmg`)**. Android (`android_app/` + `android_core/`) is paused/experimental until desktop feature parity is complete.
+  - Active release targets are **Windows (`REXA-Windows.zip`)** and **macOS Apple Silicon (`REXA-macOS-AppleSilicon.dmg`)**. Android (`android_app/` + `android_core/`) is paused/experimental until desktop feature parity is complete.
 - **Driver-Free macOS System Audio (`macos_tap/huq_tap.m` -> `libhuq_tap.dylib`):**
-  - Never install experimental HAL plugins in `/Library/Audio/Plug-Ins/HAL/`; use the pure user-space CoreAudio Process Tap (`CATapDescription` with `CATapMuted` and `stereoGlobalTapButExcludeProcesses` excluding `Huq`'s own PID).
+  - Never install experimental HAL plugins in `/Library/Audio/Plug-Ins/HAL/`; use the pure user-space CoreAudio Process Tap (`CATapDescription` with `CATapMuted` and `stereoGlobalTapButExcludeProcesses` excluding `REXA`'s own PID).
   - Controlled via the single **`Go Live`** button (`toggle_go_live`): locks `engine.fs` to the tap's native sample rate, defaults volume to `80%` (restoring `44%` local volume on exit), disables `Prev/Next/Seek/Export`, and runs `_update_live_tonal_match` every `1.5s` with a `0.25 dB` stability deadband.
   - `.github/workflows/build-release.yml` compiles `libhuq_tap.dylib`, bundles it via PyInstaller `--add-binary`, and injects `NSAudioCaptureUsageDescription` into `Info.plist`.
 - **Limiter & Bit-Perfect Safeguards (`player_ui/main.py`):**

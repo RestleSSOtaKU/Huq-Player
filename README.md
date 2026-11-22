@@ -4,6 +4,12 @@
 
 A zero-echo, real-time **HRTF (Head-Related Transfer Function)** binaural desktop audio player powered by a native **Rust** DSP backend (`hrtf_core`) and a **Python (PySide6)** interface.
 
+![REXA Liquid Glass & Settings](docs/preview-glass-settings.png)
+
+| Classic (Dark) | Light |
+| :---: | :---: |
+| ![Classic Theme](docs/preview-classic.png) | ![Light Theme](docs/preview-light.png) |
+
 ## Overview
 
 - **Anechoic Engine (`hrtf_core`):** Rust-based 4-channel partitioned FFT convolution and biquad shelving.
