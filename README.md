@@ -4,7 +4,7 @@
 
 A zero-echo, real-time **HRTF (Head-Related Transfer Function)** binaural desktop audio player powered by a native **Rust** DSP backend (`hrtf_core`) and a **Python (PySide6)** interface.
 
-![REXA Liquid Glass & Settings](docs/preview-glass-settings.png)
+![REXA Liquid Glass](docs/preview-glass.png)
 
 | Classic (Dark) | Light |
 | :---: | :---: |
