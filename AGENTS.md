@@ -38,3 +38,20 @@
 - **Limiter & Bit-Perfect Safeguards (`player_ui/main.py`):**
   - Rust receives `hard_clip=False` so Python sees true unclipped post-HRTF peaks; when `Hard Clip (Exact)` (`not float_mode`) is active, `auto_trim_gain` enforces a `-0.5 dBFS` (`0.94406`) ceiling (`1.015`/block release, instant reset when lowering volume) and displays live attenuation as `Peak: -X.X dB (LIM -Y.Y dB)`.
   - `Bit-Perfect` uses `RightClickPushButton`: **Left-Click** runs an exact `2.0s` (`80 x 25ms`) RME-style volume ramp to `100%` before locking `bit_perfect=True`; **Right-Click** jumps instantly to `100%`. Temporary `100%` Bit-Perfect / `80%` Live volumes are never persisted to `session.json`.
+
+## UI & Styling Architecture Rules (`player_ui/`)
+
+1. **Never Toggle `WA_TranslucentBackground` at Runtime:**
+   * On macOS PySide6, flipping `Qt.WA_TranslucentBackground` after `window.show()` recreates the native backing store and causes black/gray paint glitches.
+   * Keep `WA_TranslucentBackground` enabled once in `__init__` (guarded by `windows_transparency_enabled()` on Windows). `Classic` and `Light` paint `100%` opaque gradients (`alpha=255`) over `centralWidget` and `settingsRoot`, while `Glass` paints translucent tints over the native blur view.
+2. **Avoid Mismatched `border-top`/`border-bottom` Colors with `border-radius`:**
+   * Always use uniform `border: 1px solid ...` rules in `build_liquid_qss()` so Qt does not draw 45-degree corner miter seams.
+3. **Valid QSS Sub-Control Pseudo-States:**
+   * Always place `:disabled` **after** sub-controls (`QSlider::sub-page:horizontal:disabled`, never `QSlider:disabled::sub-page:horizontal`), otherwise Qt's CSS parser drops the slider groove height rule.
+4. **Stock Theme Defaults & Persistence (`session.json`):**
+   * `theme_glow`: `{"classic": 0.20, "light": 0.30, "liquid_glass": 1.00}`
+   * `glass_clarity`: `45` | `glass_rim`: `20`
+   * Keep `SettingsDialog` synced with `MainWindow` via `sync_from_main()` and `_on_ambient_color_changed()`.
+5. **Layout & Text Overflow Protection:**
+   * Use `MarqueeLabel` (with `QSizePolicy.Ignored`) for dynamic track metadata so long titles never compress `lbl_cover` or push right-side controls.
+   * Keep `combo_group` at `min-width >= 116px` (`view().setMinimumWidth(126)`) and `btn_sort_dir` at `50px` with `padding: 6px 4px;` so `"Custom"` and `"A-Z"`/`"Z-A"` never elide or clip.

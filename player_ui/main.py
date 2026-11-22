@@ -5,8 +5,13 @@ import json
 import time
 import random
 import numpy as np
+import colorsys
 import sounddevice as sd
 import pyqtgraph as pg
+try:
+    import pyqt_liquidglass as glass
+except ImportError:
+    glass = None
 
 _pf = None
 _resample_poly = None
@@ -103,10 +108,11 @@ def _fast_sosfilt(sos, x):
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                                QHBoxLayout, QPushButton, QSlider, QLabel, 
                                QFileDialog, QCheckBox, QSpinBox, QMessageBox,
-                               QComboBox, QListWidget, QListWidgetItem, QSplitter, QLineEdit)
-from PySide6.QtCore import Qt, QTimer, Signal, QObject, QThread, QSize, QEvent
-from PySide6.QtGui import QPixmap, QIcon
+                               QComboBox, QListWidget, QListWidgetItem, QSplitter, QLineEdit, QStyledItemDelegate, QStyle, QStyleOptionViewItem, QAbstractItemView)
+from PySide6.QtCore import Qt, QTimer, Signal, QObject, QThread, QSize, QEvent, QVariantAnimation, QEasingCurve
+from PySide6.QtGui import QPixmap, QIcon, QColor, QPainter, QPalette
 from dsp_bridge import RustDspBridge
+from liquid_glass import make_glass_card, sample_ambient_rgb, build_liquid_qss, apply_seamless_titlebar, apply_windows_glass, windows_transparency_enabled, WindowDragFilter
 
 
 _mac_tap_lib = None
@@ -238,6 +244,221 @@ def _extract_cover_bytes(path):
         pass
     return None
 
+
+class MarqueeLabel(QLabel):
+    def __init__(self, text="", parent=None):
+        super().__init__(text, parent)
+        self.setMouseTracking(True)
+        from PySide6.QtWidgets import QSizePolicy
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self._hovered = False
+        self._offset = 0.0
+        self._timer = QTimer(self)
+        self._timer.setInterval(16)
+        self._timer.timeout.connect(self._step)
+
+    def setText(self, text):
+        super().setText(text)
+        self._offset = 0.0
+        self.update()
+
+    def enterEvent(self, event):
+        self._hovered = True
+        self._offset = 0.0
+        self._timer.start()
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._hovered = False
+        self._offset = 0.0
+        self._timer.stop()
+        self.update()
+        super().leaveEvent(event)
+
+    def _step(self):
+        if not self._hovered:
+            self._timer.stop()
+            return
+        self._offset += 1.5
+        self.update()
+
+    def paintEvent(self, event):
+        text = self.text()
+        if not text:
+            return
+        painter = QPainter(self)
+        painter.setFont(self.font())
+        painter.setPen(self.palette().color(QPalette.WindowText))
+        rect = self.contentsRect()
+        tw = painter.fontMetrics().horizontalAdvance(text)
+        if self._hovered and tw > rect.width():
+            painter.setClipRect(rect)
+            gap = 60
+            total = tw + gap
+            off = self._offset % total
+            x1 = rect.left() - off
+            x2 = x1 + total
+            painter.drawText(int(x1), rect.top(), int(tw), rect.height(), Qt.AlignVCenter | Qt.AlignLeft, text)
+            painter.drawText(int(x2), rect.top(), int(tw), rect.height(), Qt.AlignVCenter | Qt.AlignLeft, text)
+        else:
+            elided = painter.fontMetrics().elidedText(text, Qt.ElideRight, rect.width())
+            painter.drawText(rect, Qt.AlignVCenter | Qt.AlignLeft, elided)
+        painter.end()
+
+class MarqueeDelegate(QStyledItemDelegate):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._hover_index = None
+        self._offset = 0.0
+        self._timer = QTimer(self)
+        self._timer.setInterval(16) # 60 FPS
+        self._timer.timeout.connect(self._scroll_step)
+
+    def sizeHint(self, option, index):
+        return QSize(100, 36)
+
+    def set_hover(self, index):
+        if self._hover_index != index:
+            self._hover_index = index
+            self._offset = 0.0
+            self._timer.stop()
+            if self._hover_index is not None:
+                self._timer.start()
+            if self.parent():
+                self.parent().viewport().update()
+
+    def _scroll_step(self):
+        if self._hover_index is None:
+            self._timer.stop()
+            return
+        self._offset += 1.5
+        if self.parent():
+            self.parent().viewport().update()
+
+    def paint(self, painter, option, index):
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        text = opt.text
+        
+        # Empty text so the native painter draws only the background/selection
+        opt.text = "" 
+        
+        widget = opt.widget
+        style = widget.style() if widget else QApplication.style()
+        style.drawControl(QStyle.CE_ItemViewItem, opt, painter, widget)
+        
+        if not text:
+            return
+            
+        painter.save()
+        text_rect = option.rect.adjusted(8, 0, -8, 0)
+        text_width = painter.fontMetrics().horizontalAdvance(text)
+        
+        is_selected = bool(option.state & QStyle.State_Selected)
+        if is_selected:
+            accent = getattr(self.parent().window(), 'current_accent', '#0a84ff')
+            try:
+                h = accent.lstrip('#')
+                ar, ag, ab = tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
+                brightness = (ar * 299 + ag * 587 + ab * 114) / 1000
+                painter.setPen(QColor("#000000") if brightness > 160 else QColor("#ffffff"))
+            except Exception:
+                painter.setPen(QColor("#ffffff"))
+        else:
+            is_light = getattr(self.parent().window(), 'current_theme', 'dark') == 'light'
+            painter.setPen(QColor("#1c1c1e") if is_light else QColor("#eef2f8"))
+            
+        try:
+            if self._hover_index == index and text_width > text_rect.width():
+                painter.setClipRect(text_rect)
+                gap = 60 
+                total_width = text_width + gap
+                offset = self._offset % total_width
+                
+                x1 = text_rect.left() - offset
+                x2 = x1 + total_width
+                
+                # Use the (x, y, w, h) overload to avoid needing the QRect import entirely
+                painter.drawText(int(x1), text_rect.top(), int(text_width), text_rect.height(), Qt.AlignVCenter | Qt.AlignLeft, text)
+                painter.drawText(int(x2), text_rect.top(), int(text_width), text_rect.height(), Qt.AlignVCenter | Qt.AlignLeft, text)
+            else:
+                elided = painter.fontMetrics().elidedText(text, Qt.ElideRight, text_rect.width())
+                painter.drawText(text_rect, Qt.AlignVCenter | Qt.AlignLeft, elided)
+        finally:
+            painter.restore()
+
+class MarqueeListWidget(QListWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMouseTracking(True)
+        self._delegate = MarqueeDelegate(self)
+        self.setItemDelegate(self._delegate)
+        
+        # Make the list completely transparent
+        self.setStyleSheet("QListWidget { background: transparent; border: none; }")
+        self.viewport().setAutoFillBackground(False)
+        self.viewport().setStyleSheet("background: transparent;")
+        
+        self.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.verticalScrollBar().valueChanged.connect(self.viewport().update)
+
+    def mouseMoveEvent(self, event):
+        index = self.indexAt(event.position().toPoint())
+        self._delegate.set_hover(index if index.isValid() else None)
+        super().mouseMoveEvent(event)
+
+    def leaveEvent(self, event):
+        self._delegate.set_hover(None)
+        super().leaveEvent(event)
+
+class HoverPlotWidget(pg.PlotWidget):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.legend = None
+        self.viewport().setMouseTracking(True)
+
+    def mouseMoveEvent(self, event):
+        if self.legend:
+            # Map the mouse position to the scene to see if it's inside the legend's box
+            scene_pos = self.mapToScene(event.position().toPoint())
+            if self.legend.sceneBoundingRect().contains(scene_pos):
+                self.legend.setOpacity(1.0)
+            else:
+                self.legend.setOpacity(0.1) # Almost transparent
+        super().mouseMoveEvent(event)
+
+    def leaveEvent(self, event):
+        if self.legend:
+            self.legend.setOpacity(0.1)
+        super().leaveEvent(event)
+
+class MetadataRepairThread(QThread):
+    finished_repair = Signal()
+    def __init__(self, tracks):
+        super().__init__()
+        self.tracks = tracks
+    def run(self):
+        mutagen, FLAC, ID3, MP3, MP4 = _get_mutagen()
+        for t in self.tracks:
+            try:
+                audio = mutagen.File(t['path'])
+                if audio:
+                    if isinstance(audio, FLAC):
+                        album = audio.get('album', ["Unknown Album"])[0]
+                        t['album'] = album if album else "Unknown Album"
+                    elif isinstance(audio, (MP3, MP4)):
+                        if audio.tags:
+                            if isinstance(audio.tags, ID3):
+                                album = str(audio.tags.get('TALB', "Unknown Album"))
+                                t['album'] = album if album else "Unknown Album"
+                            else:
+                                album = audio.tags.get('\xa9alb', ["Unknown Album"])[0]
+                                t['album'] = album if album else "Unknown Album"
+            except Exception:
+                pass
+        self.finished_repair.emit()
+
 class ScannerThread(QThread):
     finished_scanning = Signal(list)
     
@@ -255,6 +476,7 @@ class ScannerThread(QThread):
                     path = os.path.join(root, file)
                     title = file
                     artist = "Unknown Artist"
+                    album = "Unknown Album"
                     
                     try:
                         mutagen, FLAC, ID3, MP3, MP4 = _get_mutagen()
@@ -263,14 +485,17 @@ class ScannerThread(QThread):
                             if isinstance(audio, FLAC):
                                 title = audio.get('title', [file])[0]
                                 artist = audio.get('artist', ["Unknown Artist"])[0]
+                                album = audio.get('album', ["Unknown Album"])[0]
                             elif isinstance(audio, MP3) or isinstance(audio, MP4):
                                 if audio.tags:
                                     if isinstance(audio.tags, ID3):
                                         title = str(audio.tags.get('TIT2', file))
                                         artist = str(audio.tags.get('TPE1', "Unknown Artist"))
+                                        album = str(audio.tags.get('TALB', "Unknown Album"))
                                     else:
                                         title = audio.tags.get('\xa9nam', [file])[0]
                                         artist = audio.tags.get('\xa9ART', ["Unknown Artist"])[0]
+                                        album = audio.tags.get('\xa9alb', ["Unknown Album"])[0]
                     except Exception:
                         pass
                         
@@ -278,6 +503,7 @@ class ScannerThread(QThread):
                         'path': path,
                         'title': title,
                         'artist': artist,
+                        'album': album,
                     })
         self.finished_scanning.emit(tracks)
 
@@ -384,6 +610,13 @@ class ExportThread(QThread):
         except Exception as e:
             print(f"Export error: {e}")
             self.finished_export.emit(False, str(e))
+
+import logging
+class RustDspLogFilter(logging.Filter):
+    def filter(self, record):
+        return "Loaded native engine" not in record.getMessage()
+
+logging.getLogger().addFilter(RustDspLogFilter())
 
 class AudioEngine(QObject):
     playback_stopped = Signal()
@@ -1021,49 +1254,198 @@ class AudioEngine(QObject):
         self.viz_state = (new_h, f, __import__('time').perf_counter())
 
 
+
+
+def reset_macos_window_opaque(window):
+    if sys.platform != "darwin":
+        return
+    try:
+        import ctypes
+        objc = ctypes.CDLL("/usr/lib/libobjc.A.dylib")
+        objc.objc_getClass.restype = ctypes.c_void_p
+        objc.objc_getClass.argtypes = [ctypes.c_char_p]
+        objc.sel_registerName.restype = ctypes.c_void_p
+        objc.sel_registerName.argtypes = [ctypes.c_char_p]
+
+        def msg(obj, sel, res=ctypes.c_void_p, types=(), *args):
+            fn = ctypes.cast(objc.objc_msgSend, ctypes.CFUNCTYPE(res, ctypes.c_void_p, ctypes.c_void_p, *types))
+            return fn(obj, objc.sel_registerName(sel.encode()), *args)
+
+        ns_win = msg(ctypes.c_void_p(int(window.winId())), "window")
+        if not ns_win: return
+
+        # Force window to be Opaque
+        msg(ns_win, "setOpaque:", None, (ctypes.c_bool,), True)
+        
+        # Reset background color to the default system window color
+        ns_color = msg(objc.objc_getClass(b"NSColor"), "windowBackgroundColor")
+        msg(ns_win, "setBackgroundColor:", None, (ctypes.c_void_p,), ns_color)
+
+        # Physically remove the Native Blur View from the window hierarchy
+        content_view = msg(ns_win, "contentView")
+        subviews = msg(content_view, "subviews")
+        count = msg(subviews, "count", ctypes.c_ulong)
+        
+        for i in reversed(range(count)):
+            view = msg(subviews, "objectAtIndex:", ctypes.c_void_p, (ctypes.c_ulong,), i)
+            class_name = msg(view, "className", ctypes.c_char_p)
+            if class_name and b"VisualEffectView" in class_name:
+                msg(view, "removeFromSuperview")
+    except Exception as e:
+        print(f"Failed to reset window opacity: {e}")
+
+from PySide6.QtWidgets import QDialog, QGridLayout, QFrame
+
+class SettingsDialog(QDialog):
+    def __init__(self, mw):
+        super().__init__(mw)
+        self.mw = mw
+        self._glass_id = None
+        self.setWindowTitle("Settings")
+        self.setAttribute(Qt.WA_TranslucentBackground, windows_transparency_enabled())
+        self.setAttribute(Qt.WA_NoSystemBackground, True)
+        self.setAttribute(Qt.WA_ContentsMarginsRespectsSafeArea, False)
+        self.setMinimumSize(460, 360)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        root = QFrame(self)
+        root.setObjectName("settingsRoot")
+        outer.addWidget(root)
+
+        lay = QVBoxLayout(root)
+        lay.setContentsMargins(18, 40 if sys.platform == "darwin" else 18, 18, 18)
+        lay.setSpacing(12)
+
+        app_card = make_glass_card()
+        g = QGridLayout(app_card)
+        g.setContentsMargins(16, 14, 16, 14)
+        g.setHorizontalSpacing(14)
+        g.setVerticalSpacing(12)
+        g.setColumnStretch(1, 1)
+
+        hdr1 = QLabel("Appearance")
+        hdr1.setStyleSheet("font-weight: bold; font-size: 14px;")
+        g.addWidget(hdr1, 0, 0, 1, 2)
+
+        g.addWidget(QLabel("Theme:"), 1, 0)
+        self.combo_theme = QComboBox()
+        self.combo_theme.addItems(["Classic", "Light", "Glass"])
+
+        self.combo_theme.currentIndexChanged.connect(self._on_theme)
+        g.addWidget(self.combo_theme, 1, 1)
+
+        g.addWidget(QLabel("Ambient Glow:"), 2, 0)
+        self.s_glow = ResetSlider(30, Qt.Horizontal)
+        self.s_glow.setRange(0, 100)
+        self.s_glow.valueChanged.connect(mw.update_ambient_opacity)
+        g.addWidget(self.s_glow, 2, 1)
+
+        self.lbl_trans = QLabel("Glass Opacity:")
+        g.addWidget(self.lbl_trans, 3, 0)
+        self.s_trans = ResetSlider(45, Qt.Horizontal)
+        self.s_trans.setRange(0, 100)
+        self.s_trans.valueChanged.connect(self._on_glass)
+        g.addWidget(self.s_trans, 3, 1)
+
+        self.lbl_rim = QLabel("Glass Border Rim:")
+        g.addWidget(self.lbl_rim, 4, 0)
+        self.s_rim = ResetSlider(20, Qt.Horizontal)
+        self.s_rim.setRange(0, 100)
+        self.s_rim.valueChanged.connect(self._on_glass)
+        g.addWidget(self.s_rim, 4, 1)
+        lay.addWidget(app_card)
+
+        perf_card = make_glass_card()
+        p_lay = QVBoxLayout(perf_card)
+        p_lay.setContentsMargins(16, 14, 16, 14)
+        p_lay.setSpacing(8)
+        hdr2 = QLabel("Engine & Future Modules")
+        hdr2.setStyleSheet("font-weight: bold; font-size: 14px;")
+        p_lay.addWidget(hdr2)
+
+        self.chk_low_cpu = QCheckBox("Low-End CPU Mode (Faster startup & 10 FPS graph)")
+        self.chk_low_cpu.toggled.connect(mw.toggle_cpu_mode)
+        p_lay.addWidget(self.chk_low_cpu)
+
+        note = QLabel("Layout presets & Last.fm / ListenBrainz scrobbling coming soon.")
+        note.setWordWrap(True)
+        note.setStyleSheet("opacity: 0.7; font-size: 12px;")
+        p_lay.addWidget(note)
+        lay.addWidget(perf_card)
+        lay.addStretch()
+        self.sync_from_main()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.sync_from_main()
+
+    def sync_from_main(self):
+        idx_map = {"classic": 0, "light": 1, "liquid_glass": 2}
+        self.combo_theme.blockSignals(True)
+        self.combo_theme.setCurrentIndex(idx_map.get(self.mw.current_theme, 0))
+        self.combo_theme.blockSignals(False)
+        for s, val in ((self.s_glow, int(self.mw.ambient_opacity * 100)),
+                       (self.s_trans, self.mw.glass_clarity),
+                       (self.s_rim, self.mw.glass_rim)):
+            s.blockSignals(True); s.setValue(val); s.blockSignals(False)
+        self.chk_low_cpu.blockSignals(True)
+        self.chk_low_cpu.setChecked(self.mw.engine.low_end_mode)
+        self.chk_low_cpu.blockSignals(False)
+        is_g = self.mw.current_theme == "liquid_glass"
+        self.s_glow.default_value = 100 if is_g else (20 if self.mw.current_theme == "classic" else 30)
+        self.lbl_trans.setEnabled(is_g)
+        self.lbl_rim.setEnabled(is_g)
+        self.s_trans.setEnabled(is_g)
+        self.s_rim.setEnabled(is_g)
+        if self.isVisible():
+            if is_g:
+                if glass and self._glass_id is None:
+                    self._glass_id = glass.apply_glass_to_window(self)
+                apply_windows_glass(self, True, False)
+                apply_seamless_titlebar(self)
+            else:
+                if glass and self._glass_id is not None:
+                    try:
+                        glass.remove_glass_effect(self._glass_id)
+                    except Exception:
+                        pass
+                    self._glass_id = None
+                reset_macos_window_opaque(self)
+                apply_windows_glass(self, False, self.mw.current_theme == 'light')
+                apply_seamless_titlebar(self)
+        self.setStyleSheet(self.mw.styleSheet())
+
+    def _on_theme(self, idx):
+        targets = ["classic", "light", "liquid_glass"]
+        target = targets[idx]
+        if self.mw.current_theme != target:
+            self.mw.current_theme = targets[(idx - 1) % 3]
+            self.mw.toggle_theme()
+        self.sync_from_main()
+
+    def _on_glass(self, _=None):
+        self.mw.glass_clarity = self.s_trans.value()
+        self.mw.glass_rim = self.s_rim.value()
+        self.mw._on_ambient_color_changed(self.mw._current_ambient_color)
+        self.mw.save_session_state()
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setAcceptDrops(True)
         QApplication.instance().installEventFilter(self)
         self.setWindowTitle("ɦuk — Anechoic Engine")
+        self.setAttribute(Qt.WA_TranslucentBackground, windows_transparency_enabled())
+        self.setAttribute(Qt.WA_NoSystemBackground, True)
+        self.setAttribute(Qt.WA_ContentsMarginsRespectsSafeArea, False)
+
         self.setMinimumSize(1100, 820)
         
         pg.setConfigOptions(antialias=False, enableExperimental=False)
         
-        self.setStyleSheet("""
-            QMainWindow { background-color: #1a1a1a; }
-            QLabel { color: #e0e0e0; font-size: 13px; font-family: "Helvetica Neue"; }
-            QListWidget { background-color: #121212; color: #e0e0e0; border: 1px solid #333; font-family: "Helvetica Neue"; font-size: 13px; }
-            QListWidget::item { padding: 8px; border-bottom: 1px solid #222; }
-            QListWidget::item:selected { background-color: #007aff; color: white; }
-            QLineEdit { background-color: #2c2c2e; color: white; border: 1px solid #3a3a3c; border-radius: 4px; padding: 5px 8px; font-family: "Helvetica Neue"; font-size: 13px; }
-            QLineEdit:focus { border: 1px solid #007aff; }
-            QComboBox { background-color: #2c2c2e; color: white; border: none; border-radius: 4px; padding: 5px 24px 5px 8px; font-family: "Helvetica Neue"; }
-            QComboBox::drop-down { subcontrol-origin: padding; subcontrol-position: top right; width: 20px; border: none; }
-            QComboBox QAbstractItemView { background-color: #2c2c2e; color: white; selection-background-color: #007aff; }
-            QPushButton { 
-                background-color: #2c2c2e; color: white; 
-                border: none; padding: 8px 16px; border-radius: 6px;
-                font-size: 13px; font-weight: 500;
-            }
-            QPushButton:hover { background-color: #3a3a3c; }
-            QPushButton:pressed { background-color: #007aff; }
-            QPushButton#playBtn { font-size: 16px; padding: 10px 20px; }
-            QPushButton:checked { background-color: #007aff; }
-            QPushButton:disabled { background-color: #252525; color: #666; }
-            QSlider::groove:horizontal { height: 4px; background: #3a3a3c; border-radius: 2px; }
-            QSlider::sub-page:horizontal { background: #007aff; border-radius: 2px; }
-            QSlider::handle:horizontal { 
-                background: #fff; width: 14px; height: 14px; 
-                margin: -5px 0; border-radius: 7px; 
-            }
-            QSpinBox {
-                background-color: #2c2c2e; color: white; border: none;
-                border-radius: 4px; padding: 4px; font-size: 13px;
-                font-family: "Helvetica Neue"; min-width: 50px;
-            }
-        """)
+        self.glass_frost = 50
+        self.setStyleSheet(build_liquid_qss())
 
         self.smoothed_in = None
         self.smoothed_hrir = None
@@ -1075,6 +1457,13 @@ class MainWindow(QMainWindow):
         self.current_track_index = -1
         self.shuffle_enabled = False
         self._raw_cover_pixmap = None
+        
+        # Ambient background animation
+        self._current_ambient_color = QColor(26, 36, 58)
+        self.ambient_anim = QVariantAnimation(self)
+        self.ambient_anim.setDuration(600)
+        self.ambient_anim.setEasingCurve(QEasingCurve.InOutQuad)
+        self.ambient_anim.valueChanged.connect(self._on_ambient_color_changed)
 
         self.engine = AudioEngine()
         self.engine.playback_stopped.connect(self.on_playback_stopped)
@@ -1106,12 +1495,172 @@ class MainWindow(QMainWindow):
         self.scanner_thread = None
         self.last_sys_default = None
         
+        self.current_theme = "classic"
+        self.glass_effect_id = None
+        self.current_accent, self.current_accent_end = "#0a84ff", "#64d2ff"
+        self.theme_glow = {"classic": 0.20, "light": 0.30, "liquid_glass": 1.00}
+        self.ambient_opacity = self.theme_glow["classic"]
+        self.glass_clarity = 45
+        self.glass_rim = 20
+        pg.setConfigOption("foreground", "#eef2f8")
         self.init_ui()
         
         self.sys_device_timer = QTimer(self)
         self.sys_device_timer.setInterval(1000)
         self.sys_device_timer.timeout.connect(self.check_sys_default)
         QTimer.singleShot(10, self._deferred_startup)
+
+    def _on_glass_tuned(self, _=None):
+        self.glass_clarity = self.slider_glass_clarity.value()
+        self.glass_rim = self.slider_glass_rim.value()
+        self._on_ambient_color_changed(self._current_ambient_color)
+        self.save_session_state()
+
+    def open_settings(self):
+        if not hasattr(self, "_settings_dlg") or self._settings_dlg is None:
+            self._settings_dlg = SettingsDialog(self)
+        self._settings_dlg.sync_from_main()
+        self._settings_dlg.show()
+        self._settings_dlg.raise_()
+        self._settings_dlg.activateWindow()
+
+    def update_ambient_opacity(self, val):
+        self.ambient_opacity = val / 100.0
+        self.theme_glow[self.current_theme] = self.ambient_opacity
+        self._on_ambient_color_changed(self._current_ambient_color)
+        self.save_session_state()
+
+    def _update_graph_theme(self):
+        is_light = getattr(self, "current_theme", "classic") == "light"
+        is_glass = getattr(self, "current_theme", "classic") == "liquid_glass"
+        axis_color = '#1c1c1e' if is_light else '#eef2f8'
+        if is_glass: axis_color = '#ffffff'
+        
+        pg.setConfigOption('foreground', axis_color)
+
+        # Update axes and grid
+        for axis_name in ['left', 'bottom']:
+            axis = self.plot_widget.getAxis(axis_name)
+            axis.setPen(pg.mkPen(axis_color))
+            axis.setTextPen(pg.mkPen(axis_color))
+        
+        # Stronger grid in light mode for visibility
+        self.plot_widget.showGrid(x=True, y=True, alpha=0.35 if is_light else 0.25)
+        self.plot_widget.setTitle("Real-time Spectrum: Input vs Output", color=axis_color)
+
+        # Safely initialize/update the legend WITHOUT creating duplicates
+        if not hasattr(self, 'legend') or self.legend is None:
+            self.legend = self.plot_widget.addLegend(offset=(10, 10))
+            self.legend.setOpacity(0.1)
+            self.plot_widget.legend = self.legend
+        self.legend.setOpacity(0.1)
+        self.plot_widget.legend = self.legend
+        
+        self.legend.clear()  # Clears old labels so they don't duplicate
+        self.legend.setLabelTextColor(axis_color)
+        
+        # Give the legend a solid background for readability
+        legend_bg = pg.mkBrush(255, 255, 255, 220) if is_light else pg.mkBrush(15, 18, 25, 180)
+        self.legend.setBrush(legend_bg)
+        
+        # Re-add the items to the legend
+        for name, curve in [("Input", self.curve_in), ("HRIR Only (Raw)", self.curve_hrir), ("Processed Output", self.curve_out), ("Correction Curve", self.curve_corr)]:
+            self.legend.addItem(curve, name)
+
+        # Update curve colors and fills based on theme
+        from PySide6.QtGui import QColor
+        if is_light:
+            self.curve_in.setPen(pg.mkPen('#0066ff', width=2))
+            self.curve_in.setBrush(pg.mkBrush(QColor(0, 102, 255, 40)))
+            self.curve_hrir.setPen(pg.mkPen('#ff0055', width=2))
+            self.curve_out.setPen(pg.mkPen('#00c7be', width=2))
+            self.curve_out.setBrush(pg.mkBrush(QColor(0, 199, 190, 40)))
+            self.curve_corr.setPen(pg.mkPen('#ff9500', width=2, style=Qt.DashLine))
+        else:
+            self.curve_in.setPen(pg.mkPen('#007aff', width=2))
+            self.curve_in.setBrush(pg.mkBrush(QColor(0, 122, 255, 35)))
+            self.curve_hrir.setPen(pg.mkPen('#ff2d55', width=2))
+            self.curve_out.setPen(pg.mkPen('#34c759', width=2))
+            self.curve_out.setBrush(pg.mkBrush(QColor(52, 199, 89, 40)))
+            self.curve_corr.setPen(pg.mkPen('#ff9500', width=2, style=Qt.DashLine))
+
+    def _get_accent_color(self, r, g, b):
+        h, l, s = colorsys.rgb_to_hls(r/255.0, g/255.0, b/255.0)
+        if s < 0.04:
+            return ("#6e6e73", "#98989d") if getattr(self, "current_theme", "classic") == "light" else ("#8e8e93", "#c7c7cc")
+
+        is_light = getattr(self, "current_theme", "classic") == "light"
+        # Greens/yellows (h ~ 0.14..0.46) have high perceptual brightness, so tame saturation & luminance
+        is_bright_hue = 0.13 <= h <= 0.46
+        if is_light:
+            s = min(0.72 if is_bright_hue else 0.82, max(0.48, s * 1.1))
+            l = min(0.36 if is_bright_hue else 0.44, max(0.28, l))
+        else:
+            s = min(0.84 if is_bright_hue else 0.94, max(0.52, s * 1.25))
+            l = min(0.56 if is_bright_hue else 0.68, max(0.44, l))
+
+        nr, ng, nb = colorsys.hls_to_rgb(h, l, s)
+        accent_hex = f"#{int(nr*255):02x}{int(ng*255):02x}{int(nb*255):02x}"
+        l_end = min(0.86, l + 0.14)
+        er, eg, eb = colorsys.hls_to_rgb(h, l_end, s * 0.92)
+        accent_end_hex = f"#{int(er*255):02x}{int(eg*255):02x}{int(eb*255):02x}"
+        return accent_hex, accent_end_hex
+
+    def toggle_theme(self):
+        if self.current_theme == "classic":
+            self.current_theme = "light"
+        elif self.current_theme == "light":
+            self.current_theme = "liquid_glass"
+        else:
+            self.current_theme = "classic"
+
+        self.ambient_opacity = self.theme_glow.get(self.current_theme, 1.0 if self.current_theme == "liquid_glass" else (0.20 if self.current_theme == "classic" else 0.30))
+        theme_names = {"classic": "Classic", "light": "Light", "liquid_glass": "Glass"}
+        if hasattr(self, "btn_theme"): self.btn_theme.setText(f"Theme: {theme_names[self.current_theme]}")
+        if hasattr(self, "glass_tune_row"):
+            self.glass_tune_row.setVisible(self.current_theme == "liquid_glass")
+
+        if self.current_theme == "liquid_glass":
+            if glass and getattr(self, "glass_effect_id", None) is None:
+                self.glass_effect_id = glass.apply_glass_to_window(self)
+            apply_windows_glass(self, True, False)
+            apply_seamless_titlebar(self)
+        else:
+            if glass and getattr(self, "glass_effect_id", None) is not None:
+                try:
+                    glass.remove_glass_effect(self.glass_effect_id)
+                except Exception:
+                    pass
+                self.glass_effect_id = None
+            reset_macos_window_opaque(self)
+            apply_windows_glass(self, False, self.current_theme == 'light')
+            apply_seamless_titlebar(self)
+
+        self._update_graph_theme()
+        c = self._current_ambient_color
+        
+        self.setStyleSheet(build_liquid_qss(
+            c.red(), c.green(), c.blue(), 
+            theme=self.current_theme, 
+            ambient_opacity=self.ambient_opacity, 
+            accent=getattr(self, 'current_accent', '#0a84ff'), 
+            accent_end=getattr(self, 'current_accent_end', '#64d2ff'),
+            glass_clarity=self.glass_clarity,
+            glass_rim=self.glass_rim
+        ))
+        
+        # Force layout recalculation and repaint
+        self.centralWidget().layout().activate()
+        self.update()
+        self.repaint()
+        if getattr(self, "_settings_dlg", None) and self._settings_dlg.isVisible():
+            self._settings_dlg.sync_from_main()
+        self.save_session_state()
+
+    def _on_ambient_color_changed(self, color):
+        self.setStyleSheet(build_liquid_qss(color.red(), color.green(), color.blue(), theme=self.current_theme, ambient_opacity=self.ambient_opacity, accent=self.current_accent, accent_end=self.current_accent_end, glass_clarity=self.glass_clarity, glass_rim=self.glass_rim))
+        if getattr(self, "_settings_dlg", None) and self._settings_dlg.isVisible():
+            self._settings_dlg.setStyleSheet(self.styleSheet())
 
     def _get_macos_default_output_name(self):
         try:
@@ -1217,11 +1766,7 @@ class MainWindow(QMainWindow):
                     self.timer.start()
                 if not self.viz_timer.isActive():
                     self.viz_timer.start()
-            self.lbl_dev_status.setText(self.engine.stream_mode_status)
-            if self.engine.stream_is_exclusive:
-                self.lbl_dev_status.setStyleSheet("color: #34c759; font-size: 11px; font-weight: bold; margin-bottom: 4px;")
-            else:
-                self.lbl_dev_status.setStyleSheet("color: #ff9500; font-size: 11px; font-weight: bold; margin-bottom: 4px;")
+            self._set_dev_status(self.engine.stream_mode_status, self.engine.stream_is_exclusive)
 
     def _deferred_startup(self):
         self.refresh_devices(initial=True)
@@ -1261,7 +1806,7 @@ class MainWindow(QMainWindow):
                 f"Slower hardware detected (startup {startup_ms/1000.0:.1f}s, DSP {dsp_ms:.1f}ms).\nEnable 'Low-End CPU' mode? (Real-time HRTF stays active; switch anytime in DSP Controls.)",
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
             if reply == QMessageBox.Yes:
-                self.btn_cpu_mode.setChecked(True)
+                if hasattr(self, "btn_cpu_mode"): self.btn_cpu_mode.setChecked(True)
                 self.toggle_cpu_mode(True)
                 return
         self.save_session_state()
@@ -1269,7 +1814,7 @@ class MainWindow(QMainWindow):
     def toggle_cpu_mode(self, checked):
         low = bool(checked)
         self.engine.low_end_mode = low
-        self.btn_cpu_mode.setText("CPU: Low-End" if low else "CPU: Full Quality")
+        if hasattr(self, "btn_cpu_mode"): self.btn_cpu_mode.setText("CPU: Low-End" if low else "CPU: Full Quality")
         self.combo_fps.setCurrentIndex(0 if low else 2)
         if self.engine.sofa_data is not None:
             self.engine._update_hrirs()
@@ -1285,13 +1830,16 @@ class MainWindow(QMainWindow):
 
     def init_ui(self):
         central = QWidget()
+        central.setObjectName("centralWidget")
         self.setCentralWidget(central)
         main_layout = QHBoxLayout(central)
         main_layout.setSpacing(10)
-        main_layout.setContentsMargins(20, 20, 20, 20)
+        main_layout.setContentsMargins(20, 40 if sys.platform == 'darwin' else 20, 20, 20)
 
         # --- LEFT SIDE: LIBRARY ---
-        left_layout = QVBoxLayout()
+        left_card = make_glass_card()
+        left_layout = QVBoxLayout(left_card)
+        left_layout.setContentsMargins(14, 14, 14, 14)
         
         lib_top = QHBoxLayout()
         self.btn_open_file = QPushButton("Open File")
@@ -1312,24 +1860,31 @@ class MainWindow(QMainWindow):
         self.search_input.returnPressed.connect(self.setFocus)
         self.search_input.textChanged.connect(self.filter_playlist)
 
-        self.combo_sort = QComboBox()
-        self.combo_sort.setSizeAdjustPolicy(QComboBox.AdjustToContents)
-        self.combo_sort.setMinimumWidth(118)
-        self.combo_sort.addItems([
-            "Sort: Custom",
-            "Title (A-Z)",
-            "Title (Z-A)",
-            "Artist (A-Z)",
-            "Artist (Z-A)"
+        self.combo_group = QComboBox()
+        self.combo_group.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+        self.combo_group.setMinimumWidth(116)
+        self.combo_group.view().setMinimumWidth(126)
+        self.combo_group.addItems([
+            "Custom",
+            "Tracks",
+            "Artist",
+            "Album"
         ])
-        self.combo_sort.currentIndexChanged.connect(self.sort_playlist)
+        self.combo_group.currentIndexChanged.connect(self.apply_sort)
+
+        self.btn_sort_dir = QPushButton("A-Z")
+        self.btn_sort_dir.setCheckable(True)
+        self.btn_sort_dir.setFixedWidth(50)
+        self.btn_sort_dir.setStyleSheet("padding: 6px 4px;")
+        self.btn_sort_dir.toggled.connect(self.apply_sort)
 
         filter_layout.setSpacing(6)
         filter_layout.addWidget(self.search_input, 1)
-        filter_layout.addWidget(self.combo_sort, 0)
+        filter_layout.addWidget(self.combo_group, 0)
+        filter_layout.addWidget(self.btn_sort_dir, 0)
         left_layout.addLayout(filter_layout)
 
-        self.list_widget = QListWidget()
+        self.list_widget = MarqueeListWidget()
         self.list_widget.itemDoubleClicked.connect(self.play_selected_item)
         self.list_widget.setDragDropMode(QListWidget.InternalMove)
         self.list_widget.setDefaultDropAction(Qt.MoveAction)
@@ -1337,17 +1892,23 @@ class MainWindow(QMainWindow):
         self.list_widget.model().rowsMoved.connect(self.on_playlist_reordered)
         left_layout.addWidget(self.list_widget, 1)
         
-        main_layout.addLayout(left_layout, stretch=1)
+        main_layout.addWidget(left_card, stretch=1)
 
         # --- RIGHT SIDE: PLAYER & DSP ---
         right_layout = QVBoxLayout()
-        right_layout.setSpacing(6)
+        right_layout.setSpacing(10)
+        top_card = make_glass_card()
+        top_card_layout = QVBoxLayout(top_card)
+        top_card_layout.setContentsMargins(14, 14, 14, 14)
+        top_card_layout.setSpacing(8)
         
         # Top Controls
         file_layout = QHBoxLayout()
         self.btn_load_sofa = QPushButton("Load SOFA")
         self.btn_load_sofa.clicked.connect(self.load_sofa)
         self.lbl_sofa_file = QLabel("No SOFA loaded")
+        from PySide6.QtWidgets import QSizePolicy
+        self.lbl_sofa_file.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         
         self.btn_export = QPushButton("Export Track")
         self.btn_export.clicked.connect(self.export_track)
@@ -1362,7 +1923,13 @@ class MainWindow(QMainWindow):
         file_layout.addWidget(self.lbl_sofa_file, 1)
         file_layout.addWidget(self.btn_go_live)
         file_layout.addWidget(self.btn_export)
-        right_layout.addLayout(file_layout)
+
+        self.btn_settings = QPushButton("⚙")
+        self.btn_settings.setToolTip("Appearance & App Settings")
+        self.btn_settings.setFixedWidth(40)
+        self.btn_settings.clicked.connect(self.open_settings)
+        file_layout.addWidget(self.btn_settings)
+        top_card_layout.addLayout(file_layout)
 
         dev_layout = QHBoxLayout()
         dev_layout.addWidget(QLabel("Output Device:"))
@@ -1375,24 +1942,24 @@ class MainWindow(QMainWindow):
         self.lbl_sr = QLabel("Stream SR: -")
         self.lbl_sr.setStyleSheet("color: #ff9500; font-weight: bold;")
         dev_layout.addWidget(self.lbl_sr)
-        right_layout.addLayout(dev_layout)
+        top_card_layout.addLayout(dev_layout)
 
         self.lbl_dev_status = QLabel("Tip: Select your DAC directly instead of System Default for native sample-rate switching.")
         self.lbl_dev_status.setWordWrap(True)
         self.lbl_dev_status.setStyleSheet("color: #8e8e93; font-size: 11px; margin-bottom: 4px;")
-        right_layout.addWidget(self.lbl_dev_status)
+        top_card_layout.addWidget(self.lbl_dev_status)
 
         # Album Art & Track Info
         info_layout = QHBoxLayout()
         self.lbl_cover = QLabel()
         self.lbl_cover.setFixedSize(120, 120)
-        self.lbl_cover.setStyleSheet("background-color: #111; border: 1px solid #333;")
+        self.lbl_cover.setStyleSheet("background-color: rgba(0,0,0,90); border: 1px solid rgba(255,255,255,45); border-radius: 12px;")
         
         track_text_layout = QVBoxLayout()
-        self.lbl_track_title = QLabel("No Track Playing")
-        self.lbl_track_title.setStyleSheet("font-size: 18px; font-weight: bold; color: white;")
-        self.lbl_track_artist = QLabel("Unknown Artist")
-        self.lbl_track_artist.setStyleSheet("font-size: 14px; color: #aaa;")
+        self.lbl_track_title = MarqueeLabel("No Track Playing")
+        self.lbl_track_title.setObjectName("trackTitle")
+        self.lbl_track_artist = MarqueeLabel("Unknown Artist")
+        self.lbl_track_artist.setObjectName("trackArtist")
         track_text_layout.addStretch()
         track_text_layout.addWidget(self.lbl_track_title)
         track_text_layout.addWidget(self.lbl_track_artist)
@@ -1415,7 +1982,7 @@ class MainWindow(QMainWindow):
         perf_box.addStretch()
         info_layout.addLayout(perf_box)
 
-        right_layout.addLayout(info_layout)
+        top_card_layout.addLayout(info_layout)
 
         # Seekbar
         seek_layout = QHBoxLayout()
@@ -1429,7 +1996,7 @@ class MainWindow(QMainWindow):
         seek_layout.addWidget(self.lbl_time_current)
         seek_layout.addWidget(self.slider_seek, 1)
         seek_layout.addWidget(self.lbl_time_total)
-        right_layout.addLayout(seek_layout)
+        top_card_layout.addLayout(seek_layout)
 
         # Transport Controls
         btn_layout = QHBoxLayout()
@@ -1453,7 +2020,7 @@ class MainWindow(QMainWindow):
         btn_layout.addWidget(self.btn_play)
         btn_layout.addWidget(self.btn_next)
         btn_layout.addWidget(self.btn_shuffle)
-        right_layout.addLayout(btn_layout)
+        top_card_layout.addLayout(btn_layout)
 
         dsp_btn_layout = QHBoxLayout()
         self.btn_bypass = QPushButton("Bypass DSP")
@@ -1480,9 +2047,15 @@ class MainWindow(QMainWindow):
         dsp_btn_layout.addWidget(self.btn_bit_perfect)
         dsp_btn_layout.addWidget(self.btn_highs)
         dsp_btn_layout.addWidget(self.btn_float_mode)
-        right_layout.addLayout(dsp_btn_layout)
+        top_card_layout.addLayout(dsp_btn_layout)
+
+        right_layout.addWidget(top_card)
 
         # Peak Meter & FPS
+        spec_card = make_glass_card()
+        spec_layout = QVBoxLayout(spec_card)
+        spec_layout.setContentsMargins(14, 12, 14, 12)
+        spec_layout.setSpacing(6)
         peak_layout = QHBoxLayout()
         
         peak_layout.addWidget(QLabel("Graph FPS:"))
@@ -1506,12 +2079,15 @@ class MainWindow(QMainWindow):
         self.lbl_peak.setStyleSheet("color: #34c759; font-weight: bold; font-family: 'Helvetica Neue';")
         peak_layout.addWidget(self.lbl_peak)
         
-        right_layout.addLayout(peak_layout)
+        spec_layout.addLayout(peak_layout)
 
         # Graph
-        self.plot_widget = pg.PlotWidget(title="Real-time Spectrum: Input vs Output")
+        self.plot_widget = HoverPlotWidget(title="Real-time Spectrum: Input vs Output")
         self.plot_widget.setMinimumHeight(150)
-        self.plot_widget.setBackground('#1a1a1a')
+        self.plot_widget.setBackground((0, 0, 0, 0))
+        self.plot_widget.setStyleSheet('background: transparent; border: none;')
+        self.plot_widget.viewport().setAutoFillBackground(False)
+        self.plot_widget.getPlotItem().getViewBox().setBackgroundColor((0, 0, 0, 0))
         self.plot_widget.showGrid(x=True, y=True, alpha=0.3)
         self.plot_widget.setLogMode(x=True, y=False)
         self.plot_widget.hideButtons()
@@ -1522,7 +2098,9 @@ class MainWindow(QMainWindow):
         
         self.plot_widget.setLabel('left', 'Amplitude', units='dB')
         self.plot_widget.setLabel('bottom', 'Frequency (Hz)')
-        self.plot_widget.addLegend(offset=(10, 10))
+        self.legend = self.plot_widget.addLegend(offset=(10, 10))
+        self.legend.setOpacity(0.1)
+        self.plot_widget.legend = self.legend
         
         # STATIC X-AXIS RANGE & TICKS
         f_ticks = [20, 30, 50, 70, 100, 200, 300, 500, 700, 1000, 2000, 3000, 5000, 7000, 10000, 20000, 30000, 40000]
@@ -1535,7 +2113,8 @@ class MainWindow(QMainWindow):
         self.clip_line = pg.InfiniteLine(pos=0, angle=0, pen=pg.mkPen('r', style=Qt.DashLine, width=1))
         self.plot_widget.addItem(self.clip_line)
         
-        self.curve_in = self.plot_widget.plot(pen=pg.mkPen('#007aff', width=2), name="Input")
+        from PySide6.QtGui import QColor
+        self.curve_in = self.plot_widget.plot(pen=pg.mkPen('#007aff', width=2), name="Input", fillLevel=-120, brush=pg.mkBrush(QColor(0, 122, 255, 35)))
         self.curve_in.setDownsampling(auto=True, method='subsample')
         self.curve_in.setClipToView(True)
         
@@ -1543,7 +2122,7 @@ class MainWindow(QMainWindow):
         self.curve_hrir.setDownsampling(auto=True, method='subsample')
         self.curve_hrir.setClipToView(True)
         
-        self.curve_out = self.plot_widget.plot(pen=pg.mkPen('#34c759', width=2), name="Processed Output")
+        self.curve_out = self.plot_widget.plot(pen=pg.mkPen('#34c759', width=2), name="Processed Output", fillLevel=-120, brush=pg.mkBrush(QColor(52, 199, 89, 40)))
         self.curve_out.setDownsampling(auto=True, method='subsample')
         self.curve_out.setClipToView(True)
         
@@ -1551,9 +2130,14 @@ class MainWindow(QMainWindow):
         self.curve_corr.setDownsampling(auto=True, method='subsample')
         self.curve_corr.setClipToView(True)
         
-        right_layout.addWidget(self.plot_widget, stretch=1)
+        spec_layout.addWidget(self.plot_widget, stretch=1)
+        right_layout.addWidget(spec_card, stretch=1)
 
         # DSP Sliders (Collapsible)
+        dsp_card = make_glass_card()
+        dsp_card_layout = QVBoxLayout(dsp_card)
+        dsp_card_layout.setContentsMargins(14, 10, 14, 10)
+        dsp_card_layout.setSpacing(6)
         dsp_header_layout = QHBoxLayout()
         self.btn_toggle_dsp_panel = QPushButton("DSP Controls ▼")
         self.btn_toggle_dsp_panel.setCheckable(True)
@@ -1573,7 +2157,8 @@ class MainWindow(QMainWindow):
 
         dsp_header_layout.addWidget(self.slider_vol, 1)
         dsp_header_layout.addWidget(self.lbl_vol)
-        right_layout.addLayout(dsp_header_layout)
+
+        dsp_card_layout.addLayout(dsp_header_layout)
 
         self.dsp_panel = QWidget()
         from PySide6.QtWidgets import QSizePolicy
@@ -1647,20 +2232,16 @@ class MainWindow(QMainWindow):
         treble_layout.addWidget(self.lbl_treble)
         ctrl_layout.addLayout(treble_layout)
 
-        tonal_cpu_row = QHBoxLayout()
         self.chk_tonal = QCheckBox("Tonal Match (Neutralize coloration)")
         self.chk_tonal.setChecked(True)
         self.chk_tonal.stateChanged.connect(self.toggle_tonal_match)
-        self.btn_cpu_mode = QPushButton("CPU: Full Quality")
-        self.btn_cpu_mode.setCheckable(True)
-        self.btn_cpu_mode.clicked.connect(self.toggle_cpu_mode)
-        tonal_cpu_row.addWidget(self.chk_tonal, 1)
-        tonal_cpu_row.addWidget(self.btn_cpu_mode)
-        ctrl_layout.addLayout(tonal_cpu_row)
+        ctrl_layout.addWidget(self.chk_tonal)
 
-        right_layout.addWidget(self.dsp_panel)
+        dsp_card_layout.addWidget(self.dsp_panel)
+        right_layout.addWidget(dsp_card)
         
         main_layout.addLayout(right_layout, stretch=2)
+        self._update_graph_theme()
 
     # --- LIBRARY LOGIC ---
     def scan_folder(self):
@@ -1668,30 +2249,39 @@ class MainWindow(QMainWindow):
         if folder:
             self.btn_scan.setEnabled(False)
             self.lbl_lib_info.setText("Scanning...")
+            if self.scanner_thread is not None and self.scanner_thread.isRunning():
+                self.scanner_thread.quit()
+                self.scanner_thread.wait()
             self.scanner_thread = ScannerThread(folder)
             self.scanner_thread.finished_scanning.connect(self.on_scan_finished)
             self.scanner_thread.start()
 
     def on_scan_finished(self, tracks, auto_play_if_empty=False):
         was_empty = len(self.library_tracks) == 0
-        existing_paths = {t['path'] for t in self.library_tracks}
+        existing_map = {t['path']: i for i, t in enumerate(self.library_tracks)}
 
         added = 0
         for track in tracks:
-            if track['path'] not in existing_paths:
+            if track['path'] not in existing_map:
                 self.library_tracks.append(track)
                 self.custom_tracks.append(track)
-                existing_paths.add(track['path'])
-                item = QListWidgetItem(self._format_track_label(track))
-                item.setData(Qt.UserRole, track)
-                self.list_widget.addItem(item)
+                existing_map[track['path']] = len(self.library_tracks) - 1
                 added += 1
+            else:
+                # Update metadata for existing tracks
+                idx = existing_map[track['path']]
+                old_track = self.library_tracks[idx]
+                if old_track.get('album') != track.get('album') and track.get('album') != "Unknown Album":
+                    old_track['album'] = track.get('album')
+                if old_track.get('artist') != track.get('artist') and track.get('artist') != "Unknown Artist":
+                    old_track['artist'] = track.get('artist')
 
-        if added > 0 and hasattr(self, "combo_sort") and self.combo_sort.currentIndex() != 0:
-            self.sort_playlist(self.combo_sort.currentIndex())
-
+        # Rebuild the entire widget from scratch to fix missing tracks and layout glitches
+        self._rebuild_playlist_widget()
+        
         self.lbl_lib_info.setText(f"{len(self.library_tracks)} tracks in playlist")
         self.btn_scan.setEnabled(True)
+        
         if hasattr(self, "search_input") and self.search_input.text():
             self.filter_playlist(self.search_input.text())
 
@@ -1700,8 +2290,7 @@ class MainWindow(QMainWindow):
             self.list_widget.setCurrentItem(item)
             self.play_selected_item(item)
 
-        if hasattr(self, 'save_session_state'):
-            self.save_session_state()
+        self.save_session_state()
 
     def play_selected_item(self, item):
         self._pending_load_path = None
@@ -1727,7 +2316,7 @@ class MainWindow(QMainWindow):
         if cover_bytes:
             pixmap = QPixmap()
             pixmap.loadFromData(cover_bytes)
-            self._raw_cover_pixmap = pixmap.scaled(440, 440, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            self._raw_cover_pixmap = pixmap.scaled(440, 440, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
             self._last_cover_render_key = None
             self.update_cover_art_size()
         else:
@@ -1778,10 +2367,15 @@ class MainWindow(QMainWindow):
         
         # Clean up previous thread if exists
         if self.loader_thread is not None:
+            old_thread = self.loader_thread
+            self.loader_thread = None
             try:
-                self.loader_thread.finished_loading.disconnect()
+                old_thread.finished_loading.disconnect()
             except Exception:
                 pass
+            if old_thread.isRunning():
+                old_thread.quit()
+                old_thread.wait()
         
         self.loader_thread = LoaderThread(filepath)
         self.loader_thread.finished_loading.connect(self.on_audio_loaded)
@@ -1793,6 +2387,8 @@ class MainWindow(QMainWindow):
         self.btn_play.setEnabled(True)
         
         if success and self.loader_thread is not None:
+            if self.loader_thread.result_fs is None:
+                return # Ignore stale signals from old threads
             self.engine.audio_data = self.loader_thread.result_data
             self.engine.fs = self.loader_thread.result_fs
             self.engine.file_fs = self.loader_thread.result_fs
@@ -1844,6 +2440,9 @@ class MainWindow(QMainWindow):
         self.btn_export.setEnabled(False)
         self.btn_export.setText("Exporting...")
         
+        if self.export_thread is not None and self.export_thread.isRunning():
+            self.export_thread.quit()
+            self.export_thread.wait()
         self.export_thread = ExportThread(filepath, self.engine)
         self.export_thread.finished_export.connect(self.on_export_finished)
         self.export_thread.start()
@@ -2010,7 +2609,7 @@ class MainWindow(QMainWindow):
                 if cb:
                     pm = QPixmap()
                     pm.loadFromData(cb)
-                    self._raw_cover_pixmap = pm.scaled(440, 440, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                    self._raw_cover_pixmap = pm.scaled(440, 440, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
                     self._last_cover_render_key = None
                     self.update_cover_art_size()
                 else:
@@ -2022,8 +2621,15 @@ class MainWindow(QMainWindow):
             self.btn_play.setText("▶ Play")
             self.timer.stop()
             self.viz_timer.stop()
-            self.lbl_dev_status.setText("Live Stopped — Press Play or select a track.")
+            self._set_dev_status("Live Stopped — Press Play or select a track.", None)
+
+    def _set_dev_status(self, text, exclusive):
+        self.lbl_dev_status.setText(text)
+        if exclusive is None:
             self.lbl_dev_status.setStyleSheet("color: #8e8e93; font-size: 11px; margin-bottom: 4px;")
+        else:
+            color = "#34c759" if exclusive else "#ff9500"
+            self.lbl_dev_status.setStyleSheet(f"color: {color}; font-size: 11px; font-weight: bold; margin-bottom: 4px;")
 
     def change_device(self):
         self.engine.selected_device = self.combo_device.currentData()
@@ -2036,11 +2642,7 @@ class MainWindow(QMainWindow):
                     self.timer.start()
                 if not self.viz_timer.isActive():
                     self.viz_timer.start()
-            self.lbl_dev_status.setText(self.engine.stream_mode_status)
-            if self.engine.stream_is_exclusive:
-                self.lbl_dev_status.setStyleSheet("color: #34c759; font-size: 11px; font-weight: bold; margin-bottom: 4px;")
-            else:
-                self.lbl_dev_status.setStyleSheet("color: #ff9500; font-size: 11px; font-weight: bold; margin-bottom: 4px;")
+            self._set_dev_status(self.engine.stream_mode_status, self.engine.stream_is_exclusive)
 
     def change_fps(self, index):
         fps_map = {0: 100, 1: 33, 2: 16, 3: 8}
@@ -2288,8 +2890,8 @@ class MainWindow(QMainWindow):
 
             f, P_in = _fast_welch(self.chunk_in_buf, fs=self.engine.fs, nperseg=w_seg)
             _, P_out = _fast_welch(self.chunk_out_buf, fs=self.engine.fs, nperseg=w_seg)
-            P_in_db = 10 * np.log10(P_in + 1e-12)
-            P_out_db = 10 * np.log10(P_out + 1e-12)
+            P_in_db = np.maximum(10 * np.log10(P_in + 1e-12), -110.0)
+            P_out_db = np.maximum(10 * np.log10(P_out + 1e-12), -110.0)
 
             if (
                 self.engine.dsp_bypass
@@ -2305,7 +2907,7 @@ class MainWindow(QMainWindow):
                     f_raw = np.fft.rfftfreq(self.engine.N, 1.0 / self.engine.fs)
                     gain_raw = (np.abs(self.engine.h_LL_fft_raw) ** 2) + (np.abs(self.engine.h_RL_fft_raw) ** 2)
                     self._cached_hrir_gain = np.interp(f, f_raw, gain_raw)
-                P_hrir_db = 10 * np.log10((P_in * self._cached_hrir_gain) + 1e-12)
+                P_hrir_db = np.maximum(10 * np.log10((P_in * self._cached_hrir_gain) + 1e-12), -110.0)
 
             peak = np.max(np.abs(self.chunk_out_buf))
             peak_db = 20 * np.log10(peak + 1e-12)
@@ -2388,11 +2990,7 @@ class MainWindow(QMainWindow):
             self.btn_play.setText("⏸ Pause")
             self.timer.start()
             self.viz_timer.start()
-            self.lbl_dev_status.setText(self.engine.stream_mode_status)
-            if self.engine.stream_is_exclusive:
-                self.lbl_dev_status.setStyleSheet("color: #34c759; font-size: 11px; font-weight: bold; margin-bottom: 4px;")
-            else:
-                self.lbl_dev_status.setStyleSheet("color: #ff9500; font-size: 11px; font-weight: bold; margin-bottom: 4px;")
+            self._set_dev_status(self.engine.stream_mode_status, self.engine.stream_is_exclusive)
 
     def seek_audio(self, value):
         if self.engine.audio_data is not None:
@@ -2432,8 +3030,7 @@ class MainWindow(QMainWindow):
         self.timer.stop()
         self.viz_timer.stop()
         self.smoothed_in = None
-        self.lbl_dev_status.setText("Stopped — Select your DAC directly instead of System Default for native sample-rate switching.")
-        self.lbl_dev_status.setStyleSheet("color: #8e8e93; font-size: 11px; margin-bottom: 4px;")
+        self._set_dev_status("Stopped — Select your DAC directly instead of System Default for native sample-rate switching.", None)
 
     def toggle_dsp_panel(self, checked):
         visible = bool(checked)
@@ -2511,6 +3108,7 @@ class MainWindow(QMainWindow):
             file = os.path.basename(path)
             title = file
             artist = "Unknown Artist"
+            album = "Unknown Album"
             try:
                 mutagen, FLAC, ID3, MP3, MP4 = _get_mutagen()
                 audio = mutagen.File(path)
@@ -2518,13 +3116,16 @@ class MainWindow(QMainWindow):
                     if isinstance(audio, FLAC):
                         title = audio.get('title', [file])[0]
                         artist = audio.get('artist', ["Unknown Artist"])[0]
+                        album = audio.get('album', ["Unknown Album"])[0]
                     elif isinstance(audio, (MP3, MP4)) and audio.tags:
                         if isinstance(audio.tags, ID3):
                             title = str(audio.tags.get('TIT2', file))
                             artist = str(audio.tags.get('TPE1', "Unknown Artist"))
+                            album = str(audio.tags.get('TALB', "Unknown Album"))
                         else:
                             title = audio.tags.get('\xa9nam', [file])[0]
                             artist = audio.tags.get('\xa9ART', ["Unknown Artist"])[0]
+                            album = audio.tags.get('\xa9alb', ["Unknown Album"])[0]
             except Exception:
                 pass
 
@@ -2532,10 +3133,17 @@ class MainWindow(QMainWindow):
                 'path': path,
                 'title': title,
                 'artist': artist,
+                'album': album,
             })
 
         self.on_scan_finished(tracks, auto_play_if_empty=True)
         
+    def on_repair_finished(self):
+        self._refresh_playlist_labels()
+        if hasattr(self, "combo_group") and self.combo_group.currentIndex() != 0:
+            self.apply_sort()
+        self.save_session_state()
+
     def _state_file_path(self):
         state_dir = os.path.join(os.path.expanduser("~"), ".hrtf_audio_player")
         os.makedirs(state_dir, exist_ok=True)
@@ -2562,7 +3170,7 @@ class MainWindow(QMainWindow):
                 f"{len(self.library_tracks)} tracks in playlist" if self.library_tracks else "Library empty"
             )
 
-    def sort_playlist(self, index):
+    def apply_sort(self, *args):
         if not self.library_tracks:
             return
 
@@ -2570,22 +3178,31 @@ class MainWindow(QMainWindow):
         if 0 <= self.current_track_index < len(self.library_tracks):
             current_path = self.library_tracks[self.current_track_index]['path']
 
-        if index == 0:
-            self.library_tracks = list(self.custom_tracks)
-        elif index == 1:
-            self.library_tracks.sort(key=lambda t: (t.get('title', '').lower(), t.get('artist', '').lower()))
-        elif index == 2:
-            self.library_tracks.sort(key=lambda t: (t.get('title', '').lower(), t.get('artist', '').lower()), reverse=True)
-        elif index == 3:
-            self.library_tracks.sort(key=lambda t: (t.get('artist', '').lower(), t.get('title', '').lower()))
-        elif index == 4:
-            self.library_tracks.sort(key=lambda t: (t.get('artist', '').lower(), t.get('title', '').lower()), reverse=True)
+        group_idx = self.combo_group.currentIndex()
+        reverse = self.btn_sort_dir.isChecked()
+        self.btn_sort_dir.setText("Z-A" if reverse else "A-Z")
+        
+        # Disable the A-Z button in Custom mode since custom is manually sorted
+        self.btn_sort_dir.setEnabled(group_idx != 0)
 
+        if group_idx == 0:
+            self.library_tracks = list(self.custom_tracks)
+        elif group_idx == 1:
+            self.library_tracks.sort(key=lambda t: t.get('title', '').lower(), reverse=reverse)
+        elif group_idx == 2:
+            self.library_tracks.sort(key=lambda t: (t.get('artist', '').lower(), t.get('title', '').lower()), reverse=reverse)
+        elif group_idx == 3:
+            self.library_tracks.sort(key=lambda t: (t.get('album', '').lower(), t.get('title', '').lower()), reverse=reverse)
+
+        self._refresh_playlist_labels()
         self._rebuild_playlist_widget(current_path)
         self.save_session_state()
 
     def _format_track_label(self, track):
-        if hasattr(self, "combo_sort") and self.combo_sort.currentIndex() in (3, 4):
+        group_idx = self.combo_group.currentIndex() if hasattr(self, "combo_group") else 0
+        if group_idx == 3: # Album
+            return f"{track.get('album', 'Unknown Album')} - {track['title']}"
+        elif group_idx == 2: # Artist
             return f"{track['artist']} - {track['title']}"
         return f"{track['title']} - {track['artist']}"
 
@@ -2629,10 +3246,10 @@ class MainWindow(QMainWindow):
                 if t['path'] == current_path:
                     self.current_track_index = i
                     break
-        if hasattr(self, "combo_sort") and self.combo_sort.currentIndex() != 0:
-            self.combo_sort.blockSignals(True)
-            self.combo_sort.setCurrentIndex(0)
-            self.combo_sort.blockSignals(False)
+        if hasattr(self, "combo_group") and self.combo_group.currentIndex() != 0:
+            self.combo_group.blockSignals(True)
+            self.combo_group.setCurrentIndex(0)
+            self.combo_group.blockSignals(False)
             self._refresh_playlist_labels()
         self.save_session_state()
 
@@ -2717,13 +3334,18 @@ class MainWindow(QMainWindow):
         playing_removed = self.current_track_index in selected_rows
 
         removed_paths = set()
+        self.list_widget.setUpdatesEnabled(False)
         for row in selected_rows:
             self.list_widget.takeItem(row)
             if 0 <= row < len(self.library_tracks):
                 removed = self.library_tracks.pop(row)
                 removed_paths.add(removed['path'])
+        self.list_widget.setUpdatesEnabled(True)
+        
         if removed_paths:
             self.custom_tracks = [t for t in self.custom_tracks if t['path'] not in removed_paths]
+            
+        self.list_widget.doItemsLayout() # Force layout recalculation
 
         self.lbl_lib_info.setText(f"{len(self.library_tracks)} tracks" if self.library_tracks else "Library empty")
 
@@ -2743,6 +3365,8 @@ class MainWindow(QMainWindow):
                     self.current_track_index = i
                     break
 
+        self.list_widget.viewport().update()
+        self.list_widget.viewport().repaint() # Force synchronous clear
         self.save_session_state()
 
     def save_session_state(self):
@@ -2754,12 +3378,18 @@ class MainWindow(QMainWindow):
             state = {
                 "tracks": self.library_tracks,
                 "custom_tracks": self.custom_tracks,
-                "sort_mode": self.combo_sort.currentIndex() if hasattr(self, "combo_sort") else 0,
+                "group_mode": self.combo_group.currentIndex() if hasattr(self, "combo_group") else 0,
+                "sort_dir": self.btn_sort_dir.isChecked() if hasattr(self, "btn_sort_dir") else False,
                 "current_index": self.current_track_index,
                 "position_sec": pos_sec,
                 "volume": getattr(self, "_pre_bp_vol", getattr(self, "_pre_live_vol", int(round(self.engine.volume * 100)))) if (self.engine.bit_perfect or self._bp_ramp_timer.isActive() or self.engine.use_mac_tap) else int(round(self.engine.volume * 100)),
                 "shuffle": self.shuffle_enabled,
                 "dsp_panel_open": self.btn_toggle_dsp_panel.isChecked(),
+                "theme": getattr(self, "current_theme", "classic"),
+                "ambient_opacity": getattr(self, "ambient_opacity", 0.30),
+                "theme_glow": getattr(self, "theme_glow", {"classic": 0.30, "light": 0.30, "liquid_glass": 1.00}),
+                "glass_clarity": getattr(self, "glass_clarity", 45),
+                "glass_rim": getattr(self, "glass_rim", 20),
                 "low_end_mode": self.engine.low_end_mode,
                 "sofa_path": self.engine.sofa_path if (self.engine.sofa_path and os.path.exists(self.engine.sofa_path) and os.path.abspath(self.engine.sofa_path) != os.path.abspath(get_resource_path("default.sofa"))) else "",
             }
@@ -2789,10 +3419,28 @@ class MainWindow(QMainWindow):
             if hasattr(self, "btn_cpu_mode"):
                 self.btn_cpu_mode.blockSignals(True)
                 self.btn_cpu_mode.setChecked(low)
-                self.btn_cpu_mode.setText("CPU: Low-End" if low else "CPU: Full Quality")
+                if hasattr(self, "btn_cpu_mode"): self.btn_cpu_mode.setText("CPU: Low-End" if low else "CPU: Full Quality")
                 self.btn_cpu_mode.blockSignals(False)
                 if low:
                     self.combo_fps.setCurrentIndex(0)
+            theme = state.get("theme", "classic")
+            saved_glow = state.get("theme_glow")
+            if isinstance(saved_glow, dict):
+                self.theme_glow.update({k: float(v) for k, v in saved_glow.items() if k in self.theme_glow})
+            self.ambient_opacity = self.theme_glow.get(theme, float(state.get("ambient_opacity", 1.0 if theme == "liquid_glass" else 0.30)))
+            self.glass_clarity = int(state.get("glass_clarity", 45))
+            self.glass_rim = int(state.get("glass_rim", 20))
+            if hasattr(self, "slider_glass_clarity"):
+                self.slider_glass_clarity.blockSignals(True); self.slider_glass_clarity.setValue(self.glass_clarity); self.slider_glass_clarity.blockSignals(False)
+                self.slider_glass_rim.blockSignals(True); self.slider_glass_rim.setValue(self.glass_rim); self.slider_glass_rim.blockSignals(False)
+            if hasattr(self, "slider_glow"):
+                self.slider_glow.blockSignals(True)
+                self.slider_glow.setValue(int(self.ambient_opacity * 100))
+                self.slider_glow.blockSignals(False)
+            if theme in ("classic", "light", "liquid_glass") and self.current_theme != theme:
+                order = ["classic", "light", "liquid_glass"]
+                self.current_theme = order[(order.index(theme) - 1) % 3]
+                self.toggle_theme()
             panel_open = bool(state.get("dsp_panel_open", False))
             self.btn_toggle_dsp_panel.setChecked(panel_open)
             self.toggle_dsp_panel(panel_open)
@@ -2807,15 +3455,29 @@ class MainWindow(QMainWindow):
                 return
 
             saved_custom = [t for t in state.get("custom_tracks", []) if os.path.exists(t.get("path", ""))]
-            sort_mode = state.get("sort_mode", 0)
-            if hasattr(self, "combo_sort") and isinstance(sort_mode, int) and 0 <= sort_mode < self.combo_sort.count():
-                self.combo_sort.blockSignals(True)
-                self.combo_sort.setCurrentIndex(sort_mode)
-                self.combo_sort.blockSignals(False)
+            group_mode = state.get("group_mode", 0)
+            sort_dir = state.get("sort_dir", False)
+            if hasattr(self, "combo_group") and isinstance(group_mode, int) and 0 <= group_mode < self.combo_group.count():
+                self.combo_group.blockSignals(True)
+                self.combo_group.setCurrentIndex(group_mode)
+                self.combo_group.blockSignals(False)
+            if hasattr(self, "btn_sort_dir"):
+                self.btn_sort_dir.blockSignals(True)
+                self.btn_sort_dir.setChecked(sort_dir)
+                self.btn_sort_dir.setText("Z-A" if sort_dir else "A-Z")
+                self.btn_sort_dir.setEnabled(group_mode != 0)
+                self.btn_sort_dir.blockSignals(False)
 
             self.on_scan_finished(saved_tracks)
             if saved_custom:
                 self.custom_tracks = saved_custom
+                
+            # Only repair a small batch on startup to keep the app fast
+            needs_repair = [t for t in self.library_tracks if 'album' not in t]
+            if needs_repair:
+                self.repair_thread = MetadataRepairThread(needs_repair[:50])
+                self.repair_thread.finished_repair.connect(self.on_repair_finished)
+                self.repair_thread.start()
             idx = state.get("current_index", -1)
             pos_sec = float(state.get("position_sec", 0.0))
 
@@ -2831,7 +3493,7 @@ class MainWindow(QMainWindow):
                 if cover_bytes:
                     pixmap = QPixmap()
                     pixmap.loadFromData(cover_bytes)
-                    self._raw_cover_pixmap = pixmap.scaled(440, 440, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                    self._raw_cover_pixmap = pixmap.scaled(440, 440, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
                     self._last_cover_render_key = None
                     self.update_cover_art_size()
 
@@ -2860,22 +3522,51 @@ class MainWindow(QMainWindow):
     def update_cover_art_size(self):
         h = self.height()
         panel_h = self.dsp_panel.sizeHint().height() if (hasattr(self, "dsp_panel") and self.dsp_panel.isVisible()) else 0
-        free_for_cover = self.height() - panel_h - 535
-        size = max(110, min(440, int(free_for_cover)))
-        stepped_size = (size // 4) * 4
+        free_for_cover = (self.height() - panel_h - 590) * 0.65
+        size = max(110, min(230, int(free_for_cover)))
+        stepped_size = size
 
         self.lbl_cover.setMinimumSize(110, 110)
-        if self.lbl_cover.maximumWidth() != stepped_size or self.lbl_cover.width() != stepped_size:
-            self.lbl_cover.setMaximumSize(stepped_size, stepped_size)
-            self.lbl_cover.resize(stepped_size, stepped_size)
+        if self.lbl_cover.width() != stepped_size or self.lbl_cover.height() != stepped_size:
+            self.lbl_cover.setFixedSize(stepped_size, stepped_size)
 
         raw = getattr(self, "_raw_cover_pixmap", None)
         render_key = (id(raw), stepped_size)
         if getattr(self, "_last_cover_render_key", None) != render_key:
             self._last_cover_render_key = render_key
+            r, g, b = sample_ambient_rgb(raw)
+            
+            target_color = QColor(r, g, b)
+            self.current_accent, self.current_accent_end = self._get_accent_color(r, g, b)
+            
+            # Get the current actual color (if animation is running, use its current value)
+            if hasattr(self, 'ambient_anim') and self.ambient_anim.state() == QVariantAnimation.Running:
+                current_color = self.ambient_anim.currentValue()
+            else:
+                current_color = self._current_ambient_color
+
+            if target_color != self._current_ambient_color:
+                self.ambient_anim.stop()
+                self.ambient_anim.setStartValue(current_color)
+                self.ambient_anim.setEndValue(target_color)
+                self._current_ambient_color = target_color
+                
+                # Instantly apply QSS with the new accent color but keep the OLD background color
+                # This makes the buttons change instantly, while the background smoothly fades.
+                self.setStyleSheet(build_liquid_qss(
+                    current_color.red(), current_color.green(), current_color.blue(),
+                    theme=self.current_theme, ambient_opacity=self.ambient_opacity,
+                    accent=self.current_accent, accent_end=self.current_accent_end,
+                    glass_clarity=self.glass_clarity, glass_rim=self.glass_rim
+                ))
+                
+                self.ambient_anim.start()
+            else:
+                self._on_ambient_color_changed(self._current_ambient_color)
+                
             if raw is not None and not raw.isNull():
                 self.lbl_cover.setPixmap(
-                    raw.scaled(stepped_size, stepped_size, Qt.KeepAspectRatio, Qt.FastTransformation)
+                    raw.scaled(stepped_size, stepped_size, Qt.KeepAspectRatioByExpanding, Qt.FastTransformation if getattr(self, '_is_resizing', False) else Qt.SmoothTransformation)
                 )
 
         scale = max(1.0, min(1.5, h / 820.0))
@@ -2896,8 +3587,12 @@ class MainWindow(QMainWindow):
             self.lbl_track_artist.setFont(f)
 
     def changeEvent(self, event):
-        if event.type() == QEvent.WindowStateChange and hasattr(self, "lbl_cover"):
-            self.lbl_cover.setMinimumSize(110, 110)
+        if event.type() == QEvent.WindowStateChange:
+            if hasattr(self, "lbl_cover"):
+                self.lbl_cover.setMinimumSize(110, 110)
+            if not self.isFullScreen():
+                for ms in (50, 350, 750):
+                    QTimer.singleShot(ms, lambda: (apply_seamless_titlebar(self), self.setGeometry(self.screen().availableGeometry()) if getattr(getattr(self, '_drag_filter', None), '_was_zoomed', False) else None))
         super().changeEvent(event)
 
     def resizeEvent(self, event):
@@ -2909,10 +3604,22 @@ class MainWindow(QMainWindow):
         QApplication.instance().removeEventFilter(self)
         self.save_session_state()
         self.engine.stop()
+        
+        # Safely wait for any background threads to finish before closing
+        for thread in [self.loader_thread, self.scanner_thread, self.export_thread]:
+            if thread is not None and thread.isRunning():
+                thread.quit()
+                thread.wait()
+                
         event.accept()
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     window = MainWindow()
+    window._drag_filter = WindowDragFilter(window)
+    app.installEventFilter(window._drag_filter)
     window.show()
+    apply_seamless_titlebar(window)
+    window.raise_()
+    window.activateWindow()
     sys.exit(app.exec())
