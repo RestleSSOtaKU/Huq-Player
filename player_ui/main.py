@@ -2016,8 +2016,11 @@ class MainWindow(QMainWindow):
 
         _is_first = not os.path.exists(self.engine._sofa_cache_path(get_resource_path("default.sofa"))) if os.path.exists(get_resource_path("default.sofa")) else False
         self.lbl_dev_status = QLabel("First launch: caching HRTF acoustic profile — subsequent startups will be instant." if _is_first else "Tip: Select your DAC directly instead of System Default for native sample-rate switching.")
+        if _is_first:
+            self.lbl_dev_status.setStyleSheet("color: #64d2ff; font-size: 12px; font-weight: bold; margin-bottom: 4px;")
         self.lbl_dev_status.setWordWrap(True)
-        self.lbl_dev_status.setStyleSheet("color: #8e8e93; font-size: 11px; margin-bottom: 4px;")
+        if not _is_first:
+            self.lbl_dev_status.setStyleSheet("color: #8e8e93; font-size: 11px; margin-bottom: 4px;")
         top_card_layout.addWidget(self.lbl_dev_status)
 
         # Album Art & Track Info
