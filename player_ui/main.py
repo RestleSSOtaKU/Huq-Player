@@ -109,7 +109,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                                QHBoxLayout, QPushButton, QSlider, QLabel, 
                                QFileDialog, QCheckBox, QSpinBox, QMessageBox,
                                QComboBox, QListWidget, QListWidgetItem, QSplitter, QLineEdit, QStyledItemDelegate, QStyle, QStyleOptionViewItem, QAbstractItemView)
-from PySide6.QtCore import Qt, QTimer, Signal, QObject, QThread, QSize, QEvent, QVariantAnimation, QEasingCurve
+from PySide6.QtCore import Qt, QTimer, Signal, QObject, QThread, QSize, QEvent, QVariantAnimation, QEasingCurve, QPointF
 from PySide6.QtGui import QPixmap, QIcon, QColor, QPainter, QPalette
 from dsp_bridge import RustDspBridge
 from liquid_glass import make_glass_card, sample_ambient_rgb, build_liquid_qss, apply_seamless_titlebar, apply_windows_glass, windows_transparency_enabled, WindowDragFilter
@@ -743,6 +743,7 @@ class AudioEngine(QObject):
         self.viz_ring_hrir = np.zeros(self.viz_ring_size, dtype=np.float32)
         self.viz_head = 0
         self.viz_state = (0, self.block_size, 0.0)
+        self.latest_stereo_out = None
         
         self.correction_f = None
         self.correction_db = None
@@ -1006,10 +1007,10 @@ class AudioEngine(QObject):
         if getattr(self, 'raw_ipsi_L', None) is None or self.fs is None:
             return
             
-        h_LL = self.raw_ipsi_L
-        h_RL = self.raw_contra_R
-        h_LR = self.raw_contra_L
-        h_RR = self.raw_ipsi_R
+        h_LL = np.asarray(self.raw_ipsi_L, dtype=np.float64)
+        h_RL = np.asarray(self.raw_contra_R, dtype=np.float64)
+        h_LR = np.asarray(self.raw_contra_L, dtype=np.float64)
+        h_RR = np.asarray(self.raw_ipsi_R, dtype=np.float64)
 
         max_h_len = max(len(h_LL), len(h_RL), len(h_LR), len(h_RR))
         self.N = 2 ** int(np.ceil(np.log2(self.block_size + max_h_len - 1)))
@@ -1019,28 +1020,25 @@ class AudioEngine(QObject):
         self.h_LR_fft_raw = np.fft.rfft(h_LR, n=self.N)
         self.h_RR_fft_raw = np.fft.rfft(h_RR, n=self.N)
 
-        if self.tonal_match_enabled and self.tonal_filter is not None:
-            h_LL = _fast_fftconvolve(h_LL, self.tonal_filter)
-            h_RL = _fast_fftconvolve(h_RL, self.tonal_filter)
-            h_LR = _fast_fftconvolve(h_LR, self.tonal_filter)
-            h_RR = _fast_fftconvolve(h_RR, self.tonal_filter)
+        f = np.fft.rfftfreq(self.N, 1.0 / self.fs)
 
-        self.h_LL_fft_norm = np.fft.rfft(h_LL, n=self.N)
-        self.h_RL_fft_norm = np.fft.rfft(h_RL, n=self.N)
-        self.h_LR_fft_norm = np.fft.rfft(h_LR, n=self.N)
-        self.h_RR_fft_norm = np.fft.rfft(h_RR, n=self.N)
+        # Zero-phase tonal magnitude equalization (preserves exact SOFA ITD & inter-ear phase)
+        if self.tonal_match_enabled and self.correction_f is not None and self.correction_db is not None:
+            corr_interp_db = np.interp(f, self.correction_f, self.correction_db)
+            eq_mag = 10.0 ** (corr_interp_db / 20.0)
+        else:
+            eq_mag = 1.0
+
+        self.h_LL_fft_norm = self.h_LL_fft_raw * eq_mag
+        self.h_RL_fft_norm = self.h_RL_fft_raw * eq_mag
+        self.h_LR_fft_norm = self.h_LR_fft_raw * eq_mag
+        self.h_RR_fft_norm = self.h_RR_fft_raw * eq_mag
 
         mag_LL = np.abs(self.h_LL_fft_norm) + 1e-12
         mag_RL = np.abs(self.h_RL_fft_norm) + 1e-12
         mag_LR = np.abs(self.h_LR_fft_norm) + 1e-12
         mag_RR = np.abs(self.h_RR_fft_norm) + 1e-12
-        
-        phase_LL = np.angle(self.h_LL_fft_norm)
-        phase_RL = np.angle(self.h_RL_fft_norm)
-        phase_LR = np.angle(self.h_LR_fft_norm)
-        phase_RR = np.angle(self.h_RR_fft_norm)
 
-        f = np.fft.rfftfreq(self.N, 1.0 / self.fs)
         # Anchor spatial ILD & crossfeed ratios at 10-13 kHz (before SOFA HF roll-off)
         anchor_band = (f >= 10000.0) & (f <= 13000.0)
         if np.any(anchor_band):
@@ -1052,11 +1050,17 @@ class AudioEngine(QObject):
             ipsi_ref_L = ipsi_ref_R = 1.0
             xf_ratio_RL = xf_ratio_LR = 0.25
 
-        # Synthesize full-bandwidth HRIR extension with locked spatial ILD, crossfeed, and ITD phase
-        h_LL_ext = ipsi_ref_L * np.exp(1j * phase_LL)
-        h_RR_ext = ipsi_ref_R * np.exp(1j * phase_RR)
-        h_RL_ext = (ipsi_ref_L * xf_ratio_RL) * np.exp(1j * phase_RL)
-        h_LR_ext = (ipsi_ref_R * xf_ratio_LR) * np.exp(1j * phase_LR)
+        # Phase-coherent HF extension locked to each HRIR's true onset delay (zero 14 kHz phase jump)
+        def _true_delay_samples(ir):
+            pk = float(np.max(np.abs(ir)))
+            idx = np.where(np.abs(ir) >= 0.25 * pk)[0]
+            return float(idx[0]) if len(idx) > 0 else float(np.argmax(np.abs(ir)))
+
+        w = 2.0 * np.pi * f / float(self.fs)
+        h_LL_ext = ipsi_ref_L * np.exp(-1j * w * _true_delay_samples(h_LL))
+        h_RR_ext = ipsi_ref_R * np.exp(-1j * w * _true_delay_samples(h_RR))
+        h_RL_ext = (ipsi_ref_L * xf_ratio_RL) * np.exp(-1j * w * _true_delay_samples(h_RL))
+        h_LR_ext = (ipsi_ref_R * xf_ratio_LR) * np.exp(-1j * w * _true_delay_samples(h_LR))
 
         hf_mask = 0.5 * (1.0 + np.tanh((f - 14000.0) / 1500.0))
         lf_mask = 1.0 - hf_mask
@@ -1306,6 +1310,7 @@ class AudioEngine(QObject):
              if self.auto_trim_gain < 0.9999:
                  np.multiply(out_slice, self.auto_trim_gain, out=out_slice)
              np.clip(out_slice, -1.0, 1.0, out=out_slice)
+         self.latest_stereo_out = out_slice[:min(frames, 1024)].copy()
          np.copyto(outdata, out_slice)
          out_L = out_slice[:, 0]
          hrir_L = viz_slice
@@ -1382,6 +1387,112 @@ def reset_macos_window_opaque(window):
         print(f"Failed to reset window opacity: {e}")
 
 from PySide6.QtWidgets import QDialog, QGridLayout, QFrame
+
+class StereoAnalyzerWidget(QWidget):
+    def __init__(self, mw, parent=None):
+        super().__init__(parent)
+        self.mw = mw
+        self.setMinimumWidth(190)
+        self.setMaximumWidth(230)
+        self._corr = 1.0
+        self._pts = None
+
+    def update_from_stereo(self, stereo):
+        if stereo is None or len(stereo) < 16 or stereo.shape[1] < 2:
+            return
+        L = stereo[:, 0]
+        R = stereo[:, 1]
+        denom = float(np.sqrt(np.sum(L * L) * np.sum(R * R)))
+        if denom > 1e-9:
+            c = float(np.sum(L * R) / denom)
+            self._corr = 0.75 * self._corr + 0.25 * max(-1.0, min(1.0, c))
+        step = max(1, len(L) // 256)
+        ls, rs = L[::step], R[::step]
+        mid = (ls + rs) * 0.7071
+        side = (rs - ls) * 0.7071
+        self._pts = (side, mid)
+        self.update()
+
+    def paintEvent(self, event):
+        from PySide6.QtGui import QPen, QFont, QPolygonF
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        w, h = float(self.width()), float(self.height())
+        is_light = getattr(self.mw, "current_theme", "classic") == "light"
+
+        fg = QColor("#161618" if is_light else "#f2f4f8")
+        sub = QColor(0, 0, 0, 45) if is_light else QColor(255, 255, 255, 42)
+        accent = QColor(getattr(self.mw, "current_accent", "#0a84ff"))
+
+        p.setPen(fg)
+        p.setFont(QFont(".AppleSystemUIFont", 11, QFont.Bold))
+        p.drawText(8, 16, "Stereo & Phase")
+
+        bar_h = 26.0
+        scope_top = 22.0
+        scope_h = max(60.0, h - scope_top - bar_h - 8.0)
+        cx = w * 0.5
+        cy = scope_top + scope_h * 0.5
+        rad = min(w * 0.42, scope_h * 0.46)
+
+        p.setPen(QPen(sub, 1.0))
+        p.drawEllipse(QPointF(cx, cy), rad, rad)
+        p.drawEllipse(QPointF(cx, cy), rad * 0.5, rad * 0.5)
+        d = rad * 0.7071
+        p.drawLine(QPointF(cx - d, cy - d), QPointF(cx + d, cy + d))
+        p.drawLine(QPointF(cx + d, cy - d), QPointF(cx - d, cy + d))
+
+        p.setFont(QFont(".AppleSystemUIFont", 9, QFont.Bold))
+        p.setPen(QColor("#52525b" if is_light else "#9ca3af"))
+        p.drawText(int(cx - rad - 4), int(cy - rad + 8), "L")
+        p.drawText(int(cx + rad - 4), int(cy - rad + 8), "R")
+        p.drawText(int(cx - 4), int(cy - rad - 2), "+M")
+
+        if self._pts is not None:
+            side, mid = self._pts
+            peak = max(0.05, float(np.max(np.abs(mid))), float(np.max(np.abs(side))))
+            scale = (rad * 0.92) / peak
+            poly = QPolygonF()
+            for sx, my in zip(side, mid):
+                px = max(cx - rad, min(cx + rad, cx + float(sx) * scale))
+                py = max(cy - rad, min(cy + rad, cy - float(my) * scale))
+                poly.append(QPointF(px, py))
+            wave_c = QColor(accent)
+            wave_c.setAlpha(210)
+            p.setPen(QPen(wave_c, 1.5))
+            p.drawPolyline(poly)
+
+        by = h - bar_h
+        bx, bw, bh = 10.0, w - 20.0, 7.0
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(0, 0, 0, 26) if is_light else QColor(255, 255, 255, 28))
+        p.drawRoundedRect(int(bx), int(by), int(bw), int(bh), 3.5, 3.5)
+
+        mid_x = bx + bw * 0.5
+        p.setPen(QPen(sub, 1.0))
+        p.drawLine(int(mid_x), int(by - 2), int(mid_x), int(by + bh + 2))
+
+        c_val = self._corr
+        if c_val >= 0.25:
+            bar_c = QColor("#30d158")
+        elif c_val >= 0.0:
+            bar_c = QColor("#ff9f0a")
+        else:
+            bar_c = QColor("#ff3b30")
+        p.setPen(Qt.NoPen)
+        p.setBrush(bar_c)
+        fill_w = abs(c_val) * (bw * 0.5)
+        fill_x = mid_x if c_val >= 0 else (mid_x - fill_w)
+        p.drawRoundedRect(int(fill_x), int(by), max(3, int(fill_w)), int(bh), 3.0, 3.0)
+
+        p.setPen(fg)
+        p.setFont(QFont(".AppleSystemUIFont", 10, QFont.Bold))
+        p.drawText(int(bx), int(by + bh + 12), "-1")
+        p.drawText(int(mid_x - 4), int(by + bh + 12), "0")
+        p.drawText(int(bx + bw - 14), int(by + bh + 12), "+1")
+        p.setPen(bar_c)
+        p.drawText(int(bx + bw - 48), int(by - 4), f"{c_val:+.2f}")
+        p.end()
 
 class PeakSchemeWidget(QWidget):
     def __init__(self, mw, parent=None):
@@ -2344,7 +2455,13 @@ class MainWindow(QMainWindow):
         self.curve_corr.setDownsampling(auto=True, method='subsample')
         self.curve_corr.setClipToView(True)
         
-        spec_layout.addWidget(self.plot_widget, stretch=1)
+        spec_row = QHBoxLayout()
+        spec_row.setContentsMargins(0, 0, 0, 0)
+        spec_row.setSpacing(10)
+        spec_row.addWidget(self.plot_widget, 1)
+        self.stereo_analyzer = StereoAnalyzerWidget(self)
+        spec_row.addWidget(self.stereo_analyzer)
+        spec_layout.addLayout(spec_row, stretch=1)
         right_layout.addWidget(spec_card, stretch=1)
 
         # DSP Sliders (Collapsible)
@@ -3076,6 +3193,8 @@ class MainWindow(QMainWindow):
         try:
             if not self.engine.is_playing or (self.engine.audio_data is None and self.engine.input_device is None and not self.engine.use_mac_tap):
                 return
+            if getattr(self.engine, 'latest_stereo_out', None) is not None and hasattr(self, 'stereo_analyzer'):
+                self.stereo_analyzer.update_from_stereo(self.engine.latest_stereo_out)
                 
             # Use welch for much smoother, professional-looking graph
             sr_mult = max(1, int(round(float(self.engine.fs) / 48000.0)))
@@ -3605,7 +3724,7 @@ class MainWindow(QMainWindow):
                 "dsp_panel_open": self.btn_toggle_dsp_panel.isChecked(),
                 "theme": getattr(self, "current_theme", "classic"),
                 "ambient_opacity": getattr(self, "ambient_opacity", 0.30),
-                "theme_glow": getattr(self, "theme_glow", {"classic": 0.30, "light": 0.30, "liquid_glass": 1.00}),
+                "theme_glow": getattr(self, "theme_glow", {"classic": 0.20, "light": 0.30, "liquid_glass": 1.00}),
                 "glass_clarity": getattr(self, "glass_clarity", 45),
                 "glass_rim": getattr(self, "glass_rim", 20),
                 "low_end_mode": self.engine.low_end_mode,
