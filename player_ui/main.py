@@ -52,23 +52,17 @@ def _fast_welch(x, fs, nperseg):
     nperseg = min(int(nperseg), len(x))
     if nperseg < 16:
         return np.fft.rfftfreq(16, 1.0 / fs), np.zeros(9)
-    step = max(1, nperseg // 2)
+    step = max(1, nperseg // 4)  # 75% overlap for higher temporal & spectral resolution
     win = np.hanning(nperseg)
     scale = 1.0 / (fs * np.sum(win * win))
-    n_segs = max(1, (len(x) - nperseg) // step + 1)
-    acc = np.zeros(nperseg // 2 + 1, dtype=np.float64)
-    for idx in range(n_segs):
-        seg = x[idx * step : idx * step + nperseg]
-        if len(seg) < nperseg:
-            break
-        seg = (seg - np.mean(seg)) * win
-        acc += np.abs(np.fft.rfft(seg)) ** 2
-    acc = (acc / n_segs) * scale
-    if len(acc) > 2:
-        acc[1:-1] *= 2.0
-    elif len(acc) == 2:
-        acc *= 2.0
-    return np.fft.rfftfreq(nperseg, 1.0 / fs), acc
+    frames = np.lib.stride_tricks.sliding_window_view(x, nperseg)[::step]
+    frames = (frames - np.mean(frames, axis=1, keepdims=True)) * win
+    psd = np.mean(np.abs(np.fft.rfft(frames, axis=1)) ** 2, axis=0) * scale
+    if len(psd) > 2:
+        psd[1:-1] *= 2.0
+    elif len(psd) == 2:
+        psd *= 2.0
+    return np.fft.rfftfreq(nperseg, 1.0 / fs), psd
 
 def _fast_uniform_filter1d(arr, size):
     if size <= 1 or len(arr) == 0:
@@ -757,6 +751,9 @@ class AudioEngine(QObject):
         self.zi_treble_R = np.zeros((1, 2))
         self.cb_out_buf = np.zeros((self.block_size, 2), dtype=np.float32)
         self.cb_viz_buf = np.zeros(self.block_size, dtype=np.float32)
+        self.cb_stereo_buf = np.zeros((self.block_size, 2), dtype=np.float32)
+        self.cb_ramp_buf = np.ones((self.block_size, 1), dtype=np.float32)
+        self._unit_ramp = np.linspace(0.0, 1.0, self.block_size, dtype=np.float32)
         self.rust_dsp = None
         self.last_dsp_ms = 0.0
         self.dsp_hist = np.zeros(4096, dtype=np.float32)
@@ -1078,6 +1075,21 @@ class AudioEngine(QObject):
             self.h_LR_fft = self.h_LR_fft_norm
             self.h_RR_fft = self.h_RR_fft_norm
 
+        # Enforce linear overlap-add constraint (IR length <= N - block_size) so frequency-domain EQ/HF extension never wraps around
+        max_ir = max(64, self.N - self.block_size)
+        fade = np.linspace(1.0, 0.0, 64, dtype=np.float64)
+        def _clamp_ir_fft(H_fft):
+            ir = np.fft.irfft(H_fft, n=self.N)[:max_ir].copy()
+            ir[-64:] *= fade
+            return np.fft.rfft(ir, n=self.N)
+
+        self.h_LL_fft = _clamp_ir_fft(self.h_LL_fft)
+        self.h_RL_fft = _clamp_ir_fft(self.h_RL_fft)
+        self.h_LR_fft = _clamp_ir_fft(self.h_LR_fft)
+        self.h_RR_fft = _clamp_ir_fft(self.h_RR_fft)
+        self.h_LL_fft_raw = _clamp_ir_fft(self.h_LL_fft_raw)
+        self.h_RL_fft_raw = _clamp_ir_fft(self.h_RL_fft_raw)
+
         self.overlap_L = np.zeros(self.N)
         self.overlap_R = np.zeros(self.N)
         self.L_pad = np.zeros(self.N)
@@ -1161,6 +1173,7 @@ class AudioEngine(QObject):
                     latency='low',
                 )
                 self.input_stream.start()
+            import gc; gc.disable()
             self.stream.start()
             if sys.platform == "darwin":
                 if self.selected_device is not None:
@@ -1233,6 +1246,7 @@ class AudioEngine(QObject):
         if self.rust_dsp is not None:
             self.rust_dsp.reset()
         self.is_playing = False
+        import gc; gc.enable(); gc.collect()
 
     def seek(self, frame):
         self.current_frame = max(0, min(frame, len(self.audio_data) - 1))
@@ -1247,7 +1261,7 @@ class AudioEngine(QObject):
         if self.rust_dsp is not None:
             self.rust_dsp.reset()
 
-    def _audio_callback(self, outdata, frames, time, status):
+    def _audio_callback(self, outdata, frames, time_info, status):
         if not self.is_playing or (self.audio_data is None and self.input_device is None and not self.use_mac_tap):
             outdata.fill(0)
             return
@@ -1291,10 +1305,9 @@ class AudioEngine(QObject):
         if self.rust_dsp is not None and frames <= self.block_size:
          out_slice = self.cb_out_buf[:frames]
          viz_slice = self.cb_viz_buf[:frames]
-         import time as _time
-         t0 = _time.perf_counter()
+         t0 = time.perf_counter()
          self.rust_dsp.process(in_block, out_slice, viz_slice)
-         self.last_dsp_ms = (_time.perf_counter() - t0) * 1000.0
+         self.last_dsp_ms = (time.perf_counter() - t0) * 1000.0
          self.dsp_hist[self.dsp_hist_idx] = self.last_dsp_ms
          self.dsp_hist_idx = (self.dsp_hist_idx + 1) & 4095
          if self.dsp_hist_count < 4096:
@@ -1302,15 +1315,24 @@ class AudioEngine(QObject):
 
          if not self.float_mode and not self.bit_perfect:
              ceiling = 0.94406  # -0.5 dBFS headroom ceiling
+             prev_trim = self.auto_trim_gain
              pk = float(np.max(np.abs(out_slice)))
-             if pk * self.auto_trim_gain > ceiling:
+             if pk * prev_trim > ceiling:
                  self.auto_trim_gain = ceiling / max(pk, 1e-9)
-             elif self.auto_trim_gain < 1.0:
-                 self.auto_trim_gain = min(1.0, self.auto_trim_gain * 1.015)
-             if self.auto_trim_gain < 0.9999:
-                 np.multiply(out_slice, self.auto_trim_gain, out=out_slice)
+             elif prev_trim < 1.0:
+                 self.auto_trim_gain = min(1.0, prev_trim * 1.015)
+             if prev_trim < 0.9999 or self.auto_trim_gain < 0.9999:
+                 if abs(self.auto_trim_gain - prev_trim) > 1e-5:
+                     ramp = self.cb_ramp_buf[:frames, 0]
+                     np.multiply(self._unit_ramp[:frames], float(self.auto_trim_gain - prev_trim), out=ramp)
+                     np.add(ramp, float(prev_trim), out=ramp)
+                     np.multiply(out_slice, self.cb_ramp_buf[:frames], out=out_slice)
+                 else:
+                     np.multiply(out_slice, self.auto_trim_gain, out=out_slice)
              np.clip(out_slice, -1.0, 1.0, out=out_slice)
-         self.latest_stereo_out = out_slice[:min(frames, 1024)].copy()
+         st_dst = self.cb_stereo_buf[:frames]
+         np.copyto(st_dst, out_slice)
+         self.latest_stereo_out = st_dst
          np.copyto(outdata, out_slice)
          out_L = out_slice[:, 0]
          hrir_L = viz_slice
@@ -1343,7 +1365,7 @@ class AudioEngine(QObject):
             new_h = f - wrap
 
         self.viz_head = new_h
-        self.viz_state = (new_h, f, __import__('time').perf_counter())
+        self.viz_state = (new_h, f, time.perf_counter())
 
 
 
@@ -1670,6 +1692,10 @@ class SettingsDialog(QDialog):
         self.chk_low_cpu.toggled.connect(mw.toggle_cpu_mode)
         p_lay.addWidget(self.chk_low_cpu)
 
+        self.chk_spec_fill = QCheckBox("Spectrum Gradient Fill (Disable for max Full-Screen FPS)")
+        self.chk_spec_fill.toggled.connect(mw.toggle_spectrum_fill)
+        p_lay.addWidget(self.chk_spec_fill)
+
         note = QLabel("Layout presets & Last.fm / ListenBrainz scrobbling coming soon.")
         note.setWordWrap(True)
         note.setStyleSheet("opacity: 0.7; font-size: 12px;")
@@ -1694,6 +1720,9 @@ class SettingsDialog(QDialog):
         self.chk_low_cpu.blockSignals(True)
         self.chk_low_cpu.setChecked(self.mw.engine.low_end_mode)
         self.chk_low_cpu.blockSignals(False)
+        self.chk_spec_fill.blockSignals(True)
+        self.chk_spec_fill.setChecked(getattr(self.mw, 'spectrum_fill_enabled', True))
+        self.chk_spec_fill.blockSignals(False)
         is_g = self.mw.current_theme == "liquid_glass"
         self.s_glow.default_value = 100 if is_g else (20 if self.mw.current_theme == "classic" else 30)
         self.lbl_trans.setEnabled(is_g)
@@ -1747,7 +1776,7 @@ class MainWindow(QMainWindow):
 
         self.setMinimumSize(1100, 820)
         
-        pg.setConfigOptions(antialias=False, enableExperimental=False)
+        pg.setConfigOptions(antialias=False, useOpenGL=False, enableExperimental=False)
         
         self.glass_frost = 50
         self.setStyleSheet(build_liquid_qss())
@@ -1800,13 +1829,14 @@ class MainWindow(QMainWindow):
         self.scanner_thread = None
         self.last_sys_default = None
         
-        self.current_theme = "classic"
+        self.current_theme = "liquid_glass"
         self.glass_effect_id = None
         self.current_accent, self.current_accent_end = "#0a84ff", "#64d2ff"
         self.theme_glow = {"classic": 0.20, "light": 0.30, "liquid_glass": 1.00}
-        self.ambient_opacity = self.theme_glow["classic"]
+        self.ambient_opacity = self.theme_glow["liquid_glass"]
         self.glass_clarity = 45
         self.glass_rim = 20
+        self.spectrum_fill_enabled = True
         pg.setConfigOption("foreground", "#eef2f8")
         self.init_ui()
         
@@ -2116,6 +2146,15 @@ class MainWindow(QMainWindow):
                 return
         self.save_session_state()
 
+    def toggle_spectrum_fill(self, checked):
+        self.spectrum_fill_enabled = bool(checked)
+        lvl = -120 if self.spectrum_fill_enabled else None
+        if hasattr(self, "curve_in"):
+            self.curve_in.setFillLevel(lvl)
+            self.curve_out.setFillLevel(lvl)
+        if hasattr(self, "save_session_state"):
+            self.save_session_state()
+
     def toggle_cpu_mode(self, checked):
         low = bool(checked)
         self.engine.low_end_mode = low
@@ -2398,6 +2437,12 @@ class MainWindow(QMainWindow):
         self.combo_smooth.setFixedWidth(120) 
         self.combo_smooth.currentIndexChanged.connect(self.change_smoothing)
         peak_layout.addWidget(self.combo_smooth)
+
+        self.btn_stereo_scope = QPushButton("Stereo: Off")
+        self.btn_stereo_scope.setCheckable(True)
+        self.btn_stereo_scope.setChecked(False)
+        self.btn_stereo_scope.clicked.connect(self.toggle_stereo_scope)
+        peak_layout.addWidget(self.btn_stereo_scope)
         
         peak_layout.addStretch()
         self.lbl_peak = QLabel("Peak: -inf dB")
@@ -2460,6 +2505,7 @@ class MainWindow(QMainWindow):
         spec_row.setSpacing(10)
         spec_row.addWidget(self.plot_widget, 1)
         self.stereo_analyzer = StereoAnalyzerWidget(self)
+        self.stereo_analyzer.setVisible(False)
         spec_row.addWidget(self.stereo_analyzer)
         spec_layout.addLayout(spec_row, stretch=1)
         right_layout.addWidget(spec_card, stretch=1)
@@ -3004,6 +3050,8 @@ class MainWindow(QMainWindow):
             self.btn_float_mode._scheme.update()
 
     def toggle_bypass(self, state):
+        if not state and self.engine.rust_dsp is not None:
+            self.engine.rust_dsp.reset()
         self.engine.dsp_bypass = bool(state)
         self.btn_bypass.setText("DSP Active" if not state else "DSP Bypassed")
         
@@ -3193,8 +3241,12 @@ class MainWindow(QMainWindow):
         try:
             if not self.engine.is_playing or (self.engine.audio_data is None and self.engine.input_device is None and not self.engine.use_mac_tap):
                 return
-            if getattr(self.engine, 'latest_stereo_out', None) is not None and hasattr(self, 'stereo_analyzer'):
-                self.stereo_analyzer.update_from_stereo(self.engine.latest_stereo_out)
+            if getattr(self.engine, 'latest_stereo_out', None) is not None and hasattr(self, 'stereo_analyzer') and self.stereo_analyzer.isVisible():
+                st_buf = self.engine.latest_stereo_out
+                _, lf_st, wt_st = self.engine.viz_state
+                fr_st = min(1.0, max(0.0, (time.perf_counter() - wt_st) / max(1e-4, lf_st / float(self.engine.fs))))
+                end_st = max(512, min(len(st_buf), int(512 + fr_st * (len(st_buf) - 512))))
+                self.stereo_analyzer.update_from_stereo(st_buf[max(0, end_st - 1024):end_st])
                 
             # Use welch for much smoother, professional-looking graph
             sr_mult = max(1, int(round(float(self.engine.fs) / 48000.0)))
@@ -3207,9 +3259,8 @@ class MainWindow(QMainWindow):
             frac = min(1.0, max(0.0, (now - write_time) / block_dur))
 
             if not hasattr(self, 'chunk_in_buf') or len(self.chunk_in_buf) != n_fft:
-                self.chunk_in_buf = np.zeros(n_fft)
-                self.chunk_hrir_buf = np.zeros(n_fft)
-                self.chunk_out_buf = np.zeros(n_fft)
+                self.chunk_in_buf = np.zeros(n_fft, dtype=np.float32)
+                self.chunk_out_buf = np.zeros(n_fft, dtype=np.float32)
 
             lag = int((1.0 - frac) * last_frames)
             h_audio = (head - lag) % b
@@ -3366,6 +3417,13 @@ class MainWindow(QMainWindow):
         self.viz_timer.stop()
         self.smoothed_in = None
         self._set_dev_status("Stopped — Select your DAC directly instead of System Default for native sample-rate switching.", None)
+
+    def toggle_stereo_scope(self, checked):
+        visible = bool(checked)
+        self.stereo_analyzer.setVisible(visible)
+        self.btn_stereo_scope.setText("Stereo: On" if visible else "Stereo: Off")
+        if hasattr(self, "save_session_state"):
+            self.save_session_state()
 
     def toggle_dsp_panel(self, checked):
         visible = bool(checked)
@@ -3722,12 +3780,14 @@ class MainWindow(QMainWindow):
                 "volume": getattr(self, "_pre_bp_vol", getattr(self, "_pre_live_vol", int(round(self.engine.volume * 100)))) if (self.engine.bit_perfect or self._bp_ramp_timer.isActive() or self.engine.use_mac_tap) else int(round(self.engine.volume * 100)),
                 "shuffle": self.shuffle_enabled,
                 "dsp_panel_open": self.btn_toggle_dsp_panel.isChecked(),
-                "theme": getattr(self, "current_theme", "classic"),
+                "stereo_scope_open": self.btn_stereo_scope.isChecked() if hasattr(self, "btn_stereo_scope") else False,
+                "theme": getattr(self, "current_theme", "liquid_glass"),
                 "ambient_opacity": getattr(self, "ambient_opacity", 0.30),
                 "theme_glow": getattr(self, "theme_glow", {"classic": 0.20, "light": 0.30, "liquid_glass": 1.00}),
                 "glass_clarity": getattr(self, "glass_clarity", 45),
                 "glass_rim": getattr(self, "glass_rim", 20),
                 "low_end_mode": self.engine.low_end_mode,
+                "spectrum_fill": getattr(self, "spectrum_fill_enabled", True),
                 "sofa_path": self.engine.sofa_path if (self.engine.sofa_path and os.path.exists(self.engine.sofa_path) and os.path.abspath(self.engine.sofa_path) != os.path.abspath(get_resource_path("default.sofa"))) else "",
             }
             with open(self._state_file_path(), "w", encoding="utf-8") as f:
@@ -3751,6 +3811,7 @@ class MainWindow(QMainWindow):
             self.btn_shuffle.setChecked(shuf)
             self.toggle_shuffle(shuf)
 
+            self.toggle_spectrum_fill(bool(state.get("spectrum_fill", True)))
             low = bool(state.get("low_end_mode", False))
             self.engine.low_end_mode = low
             if hasattr(self, "btn_cpu_mode"):
@@ -3760,7 +3821,7 @@ class MainWindow(QMainWindow):
                 self.btn_cpu_mode.blockSignals(False)
                 if low:
                     self.combo_fps.setCurrentIndex(0)
-            theme = state.get("theme", "classic")
+            theme = state.get("theme", "liquid_glass")
             saved_glow = state.get("theme_glow")
             if isinstance(saved_glow, dict):
                 self.theme_glow.update({k: float(v) for k, v in saved_glow.items() if k in self.theme_glow})
@@ -3781,6 +3842,10 @@ class MainWindow(QMainWindow):
             panel_open = bool(state.get("dsp_panel_open", False))
             self.btn_toggle_dsp_panel.setChecked(panel_open)
             self.toggle_dsp_panel(panel_open)
+            stereo_open = bool(state.get("stereo_scope_open", False))
+            if hasattr(self, "btn_stereo_scope"):
+                self.btn_stereo_scope.setChecked(stereo_open)
+                self.toggle_stereo_scope(stereo_open)
 
             sofa = state.get("sofa_path", "")
             if sofa and os.path.exists(sofa) and sofa != self.engine.sofa_path:
@@ -3858,12 +3923,17 @@ class MainWindow(QMainWindow):
 
     def update_cover_art_size(self):
         h = self.height()
+        w = self.width()
         panel_h = self.dsp_panel.sizeHint().height() if (hasattr(self, "dsp_panel") and self.dsp_panel.isVisible()) else 0
-        free_for_cover = (self.height() - panel_h - 590) * 0.65
-        size = max(110, min(230, int(free_for_cover)))
+        free_for_cover = (h - panel_h - 555) * 0.72
+        size = max(108, min(280, int(free_for_cover)))
         stepped_size = size
 
-        self.lbl_cover.setMinimumSize(110, 110)
+        if hasattr(self, "stereo_analyzer"):
+            sa_w = max(205, min(295, int(w * 0.185)))
+            self.stereo_analyzer.setFixedWidth(sa_w)
+
+        self.lbl_cover.setMinimumSize(100, 100)
         if self.lbl_cover.width() != stepped_size or self.lbl_cover.height() != stepped_size:
             self.lbl_cover.setFixedSize(stepped_size, stepped_size)
 
@@ -3926,7 +3996,7 @@ class MainWindow(QMainWindow):
     def changeEvent(self, event):
         if event.type() == QEvent.WindowStateChange:
             if hasattr(self, "lbl_cover"):
-                self.lbl_cover.setMinimumSize(110, 110)
+                self.lbl_cover.setMinimumSize(100, 100)
             if not self.isFullScreen():
                 for ms in (50, 350, 750):
                     QTimer.singleShot(ms, lambda: (apply_seamless_titlebar(self), self.setGeometry(self.screen().availableGeometry()) if getattr(getattr(self, '_drag_filter', None), '_was_zoomed', False) else None))
@@ -3936,6 +4006,7 @@ class MainWindow(QMainWindow):
         super().resizeEvent(event)
         if hasattr(self, "lbl_cover"):
             self.update_cover_art_size()
+
 
     def closeEvent(self, event):
         QApplication.instance().removeEventFilter(self)
@@ -3956,6 +4027,20 @@ if __name__ == "__main__":
     window._drag_filter = WindowDragFilter(window)
     app.installEventFilter(window._drag_filter)
     window.show()
+    if window.current_theme == "liquid_glass":
+        if glass and getattr(window, "glass_effect_id", None) is None:
+            window.glass_effect_id = glass.apply_glass_to_window(window)
+        apply_windows_glass(window, True, False)
+        c = window._current_ambient_color
+        window.setStyleSheet(build_liquid_qss(
+            c.red(), c.green(), c.blue(),
+            theme="liquid_glass",
+            ambient_opacity=window.ambient_opacity,
+            accent=window.current_accent,
+            accent_end=window.current_accent_end,
+            glass_clarity=window.glass_clarity,
+            glass_rim=window.glass_rim
+        ))
     apply_seamless_titlebar(window)
     window.raise_()
     window.activateWindow()
