@@ -1421,8 +1421,14 @@ class FloatSchemeButton(RightClickPushButton):
         super().__init__(text, parent)
         self.mw = mw
         self._popup = None
+        self._hover_timer = QTimer(self)
+        self._hover_timer.setSingleShot(True)
+        self._hover_timer.setInterval(700)
+        self._hover_timer.timeout.connect(self._show_popup)
 
-    def enterEvent(self, event):
+    def _show_popup(self):
+        if not self.underMouse():
+            return
         if self._popup is None:
             self._popup = QWidget(None, Qt.ToolTip | Qt.FramelessWindowHint)
             self._popup.setAttribute(Qt.WA_TranslucentBackground, True)
@@ -1435,9 +1441,13 @@ class FloatSchemeButton(RightClickPushButton):
         pos = self.mapToGlobal(self.rect().topLeft())
         self._popup.move(max(10, pos.x() - 140), max(10, pos.y() - 104))
         self._popup.show()
+
+    def enterEvent(self, event):
+        self._hover_timer.start()
         super().enterEvent(event)
 
     def leaveEvent(self, event):
+        self._hover_timer.stop()
         if self._popup is not None:
             self._popup.hide()
         super().leaveEvent(event)
