@@ -1348,6 +1348,100 @@ def reset_macos_window_opaque(window):
 
 from PySide6.QtWidgets import QDialog, QGridLayout, QFrame
 
+class PeakSchemeWidget(QWidget):
+    def __init__(self, mw, parent=None):
+        super().__init__(parent)
+        self.mw = mw
+        from PySide6.QtWidgets import QSizePolicy
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.setFixedHeight(96)
+
+    def paintEvent(self, event):
+        from PySide6.QtGui import QPen, QPainterPath, QFont
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        w, h = float(self.width()), float(self.height())
+        is_light = getattr(self.mw, "current_theme", "classic") == "light"
+        is_float = bool(self.mw.engine.float_mode)
+
+        # Background box
+        p.setPen(QPen(QColor(0, 0, 0, 25) if is_light else QColor(255, 255, 255, 32), 1))
+        p.setBrush(QColor(255, 255, 255, 246) if is_light else QColor(20, 23, 31, 244))
+        p.drawRoundedRect(1, 1, int(w - 2), int(h - 2), 10, 10)
+
+        mid_y = h * 0.78
+        ceil_y = h * 0.36  # 0.0 dBFS ceiling line
+
+        # 0 dBFS Ceiling Line
+        ceil_pen = QPen(QColor("#ff3b30"), 1.2, Qt.DashLine)
+        p.setPen(ceil_pen)
+        p.drawLine(int(12), int(ceil_y), int(w - 12), int(ceil_y))
+        p.setFont(QFont(".AppleSystemUIFont", 10, QFont.Bold))
+        p.drawText(int(w - 76), int(ceil_y - 4), "0 dBFS Limit")
+
+        # Draw transient peak wave (left = Hard Clip, right = 32-bit Float)
+        def draw_peak(cx, span_w, clamped, active, color_hex, title, sub):
+            path = QPainterPath()
+            steps = 60
+            peak_h = (mid_y - ceil_y) * 1.48  # Overshoots 0 dBFS by ~3.4 dB
+            for i in range(steps + 1):
+                t = (i / steps) * 2.0 - 1.0
+                x = cx + t * (span_w * 0.42)
+                env = max(0.0, np.cos(t * np.pi * 0.5)) ** 1.6
+                y = mid_y - env * peak_h
+                if clamped and y < ceil_y + 2:
+                    y = ceil_y + 2  # Soft/hard ceiling clamp at -0.5 dBFS
+                if i == 0:
+                    path.moveTo(x, y)
+                else:
+                    path.lineTo(x, y)
+
+            c = QColor(color_hex)
+            c.setAlpha(255 if active else 95)
+            p.setPen(QPen(c, 2.6 if active else 1.6))
+            p.setBrush(Qt.NoBrush)
+            p.drawPath(path)
+
+            txt_c = QColor("#161618" if is_light else "#f2f4f8")
+            txt_c.setAlpha(255 if active else 130)
+            p.setPen(txt_c)
+            p.setFont(QFont(".AppleSystemUIFont", 11, QFont.Bold if active else QFont.Normal))
+            p.drawText(int(cx - span_w * 0.46), int(h - 16), title)
+            p.setFont(QFont(".AppleSystemUIFont", 10))
+            p.drawText(int(cx - span_w * 0.46), int(15), sub)
+
+        draw_peak(w * 0.27, w * 0.46, True, not is_float, "#ff9500",
+                  "Hard Clip: Tight & DAC-Safe", "Clamped at -0.5 dBFS")
+        draw_peak(w * 0.74, w * 0.46, False, is_float, "#30d158",
+                  "32-bit Float: Open Breathing", "Unclamped > 0 dBFS")
+        p.end()
+
+class FloatSchemeButton(RightClickPushButton):
+    def __init__(self, text, mw, parent=None):
+        super().__init__(text, parent)
+        self.mw = mw
+        self._popup = None
+
+    def enterEvent(self, event):
+        if self._popup is None:
+            self._popup = QWidget(None, Qt.ToolTip | Qt.FramelessWindowHint)
+            self._popup.setAttribute(Qt.WA_TranslucentBackground, True)
+            lay = QVBoxLayout(self._popup)
+            lay.setContentsMargins(0, 0, 0, 0)
+            self._scheme = PeakSchemeWidget(self.mw)
+            self._scheme.setFixedSize(410, 96)
+            lay.addWidget(self._scheme)
+        self._scheme.update()
+        pos = self.mapToGlobal(self.rect().topLeft())
+        self._popup.move(max(10, pos.x() - 140), max(10, pos.y() - 104))
+        self._popup.show()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        if self._popup is not None:
+            self._popup.hide()
+        super().leaveEvent(event)
+
 class SettingsDialog(QDialog):
     def __init__(self, mw):
         super().__init__(mw)
@@ -1881,7 +1975,7 @@ class MainWindow(QMainWindow):
             is_cached = os.path.exists(self.engine._sofa_cache_path(default_path))
             if not is_cached:
                 self.lbl_sofa_file.setText("Caching HRTF (first launch)...")
-                self._set_dev_status("First launch: caching HRTF acoustic profile — subsequent startups will be instant.", None)
+                self._set_dev_status("First launch: caching HRTF acoustic profile — next startups will be instant.", None)
                 QApplication.processEvents()
             t_s = time.perf_counter()
             self.engine.load_sofa(default_path)
@@ -1996,7 +2090,8 @@ class MainWindow(QMainWindow):
 
         self.btn_settings = QPushButton("⚙")
         self.btn_settings.setToolTip("Appearance & App Settings")
-        self.btn_settings.setFixedWidth(40)
+        self.btn_settings.setFixedSize(42, 34)
+        self.btn_settings.setStyleSheet("font-size: 19px; padding: 0px 0px 1px 0px;")
         self.btn_settings.clicked.connect(self.open_settings)
         file_layout.addWidget(self.btn_settings)
         top_card_layout.addLayout(file_layout)
@@ -2112,7 +2207,7 @@ class MainWindow(QMainWindow):
         self.btn_highs.setChecked(True)
         self.btn_highs.clicked.connect(self.toggle_highs)
 
-        self.btn_float_mode = QPushButton("Hard Clip (Exact)")
+        self.btn_float_mode = FloatSchemeButton("Hard Clip (Exact)", self)
         self.btn_float_mode.setCheckable(True)
         self.btn_float_mode.setChecked(False)
         self.btn_float_mode.clicked.connect(self.toggle_float_mode)
@@ -2743,6 +2838,8 @@ class MainWindow(QMainWindow):
         else:
             self.btn_float_mode.setText("Hard Clip (Exact)")
         self.engine._sync_rust_params()
+        if getattr(self.btn_float_mode, "_popup", None) and self.btn_float_mode._popup.isVisible():
+            self.btn_float_mode._scheme.update()
 
     def toggle_bypass(self, state):
         self.engine.dsp_bypass = bool(state)
