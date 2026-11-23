@@ -231,20 +231,55 @@ def _high_shelf_sos(fc, gain_db, Q, fs):
     return np.array([[b0/a0, b1/a0, b2/a0, 1.0, a1/a0, a2/a0]])
 
 def _extract_cover_bytes(path):
+    # 1. Check embedded tags (FLAC, MP3/ID3, MP4/M4A, Ogg/Opus)
     try:
         mutagen, FLAC, ID3, MP3, MP4 = _get_mutagen()
         audio = mutagen.File(path)
-        if not audio:
-            return None
-        if isinstance(audio, FLAC) and audio.pictures:
-            return audio.pictures[0].data
-        if isinstance(audio, (MP3, MP4)) and audio.tags:
-            if isinstance(audio.tags, ID3):
-                for tag in audio.tags.values():
-                    if tag.FrameID == 'APIC':
-                        return tag.data
-            elif 'covr' in audio.tags:
-                return bytes(audio.tags['covr'][0])
+        if audio:
+            if isinstance(audio, FLAC) and audio.pictures:
+                return audio.pictures[0].data
+            if getattr(audio, "tags", None):
+                if isinstance(audio.tags, ID3) or hasattr(audio.tags, "getall"):
+                    for tag in audio.tags.values():
+                        if getattr(tag, "FrameID", "") in ("APIC", "PIC"):
+                            return tag.data
+                if "covr" in audio.tags:
+                    return bytes(audio.tags["covr"][0])
+                if "metadata_block_picture" in audio.tags:
+                    import base64
+                    from mutagen.flac import Picture
+                    pic = Picture(base64.b64decode(audio.tags["metadata_block_picture"][0]))
+                    return pic.data
+    except Exception:
+        pass
+
+    # 2. Fallback to external cover image in the track's folder (and parent folder for CD1/Disc1)
+    try:
+        folder = os.path.dirname(os.path.abspath(path))
+        search_dirs = [folder]
+        parent = os.path.dirname(folder)
+        if os.path.basename(folder).lower().startswith(("cd", "disc", "disk")) and parent != folder:
+            search_dirs.append(parent)
+
+        img_exts = (".jpg", ".jpeg", ".png", ".webp", ".bmp")
+        priority_names = ("cover", "folder", "front", "album", "albumart", "artwork", "scan")
+
+        for d in search_dirs:
+            if not os.path.isdir(d):
+                continue
+            entries = [e for e in os.listdir(d) if e.lower().endswith(img_exts) and not e.startswith(".")]
+            if not entries:
+                continue
+            for p_name in priority_names:
+                for e in entries:
+                    stem = os.path.splitext(e)[0].lower()
+                    if stem == p_name or stem.startswith(p_name):
+                        with open(os.path.join(d, e), "rb") as f:
+                            return f.read()
+            # Otherwise pick the largest image file in the album folder
+            entries.sort(key=lambda e: os.path.getsize(os.path.join(d, e)), reverse=True)
+            with open(os.path.join(d, entries[0]), "rb") as f:
+                return f.read()
     except Exception:
         pass
     return None
