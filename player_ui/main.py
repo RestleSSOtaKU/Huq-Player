@@ -142,12 +142,17 @@ if getattr(sys, 'frozen', False):
     sys.stderr = DummyWriter()
 
 def get_binary_path(bin_name):
+    exe_name = f"{bin_name}.exe" if sys.platform == "win32" else bin_name
     if getattr(sys, 'frozen', False):
         bundle_dir = getattr(sys, '_MEIPASS', os.path.dirname(sys.executable))
-        exe_name = f"{bin_name}.exe" if sys.platform == "win32" else bin_name
         bundled = os.path.join(bundle_dir, "bin", exe_name)
         if os.path.exists(bundled):
             return bundled
+    if sys.platform == "darwin":
+        for prefix in ("/opt/homebrew/bin", "/usr/local/bin"):
+            cand = os.path.join(prefix, exe_name)
+            if os.path.exists(cand):
+                return cand
     return bin_name
 
 def get_resource_path(filename):
@@ -618,6 +623,19 @@ class RustDspLogFilter(logging.Filter):
 
 logging.getLogger().addFilter(RustDspLogFilter())
 
+class _FastSofaData:
+    def __init__(self, time_arr, sampling_rate):
+        self.time = time_arr
+        self.sampling_rate = int(sampling_rate)
+
+class _FastSofaCoords:
+    def __init__(self, cart_xyz):
+        self.cart = np.asarray(cart_xyz, dtype=np.float64)
+
+    def find_nearest(self, q_xyz):
+        dots = self.cart @ np.asarray(q_xyz, dtype=np.float64)
+        return int(np.argmax(dots)), None
+
 class AudioEngine(QObject):
     playback_stopped = Signal()
     track_finished = Signal()
@@ -760,9 +778,27 @@ class AudioEngine(QObject):
         self._sync_rust_params()
 
         
+    def _sofa_cache_path(self, filepath):
+        import hashlib
+        st = os.stat(filepath)
+        key = f"{os.path.abspath(filepath)}:{st.st_size}:{int(st.st_mtime)}".encode("utf-8", errors="ignore")
+        h = hashlib.sha256(key).hexdigest()[:16]
+        cache_dir = os.path.join(os.path.expanduser("~"), ".hrtf_audio_player", "sofa_cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        return os.path.join(cache_dir, f"{h}.npz")
+
     def load_sofa(self, filepath):
         temp_copy = None
         try:
+            cache_file = self._sofa_cache_path(filepath)
+            if os.path.exists(cache_file):
+                npz = np.load(cache_file)
+                self.sofa_data = _FastSofaData(npz["time"], int(npz["fs"]))
+                self.sofa_coords = _FastSofaCoords(npz["cart"])
+                self.sofa_path = filepath
+                self._update_hrirs()
+                return
+
             read_path = filepath
             if sys.platform == "win32" and not filepath.isascii():
                 import shutil, tempfile, uuid
@@ -774,7 +810,19 @@ class AudioEngine(QObject):
                 shutil.copy2(filepath, temp_copy)
                 read_path = temp_copy
 
-            self.sofa_data, self.sofa_coords, _ = _get_pyfar().io.read_sofa(read_path)
+            s_data, s_coords, _ = _get_pyfar().io.read_sofa(read_path)
+            raw_cart = s_coords.cartesian() if callable(s_coords.cartesian) else s_coords.cartesian
+            cart = np.asarray(raw_cart, dtype=np.float64)
+            norms = np.linalg.norm(cart, axis=1, keepdims=True)
+            cart = cart / np.maximum(norms, 1e-12)
+            time_arr = np.asarray(s_data.time, dtype=np.float32)
+            sr_val = int(s_data.sampling_rate)
+            try:
+                np.savez(cache_file, time=time_arr, cart=cart, fs=np.array(sr_val, dtype=np.int64))
+            except Exception:
+                pass
+            self.sofa_data = _FastSofaData(time_arr, sr_val)
+            self.sofa_coords = _FastSofaCoords(cart)
             self.sofa_path = filepath
             self._update_hrirs()
         except Exception as e:
@@ -795,7 +843,11 @@ class AudioEngine(QObject):
             right_az = -self.azimuth
             
             def get_hrir(az, el):
-                q = _get_pyfar().Coordinates.from_spherical_elevation(np.deg2rad(az), np.deg2rad(el), 1.0)
+                if isinstance(self.sofa_coords, _FastSofaCoords):
+                    az_r, el_r = np.deg2rad(az), np.deg2rad(el)
+                    q = np.array([np.cos(el_r) * np.cos(az_r), np.cos(el_r) * np.sin(az_r), np.sin(el_r)])
+                else:
+                    q = _get_pyfar().Coordinates.from_spherical_elevation(np.deg2rad(az), np.deg2rad(el), 1.0)
                 idx, _ = self.sofa_coords.find_nearest(q)
                 idx = int(np.atleast_1d(idx).ravel()[0])
                 raw = self.sofa_data.time
@@ -810,7 +862,7 @@ class AudioEngine(QObject):
             
             sofa_fs = int(self.sofa_data.sampling_rate)
             if sofa_fs != int(self.fs):
-                if self.low_end_mode:
+                if True:
                     self.raw_ipsi_L = _fast_resample(self.raw_ipsi_L, sofa_fs, int(self.fs))
                     self.raw_contra_L = _fast_resample(self.raw_contra_L, sofa_fs, int(self.fs))
                     self.raw_contra_R = _fast_resample(self.raw_contra_R, sofa_fs, int(self.fs))
@@ -1477,7 +1529,7 @@ class MainWindow(QMainWindow):
         self.timer.timeout.connect(self.update_ui_seekbar)
 
         self.viz_timer = QTimer(self)
-        self.viz_timer.setInterval(16) 
+        self.viz_timer.setInterval(8) 
         self.viz_timer.timeout.connect(self.update_graph)
 
         self.debounce_timer = QTimer(self)
@@ -1511,7 +1563,7 @@ class MainWindow(QMainWindow):
         self.sys_device_timer = QTimer(self)
         self.sys_device_timer.setInterval(1000)
         self.sys_device_timer.timeout.connect(self.check_sys_default)
-        QTimer.singleShot(10, self._deferred_startup)
+        QTimer.singleShot(120, self._deferred_startup)
 
     def _on_glass_tuned(self, _=None):
         self.glass_clarity = self.slider_glass_clarity.value()
@@ -1803,10 +1855,10 @@ class MainWindow(QMainWindow):
                 samples.append((time.perf_counter() - tb) * 1000.0)
             dsp_ms = float(np.median(samples))
             self.engine.rust_dsp.reset()
-        if dsp_ms > 8.0 or startup_ms > 3500.0:
+        if dsp_ms > 8.0:
             reply = QMessageBox.question(
                 self, "Performance Check",
-                f"Slower hardware detected (startup {startup_ms/1000.0:.1f}s, DSP {dsp_ms:.1f}ms).\nEnable 'Low-End CPU' mode? (Real-time HRTF stays active; switch anytime in DSP Controls.)",
+                f"Slower CPU detected (DSP block time {dsp_ms:.1f} ms).\nEnable 'Low-End CPU' mode? (Real-time HRTF stays active; switch anytime in Settings.)",
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
             if reply == QMessageBox.Yes:
                 if hasattr(self, "btn_cpu_mode"): self.btn_cpu_mode.setChecked(True)
@@ -1818,7 +1870,7 @@ class MainWindow(QMainWindow):
         low = bool(checked)
         self.engine.low_end_mode = low
         if hasattr(self, "btn_cpu_mode"): self.btn_cpu_mode.setText("CPU: Low-End" if low else "CPU: Full Quality")
-        self.combo_fps.setCurrentIndex(0 if low else 2)
+        self.combo_fps.setCurrentIndex(0 if low else 3)
         if self.engine.sofa_data is not None:
             self.engine._update_hrirs()
         self.save_session_state()
@@ -1826,8 +1878,23 @@ class MainWindow(QMainWindow):
     def load_default_sofa(self):
         default_path = get_resource_path("default.sofa")
         if os.path.exists(default_path):
-            self.lbl_sofa_file.setText("default.sofa (Built-in)")
+            is_cached = os.path.exists(self.engine._sofa_cache_path(default_path))
+            if not is_cached:
+                self.lbl_sofa_file.setText("Caching HRTF (first launch)...")
+                self._set_dev_status("First launch: caching HRTF acoustic profile — subsequent startups will be instant.", None)
+                QApplication.processEvents()
+            t_s = time.perf_counter()
             self.engine.load_sofa(default_path)
+            dt_s = (time.perf_counter() - t_s) * 1000.0
+            try:
+                with open(os.path.join(os.path.expanduser("~"), ".hrtf_audio_player", "startup.log"), "a") as lf:
+                    lf.write(f"cached={is_cached} load_sofa_ms={dt_s:.1f}\n")
+            except Exception:
+                pass
+            self.lbl_sofa_file.setText("default.sofa (Built-in)")
+            if not is_cached:
+                self._set_dev_status(f"First launch complete ({dt_s/1000.0:.1f}s) — HRTF cached for instant future startups!", True)
+                QTimer.singleShot(5000, lambda: self._set_dev_status("Tip: Select your DAC directly instead of System Default for native sample-rate switching.", None))
         else:
             self.lbl_sofa_file.setText("No SOFA loaded")
 
@@ -1938,7 +2005,7 @@ class MainWindow(QMainWindow):
         dev_layout.addWidget(QLabel("Output Device:"))
         self.combo_device = DeviceComboBox()
         self.combo_device.refresh_callback = self._on_device_popup
-        self.refresh_devices(initial=True)
+        self.combo_device.addItem("System Default", None)
         self.combo_device.currentIndexChanged.connect(self.change_device)
         dev_layout.addWidget(self.combo_device, 1)
         
@@ -1947,7 +2014,8 @@ class MainWindow(QMainWindow):
         dev_layout.addWidget(self.lbl_sr)
         top_card_layout.addLayout(dev_layout)
 
-        self.lbl_dev_status = QLabel("Tip: Select your DAC directly instead of System Default for native sample-rate switching.")
+        _is_first = not os.path.exists(self.engine._sofa_cache_path(get_resource_path("default.sofa"))) if os.path.exists(get_resource_path("default.sofa")) else False
+        self.lbl_dev_status = QLabel("First launch: caching HRTF acoustic profile — subsequent startups will be instant." if _is_first else "Tip: Select your DAC directly instead of System Default for native sample-rate switching.")
         self.lbl_dev_status.setWordWrap(True)
         self.lbl_dev_status.setStyleSheet("color: #8e8e93; font-size: 11px; margin-bottom: 4px;")
         top_card_layout.addWidget(self.lbl_dev_status)
@@ -2064,7 +2132,7 @@ class MainWindow(QMainWindow):
         peak_layout.addWidget(QLabel("Graph FPS:"))
         self.combo_fps = QComboBox()
         self.combo_fps.addItems(["10 FPS", "30 FPS", "60 FPS", "120 FPS"])
-        self.combo_fps.setCurrentIndex(2) 
+        self.combo_fps.setCurrentIndex(3) 
         self.combo_fps.setFixedWidth(120) 
         self.combo_fps.currentIndexChanged.connect(self.change_fps)
         peak_layout.addWidget(self.combo_fps)
@@ -3217,6 +3285,7 @@ class MainWindow(QMainWindow):
                 item.setText(self._format_track_label(track))
 
     def _rebuild_playlist_widget(self, current_path=None):
+        self.list_widget.setUpdatesEnabled(False)
         self.list_widget.blockSignals(True)
         self.list_widget.clear()
         self.current_track_index = -1
@@ -3228,6 +3297,7 @@ class MainWindow(QMainWindow):
                 self.current_track_index = i
                 self.list_widget.setCurrentItem(item)
         self.list_widget.blockSignals(False)
+        self.list_widget.setUpdatesEnabled(True)
         if hasattr(self, "search_input"):
             self.filter_playlist(self.search_input.text())
 
@@ -3453,11 +3523,11 @@ class MainWindow(QMainWindow):
                 self.lbl_sofa_file.setText(os.path.basename(sofa))
                 self.engine.load_sofa(sofa)
 
-            saved_tracks = [t for t in state.get("tracks", []) if os.path.exists(t.get("path", ""))]
+            saved_tracks = [t for t in state.get("tracks", []) if t.get("path")]
             if not saved_tracks:
                 return
 
-            saved_custom = [t for t in state.get("custom_tracks", []) if os.path.exists(t.get("path", ""))]
+            saved_custom = [t for t in state.get("custom_tracks", []) if t.get("path")]
             group_mode = state.get("group_mode", 0)
             sort_dir = state.get("sort_dir", False)
             if hasattr(self, "combo_group") and isinstance(group_mode, int) and 0 <= group_mode < self.combo_group.count():
