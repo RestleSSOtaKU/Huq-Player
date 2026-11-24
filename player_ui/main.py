@@ -1410,6 +1410,123 @@ def reset_macos_window_opaque(window):
 
 from PySide6.QtWidgets import QDialog, QGridLayout, QFrame
 
+APP_VERSION = "0.5.1"
+GITHUB_RELEASES_API = "https://github.com"
+
+def _parse_ver(tag):
+    clean = str(tag or "").strip().lstrip("vV")
+    parts = []
+    for p in clean.split("."):
+        digits = "".join(c for c in p if c.isdigit())
+        parts.append(int(digits) if digits else 0)
+    while len(parts) < 3:
+        parts.append(0)
+    return tuple(parts[:3])
+
+class UpdateCheckThread(QThread):
+    result_ready = Signal(bool, str, str, str)  # has_update, latest_tag, asset_url, release_notes
+
+    def run(self):
+        import json, urllib.request
+        try:
+            req = urllib.request.Request(
+                GITHUB_RELEASES_API,
+                headers={"User-Agent": f"REXA-Player/{APP_VERSION}", "Accept": "application/vnd.github+json"}
+            )
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            tag = data.get("tag_name", "")
+            notes = (data.get("body") or "").strip()
+            assets = data.get("assets", [])
+            want_name = "REXA-macOS-AppleSilicon.dmg" if sys.platform == "darwin" else "REXA-Windows.zip"
+            dl_url = ""
+            for a in assets:
+                if a.get("name") == want_name:
+                    dl_url = a.get("browser_download_url", "")
+                    break
+            if not dl_url:
+                dl_url = data.get("html_url", "https://github.com")
+            has_upd = _parse_ver(tag) > _parse_ver(APP_VERSION)
+            self.result_ready.emit(has_upd, tag or f"v{APP_VERSION}", dl_url, notes)
+        except Exception as e:
+            self.result_ready.emit(False, f"Error: {e}", "", "")
+
+class UpdateInstallThread(QThread):
+    progress = Signal(int)
+    finished_install = Signal(bool, str)
+
+    def __init__(self, url, parent=None):
+        super().__init__(parent)
+        self.url = url
+
+    def run(self):
+        import urllib.request, tempfile, zipfile, shutil
+        try:
+            dl_dir = os.path.join(tempfile.gettempdir(), "rexa_update")
+            os.makedirs(dl_dir, exist_ok=True)
+            fname = os.path.basename(self.url.split("?")[0]) or ("REXA.dmg" if sys.platform == "darwin" else "REXA-Windows.zip")
+            dest = os.path.join(dl_dir, fname)
+
+            req = urllib.request.Request(self.url, headers={"User-Agent": f"REXA-Player/{APP_VERSION}"})
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                total = int(resp.headers.get("Content-Length") or 0)
+                read = 0
+                with open(dest, "wb") as f:
+                    while True:
+                        chunk = resp.read(65536)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        read += len(chunk)
+                        if total > 0:
+                            self.progress.emit(min(99, int(read * 100 / total)))
+
+            self.progress.emit(100)
+            if sys.platform == "darwin" and dest.endswith(".dmg"):
+                mnt = os.path.join(dl_dir, "mnt")
+                os.makedirs(mnt, exist_ok=True)
+                subprocess.run(["hdiutil", "detach", mnt, "-quiet"], check=False)
+                res = subprocess.run(["hdiutil", "attach", dest, "-nobrowse", "-quiet", "-mountpoint", mnt], capture_output=True)
+                new_app = os.path.join(mnt, "REXA.app")
+                target_app = ""
+                if getattr(sys, "frozen", False) and ".app/Contents/" in sys.executable:
+                    target_app = sys.executable.split(".app/Contents/") + ".app"
+                elif os.path.isdir("/Applications/REXA.app"):
+                    target_app = "/Applications/REXA.app"
+
+                if res.returncode == 0 and os.path.isdir(new_app) and target_app and os.access(os.path.dirname(target_app), os.W_OK):
+                    sh_script = os.path.join(dl_dir, "apply_update.sh")
+                    with open(sh_script, "w", encoding="utf-8") as sf:
+                        sf.write(f'#!/bin/sh\nsleep 1\nrm -rf "{target_app}"\nditto "{new_app}" "{target_app}"\nxattr -cr "{target_app}" 2>/dev/null || true\nhdiutil detach "{mnt}" -quiet\nopen -n "{target_app}"\n')
+                    os.chmod(sh_script, 0o755)
+                    subprocess.Popen(["/bin/sh", sh_script], start_new_session=True)
+                    self.finished_install.emit(True, "RESTART_NOW")
+                else:
+                    subprocess.run(["hdiutil", "detach", mnt, "-quiet"], check=False)
+                    subprocess.Popen(["open", dest])
+                    self.finished_install.emit(True, "Downloaded update image! Drag REXA.app to Applications to finish updating.")
+            elif sys.platform == "win32" and dest.endswith(".zip") and getattr(sys, "frozen", False):
+                ext_dir = os.path.join(dl_dir, "extracted")
+                if os.path.exists(ext_dir):
+                    shutil.rmtree(ext_dir, ignore_errors=True)
+                with zipfile.ZipFile(dest, "r") as zf:
+                    zf.extractall(ext_dir)
+                src_dir = ext_dir
+                sub = os.path.join(ext_dir, "REXA")
+                if os.path.isdir(sub):
+                    src_dir = sub
+                app_dir = os.path.dirname(os.path.abspath(sys.executable))
+                bat = os.path.join(dl_dir, "apply_update.bat")
+                with open(bat, "w", encoding="utf-8") as bf:
+                    bf.write(f'@echo off\ntimeout /t 2 /nobreak >nul\nxcopy /E /Y /I "{src_dir}\\*" "{app_dir}\\" >nul\nstart "" "{sys.executable}"\n')
+                subprocess.Popen(["cmd", "/c", bat], creationflags=0x08000000)
+                self.finished_install.emit(True, "RESTART_NOW")
+            else:
+                subprocess.Popen(["open" if sys.platform == "darwin" else "explorer", dl_dir])
+                self.finished_install.emit(True, f"Downloaded update to {dest}")
+        except Exception as e:
+            self.finished_install.emit(False, str(e))
+
 class StereoAnalyzerWidget(QWidget):
     def __init__(self, mw, parent=None):
         super().__init__(parent)
@@ -1696,6 +1813,15 @@ class SettingsDialog(QDialog):
         self.chk_spec_fill.toggled.connect(mw.toggle_spectrum_fill)
         p_lay.addWidget(self.chk_spec_fill)
 
+        upd_row = QHBoxLayout()
+        self.lbl_upd = QLabel(f"REXA v{APP_VERSION}")
+        self.lbl_upd.setStyleSheet("font-size: 11px; opacity: 0.78;")
+        self.btn_check_upd = QPushButton("Check for Updates")
+        self.btn_check_upd.clicked.connect(self._on_check_updates)
+        upd_row.addWidget(self.lbl_upd, 1)
+        upd_row.addWidget(self.btn_check_upd)
+        p_lay.addLayout(upd_row)
+
         note = QLabel("Layout presets & Last.fm / ListenBrainz scrobbling coming soon.")
         note.setWordWrap(True)
         note.setStyleSheet("opacity: 0.7; font-size: 12px;")
@@ -1707,6 +1833,46 @@ class SettingsDialog(QDialog):
     def showEvent(self, event):
         super().showEvent(event)
         self.sync_from_main()
+
+    def _on_check_updates(self):
+        self.btn_check_upd.setEnabled(False)
+        self.lbl_upd.setText("Checking GitHub Releases...")
+        self._chk_thr = UpdateCheckThread(self)
+        self._chk_thr.result_ready.connect(self._on_update_checked)
+        self._chk_thr.start()
+
+    def _on_update_checked(self, has_upd, tag, dl_url, notes):
+        self.btn_check_upd.setEnabled(True)
+        if tag.startswith("Error:"):
+            self.lbl_upd.setText(tag[:60])
+            return
+        if not has_upd:
+            self.lbl_upd.setText(f"Up to date (v{APP_VERSION})")
+            return
+        self.lbl_upd.setText(f"Update available: {tag}!")
+        reply = QMessageBox.question(
+            self, "Update Available",
+            f"A newer version of REXA ({tag}) is available (current: v{APP_VERSION}).\n\nDownload and install now?",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply == QMessageBox.Yes:
+            self.btn_check_upd.setEnabled(False)
+            self._dl_thr = UpdateInstallThread(dl_url, self)
+            self._dl_thr.progress.connect(lambda p: self.lbl_upd.setText(f"Downloading {tag}... {p}%"))
+            self._dl_thr.finished_install.connect(self._on_update_installed)
+            self._dl_thr.start()
+
+    def _on_update_installed(self, ok, msg):
+        self.btn_check_upd.setEnabled(True)
+        if not ok:
+            self.lbl_upd.setText("Update failed")
+            QMessageBox.warning(self, "Update Error", f"Failed to download update:\n{msg}")
+            return
+        if msg == "RESTART_NOW":
+            QApplication.quit()
+        else:
+            self.lbl_upd.setText("Update ready!")
+            QMessageBox.information(self, "Update Ready", msg)
 
     def sync_from_main(self):
         idx_map = {"classic": 0, "light": 1, "liquid_glass": 2}
