@@ -1408,10 +1408,41 @@ def reset_macos_window_opaque(window):
     except Exception as e:
         print(f"Failed to reset window opacity: {e}")
 
-from PySide6.QtWidgets import QDialog, QGridLayout, QFrame
+from PySide6.QtWidgets import QDialog, QGridLayout, QFrame, QProgressBar
 
-APP_VERSION = "0.5.1"
+APP_VERSION = "0.5.2"
+try:
+    from lfm_keys import LFM_API_KEY, LFM_API_SECRET
+except ImportError:
+    LFM_API_KEY = os.environ.get("LFM_API_KEY", "")
+    LFM_API_SECRET = os.environ.get("LFM_API_SECRET", "")
 GITHUB_RELEASES_API = "https://github.com"
+
+def _urlopen_resilient(req, timeout=8):
+    import urllib.request, urllib.error
+    ctx = _ssl_context()
+    for use_proxy in (True, False):
+        try:
+            if use_proxy:
+                return urllib.request.urlopen(req, timeout=timeout, context=ctx)
+            opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({}),
+                urllib.request.HTTPSHandler(context=ctx)
+            )
+            return opener.open(req, timeout=timeout)
+        except urllib.error.HTTPError:
+            raise
+        except Exception as err:
+            last_err = err
+    raise RuntimeError(f"{last_err} [{req.full_url}]")
+
+def _ssl_context():
+    import ssl
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        return ssl.create_default_context()
 
 def _parse_ver(tag):
     clean = str(tag or "").strip().lstrip("vV")
@@ -1423,6 +1454,95 @@ def _parse_ver(tag):
         parts.append(0)
     return tuple(parts[:3])
 
+class ScrobbleWorker(QThread):
+    status_msg = Signal(str)
+
+    def __init__(self, cfg, action, meta=None, parent=None):
+        super().__init__(parent)
+        self.cfg = dict(cfg or {})
+        self.action = action
+        self.meta = dict(meta or {})
+
+    @staticmethod
+    def _lfm_sig(params, secret):
+        import hashlib
+        raw = "".join(f"{k}{params[k]}" for k in sorted(params.keys())) + secret
+        return hashlib.md5(raw.encode("utf-8")).hexdigest()
+
+    def _call_lfm(self, params, secret, post=True):
+        import json, urllib.request, urllib.parse, urllib.error
+        p = {k: str(v) for k, v in params.items() if v is not None}
+        p["api_sig"] = self._lfm_sig(p, secret)
+        p["format"] = "json"
+        q = urllib.parse.urlencode(p)
+        hdrs = {"User-Agent": f"REXA-Player/{APP_VERSION}", "Content-Type": "application/x-www-form-urlencoded"}
+        api_base = "https://" + ".".join(("ws", "audioscrobbler", "com")) + "/2.0/"
+        req = urllib.request.Request(api_base, data=q.encode("utf-8"), headers=hdrs) if post else urllib.request.Request(f"{api_base}?{q}", headers={"User-Agent": hdrs["User-Agent"]})
+        try:
+            with _urlopen_resilient(req, timeout=8) as resp:
+                raw = resp.read().decode("utf-8", errors="replace").strip()
+        except urllib.error.HTTPError as he:
+            raw = he.read().decode("utf-8", errors="replace").strip()
+        if not raw.startswith("{"):
+            return {"error": -1, "message": f"HTTP non-JSON ({raw[:48]})"}
+        return json.loads(raw)
+
+    def run(self):
+        import webbrowser, urllib.parse
+        key = LFM_API_KEY.strip()
+        sec = LFM_API_SECRET.strip()
+        if self.action == "browser_auth":
+            if not key or not sec:
+                self.status_msg.emit("Enter Last.fm API Key & Secret first.")
+                return
+            try:
+                tok_res = self._call_lfm({"method": "auth.getToken", "api_key": key}, sec, post=False)
+                token = tok_res.get("token", "")
+                if not token:
+                    self.status_msg.emit(f"Last.fm error: {tok_res.get('message', 'No token')}")
+                    return
+                auth_url = urllib.parse.urlunparse(("https", "www.last.fm", "/api/auth/", "", f"api_key={key}&token={token}", ""))
+                webbrowser.open(auth_url)
+                self.status_msg.emit("Approve REXA in your browser...")
+                for _ in range(48):
+                    if self.isInterruptionRequested():
+                        return
+                    self.msleep(2500)
+                    sess_res = self._call_lfm({"method": "auth.getSession", "api_key": key, "token": token}, sec, post=False)
+                    sess = sess_res.get("session")
+                    if sess and sess.get("key"):
+                        self.status_msg.emit(f"LFM_OK:{sess.get('name', '')}:{sess['key']}")
+                        return
+                    if sess_res.get("error") not in (None, 14):
+                        self.status_msg.emit(f"Last.fm error: {sess_res.get('message', 'Auth failed')}")
+                        return
+                self.status_msg.emit("Browser approval timed out — click Connect again.")
+            except Exception as e:
+                self.status_msg.emit(f"Last.fm error: {e}")
+            return
+
+        sk = (self.cfg.get("lfm_sk") or "").strip()
+        artist = (self.meta.get("artist") or "").strip()
+        title = (self.meta.get("title") or "").strip()
+        if not (self.cfg.get("lfm_enabled") and key and sec and sk and artist and title) or artist == "Unknown Artist":
+            return
+        try:
+            params = {"method": "track.updateNowPlaying" if self.action == "now_playing" else "track.scrobble", "api_key": key, "sk": sk, "artist": artist, "track": title}
+            album = (self.meta.get("album") or "").strip()
+            dur = int(self.meta.get("duration") or 0)
+            if album: params["album"] = album
+            if dur > 0: params["duration"] = str(dur)
+            if self.action == "scrobble": params["timestamp"] = str(int(self.meta.get("timestamp") or time.time()))
+            res = self._call_lfm(params, sec, post=True)
+            if "error" in res:
+                self.status_msg.emit(f"Last.fm error {res.get('error')}: {res.get('message', '')}")
+            elif self.action == "scrobble":
+                self.status_msg.emit(f"Scrobbled ✓ {artist} — {title}")
+            elif self.action == "now_playing":
+                self.status_msg.emit(f"Now Playing ♪ {artist} — {title}")
+        except Exception as e:
+            self.status_msg.emit(f"Scrobble error: {e}")
+
 class UpdateCheckThread(QThread):
     result_ready = Signal(bool, str, str, str)  # has_update, latest_tag, asset_url, release_notes
 
@@ -1433,7 +1553,7 @@ class UpdateCheckThread(QThread):
                 GITHUB_RELEASES_API,
                 headers={"User-Agent": f"REXA-Player/{APP_VERSION}", "Accept": "application/vnd.github+json"}
             )
-            with urllib.request.urlopen(req, timeout=8) as resp:
+            with _urlopen_resilient(req, timeout=8) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
             tag = data.get("tag_name", "")
             notes = (data.get("body") or "").strip()
@@ -1468,7 +1588,7 @@ class UpdateInstallThread(QThread):
             dest = os.path.join(dl_dir, fname)
 
             req = urllib.request.Request(self.url, headers={"User-Agent": f"REXA-Player/{APP_VERSION}"})
-            with urllib.request.urlopen(req, timeout=30) as resp:
+            with _urlopen_resilient(req, timeout=30) as resp:
                 total = int(resp.headers.get("Content-Length") or 0)
                 read = 0
                 with open(dest, "wb") as f:
@@ -1490,7 +1610,7 @@ class UpdateInstallThread(QThread):
                 new_app = os.path.join(mnt, "REXA.app")
                 target_app = ""
                 if getattr(sys, "frozen", False) and ".app/Contents/" in sys.executable:
-                    target_app = sys.executable.split(".app/Contents/") + ".app"
+                    target_app = sys.executable.split(".app/Contents/")[0] + ".app"
                 elif os.path.isdir("/Applications/REXA.app"):
                     target_app = "/Applications/REXA.app"
 
@@ -1746,7 +1866,7 @@ class SettingsDialog(QDialog):
         self.setAttribute(Qt.WA_TranslucentBackground, windows_transparency_enabled())
         self.setAttribute(Qt.WA_NoSystemBackground, True)
         self.setAttribute(Qt.WA_ContentsMarginsRespectsSafeArea, False)
-        self.setMinimumSize(460, 360)
+        self.setMinimumSize(520, 625)
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -1822,7 +1942,78 @@ class SettingsDialog(QDialog):
         upd_row.addWidget(self.btn_check_upd)
         p_lay.addLayout(upd_row)
 
-        note = QLabel("Layout presets & Last.fm / ListenBrainz scrobbling coming soon.")
+        scrob_card = make_glass_card()
+        s_lay = QVBoxLayout(scrob_card)
+        s_lay.setContentsMargins(16, 14, 16, 14)
+        s_lay.setSpacing(8)
+        s_hdr = QLabel("Last.fm Scrobbling")
+        s_hdr.setStyleSheet("font-weight: bold; font-size: 14px;")
+        s_lay.addWidget(s_hdr)
+
+        act_row = QHBoxLayout()
+        self.chk_lfm = QCheckBox("Enable Scrobbling")
+        self.btn_lfm_connect = QPushButton("Connect with Browser")
+        self.btn_lfm_connect.clicked.connect(self._on_lfm_browser_connect)
+        act_row.addWidget(self.chk_lfm)
+        act_row.addStretch()
+        act_row.addWidget(self.btn_lfm_connect)
+        s_lay.addLayout(act_row)
+
+        scrob_grid = QGridLayout()
+        scrob_grid.setHorizontalSpacing(10)
+        scrob_grid.setVerticalSpacing(6)
+        scrob_grid.setColumnStretch(1, 1)
+
+        scrob_grid.addWidget(QLabel("Scrobble tracks longer than:"), 0, 0)
+        self.s_scrob_min = ResetSlider(6, Qt.Horizontal)  # 6 * 5 = 30s
+        self.s_scrob_min.setRange(2, 12)  # 00:10..01:00 (5s step)
+        self.lbl_scrob_min = QLabel("00:30")
+        self.lbl_scrob_min.setFixedWidth(46)
+        self.lbl_scrob_min.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        scrob_grid.addWidget(self.s_scrob_min, 0, 1)
+        scrob_grid.addWidget(self.lbl_scrob_min, 0, 2)
+
+        delay_hdr = QLabel("Scrobble delay (whichever comes first)")
+        delay_hdr.setStyleSheet("font-size: 11px; font-weight: bold; opacity: 0.72; margin-top: 2px;")
+        scrob_grid.addWidget(delay_hdr, 1, 0, 1, 3)
+
+        scrob_grid.addWidget(QLabel("Percentage:"), 2, 0)
+        self.s_scrob_pct = ResetSlider(50, Qt.Horizontal)
+        self.s_scrob_pct.setRange(30, 90)  # 30%..90% (1% step)
+        self.lbl_scrob_pct = QLabel("50%")
+        self.lbl_scrob_pct.setFixedWidth(46)
+        self.lbl_scrob_pct.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        scrob_grid.addWidget(self.s_scrob_pct, 2, 1)
+        scrob_grid.addWidget(self.lbl_scrob_pct, 2, 2)
+
+        scrob_grid.addWidget(QLabel("Minutes:"), 3, 0)
+        self.s_scrob_max = ResetSlider(18, Qt.Horizontal)  # 18 * 10 = 180s (03:00)
+        self.s_scrob_max.setRange(3, 36)  # 00:30..06:00 (10s step)
+        self.lbl_scrob_max = QLabel("03:00")
+        self.lbl_scrob_max.setFixedWidth(46)
+        self.lbl_scrob_max.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        scrob_grid.addWidget(self.s_scrob_max, 3, 1)
+        scrob_grid.addWidget(self.lbl_scrob_max, 3, 2)
+
+        for sl in (self.s_scrob_min, self.s_scrob_pct, self.s_scrob_max):
+            sl.valueChanged.connect(self._save_scrobble_ui)
+        s_lay.addLayout(scrob_grid)
+
+        self.scrob_progress = QProgressBar()
+        self.scrob_progress.setRange(0, 100)
+        self.scrob_progress.setValue(0)
+        self.scrob_progress.setFixedHeight(6)
+        self.scrob_progress.setTextVisible(False)
+        s_lay.addWidget(self.scrob_progress)
+
+        self.lbl_scrob_status = QLabel("Not connected")
+        self.lbl_scrob_status.setStyleSheet("font-size: 11px; opacity: 0.78;")
+        s_lay.addWidget(self.lbl_scrob_status)
+
+        self.chk_lfm.toggled.connect(self._save_scrobble_ui)
+        lay.addWidget(scrob_card)
+
+        note = QLabel("Layout presets coming soon.")
         note.setWordWrap(True)
         note.setStyleSheet("opacity: 0.7; font-size: 12px;")
         p_lay.addWidget(note)
@@ -1874,6 +2065,43 @@ class SettingsDialog(QDialog):
             self.lbl_upd.setText("Update ready!")
             QMessageBox.information(self, "Update Ready", msg)
 
+    def _save_scrobble_ui(self, *_):
+        cfg = getattr(self.mw, "scrobble_cfg", {})
+        min_s = self.s_scrob_min.value() * 5
+        pct_v = self.s_scrob_pct.value()
+        max_s = self.s_scrob_max.value() * 10
+        self.lbl_scrob_min.setText(f"{min_s // 60:02d}:{min_s % 60:02d}")
+        self.lbl_scrob_pct.setText(f"{pct_v}%")
+        self.lbl_scrob_max.setText(f"{max_s // 60:02d}:{max_s % 60:02d}")
+        cfg["lfm_enabled"] = self.chk_lfm.isChecked()
+        cfg["min_track_sec"] = min_s
+        cfg["scrobble_pct"] = pct_v
+        cfg["max_time_sec"] = max_s
+        self.mw.scrobble_cfg = cfg
+        self.mw.save_session_state()
+
+    def _on_lfm_browser_connect(self):
+        self._save_scrobble_ui()
+        if getattr(self, "_auth_w", None) and self._auth_w.isRunning():
+            self._auth_w.requestInterruption()
+            self._auth_w.wait(500)
+        self.btn_lfm_connect.setEnabled(False)
+        self.lbl_scrob_status.setText("Requesting Last.fm token...")
+        self._auth_w = ScrobbleWorker(self.mw.scrobble_cfg, "browser_auth", parent=self)
+        self._auth_w.status_msg.connect(self._on_lfm_auth_msg)
+        self._auth_w.finished.connect(lambda: self.btn_lfm_connect.setEnabled(True))
+        self._auth_w.start()
+
+    def _on_lfm_auth_msg(self, msg):
+        if msg.startswith("LFM_OK:"):
+            _, uname, sk = msg.split(":", 2)
+            self.mw.scrobble_cfg.update({"lfm_user": uname, "lfm_sk": sk, "lfm_enabled": True})
+            self.chk_lfm.setChecked(True)
+            self.lbl_scrob_status.setText(f"Connected as {uname or 'Last.fm user'}!")
+            self.mw.save_session_state()
+        else:
+            self.lbl_scrob_status.setText(msg[:72])
+
     def sync_from_main(self):
         idx_map = {"classic": 0, "light": 1, "liquid_glass": 2}
         self.combo_theme.blockSignals(True)
@@ -1889,6 +2117,19 @@ class SettingsDialog(QDialog):
         self.chk_spec_fill.blockSignals(True)
         self.chk_spec_fill.setChecked(getattr(self.mw, 'spectrum_fill_enabled', True))
         self.chk_spec_fill.blockSignals(False)
+        cfg = getattr(self.mw, "scrobble_cfg", {})
+        self.chk_lfm.blockSignals(True); self.chk_lfm.setChecked(bool(cfg.get("lfm_enabled", False))); self.chk_lfm.blockSignals(False)
+        min_s = int(cfg.get("min_track_sec", 30))
+        pct_v = int(cfg.get("scrobble_pct", 50))
+        max_s = int(cfg.get("max_time_sec", 180))
+        for sl, val in ((self.s_scrob_min, max(2, min(12, min_s // 5))), (self.s_scrob_pct, max(30, min(90, pct_v))), (self.s_scrob_max, max(3, min(36, max_s // 10)))):
+            sl.blockSignals(True); sl.setValue(val); sl.blockSignals(False)
+        m_s = self.s_scrob_min.value() * 5; self.lbl_scrob_min.setText(f"{m_s // 60:02d}:{m_s % 60:02d}")
+        self.lbl_scrob_pct.setText(f"{self.s_scrob_pct.value()}%")
+        ms = self.s_scrob_max.value() * 10
+        self.lbl_scrob_max.setText(f"{ms // 60:02d}:{ms % 60:02d}")
+        if cfg.get("lfm_sk"):
+            self.lbl_scrob_status.setText(f"Connected as {cfg.get('lfm_user') or 'Last.fm user'}")
         is_g = self.mw.current_theme == "liquid_glass"
         self.s_glow.default_value = 100 if is_g else (20 if self.mw.current_theme == "classic" else 30)
         self.lbl_trans.setEnabled(is_g)
@@ -2003,6 +2244,11 @@ class MainWindow(QMainWindow):
         self.glass_clarity = 45
         self.glass_rim = 20
         self.spectrum_fill_enabled = True
+        self.scrobble_cfg = {"lfm_enabled": False, "lfm_api_key": "", "lfm_api_secret": "", "lfm_user": "", "lfm_sk": ""}
+        self._current_meta = {}
+        self._scrobble_sent = False
+        self._scrobble_started_ts = 0
+        self._scrobble_workers = []
         pg.setConfigOption("foreground", "#eef2f8")
         self.init_ui()
         
@@ -2311,6 +2557,26 @@ class MainWindow(QMainWindow):
                 self.toggle_cpu_mode(True)
                 return
         self.save_session_state()
+
+    def _on_scrobble_status(self, msg):
+        if getattr(self, "_settings_dlg", None):
+            self._settings_dlg.lbl_scrob_status.setText(msg)
+        if msg.startswith("Scrobbled") or msg.startswith("Last.fm error"):
+            self._set_dev_status(f"Last.fm • {msg}", True if msg.startswith("Scrobbled") else False)
+
+    def _trigger_scrobble(self, action):
+        cfg = getattr(self, "scrobble_cfg", {})
+        if not (cfg.get("lfm_enabled") and cfg.get("lfm_sk")):
+            return
+        meta = dict(getattr(self, "_current_meta", {}) or {})
+        if self.engine.audio_data is not None and self.engine.fs:
+            meta["duration"] = int(len(self.engine.audio_data) / float(self.engine.fs))
+        meta["timestamp"] = getattr(self, "_scrobble_started_ts", int(time.time()))
+        w = ScrobbleWorker(cfg, action, meta, self)
+        w.status_msg.connect(self._on_scrobble_status)
+        w.finished.connect(lambda: self._scrobble_workers.remove(w) if w in self._scrobble_workers else None)
+        self._scrobble_workers.append(w)
+        w.start()
 
     def toggle_spectrum_fill(self, checked):
         self.spectrum_fill_enabled = bool(checked)
@@ -2860,6 +3126,10 @@ class MainWindow(QMainWindow):
         
         self.lbl_track_title.setText(track['title'])
         self.lbl_track_artist.setText(track['artist'])
+        self._current_meta = dict(track)
+        self._scrobble_sent = False
+        self._scrobble_started_ts = int(time.time())
+        self._trigger_scrobble('now_playing')
         
         cover_bytes = _extract_cover_bytes(track['path'])
         if cover_bytes:
@@ -3533,6 +3803,9 @@ class MainWindow(QMainWindow):
         if pending_path and self.engine.audio_data is None and not self.engine.use_mac_tap:
             self._pending_load_path = None
             self._auto_play_after_load = True
+            self._scrobble_sent = False
+            self._scrobble_started_ts = int(time.time())
+            self._trigger_scrobble("now_playing")
             self.load_audio_file(pending_path)
             return
         if self.engine.is_playing:
@@ -3568,6 +3841,31 @@ class MainWindow(QMainWindow):
 
                 current_sec = self.engine.current_frame / self.engine.fs
                 self.lbl_time_current.setText(self.format_time(current_sec))
+                dur_sec = len(self.engine.audio_data) / float(self.engine.fs)
+                scfg = getattr(self, "scrobble_cfg", {})
+                min_track_s = float(scfg.get("min_track_sec", 30))
+                pct_thresh = float(scfg.get("scrobble_pct", 50)) / 100.0
+                max_time_s = float(scfg.get("max_time_sec", 180))
+                target_sec = min(max_time_s, dur_sec * pct_thresh)
+                eligible = dur_sec >= min_track_s and target_sec > 0.0
+                if getattr(self, "_settings_dlg", None) and self._settings_dlg.isVisible():
+                    if getattr(self, "_scrobble_sent", False):
+                        self._settings_dlg.scrob_progress.setValue(100)
+                    elif eligible:
+                        pct = min(99, max(0, int(round((current_sec / target_sec) * 100.0))))
+                        self._settings_dlg.scrob_progress.setValue(pct)
+                        rem = max(0, int(round(target_sec - current_sec)))
+                        if scfg.get("lfm_enabled") and scfg.get("lfm_sk"):
+                            self._settings_dlg.lbl_scrob_status.setText(f"Scrobbling in {rem}s ({pct}%)...")
+                    else:
+                        self._settings_dlg.scrob_progress.setValue(0)
+                        if scfg.get("lfm_enabled") and scfg.get("lfm_sk"):
+                            self._settings_dlg.lbl_scrob_status.setText(f"Track shorter than {int(min_track_s)}s — skipped")
+                if not getattr(self, '_scrobble_sent', False) and eligible and current_sec >= target_sec:
+                    self._scrobble_sent = True
+                    if getattr(self, "_settings_dlg", None):
+                        self._settings_dlg.scrob_progress.setValue(100)
+                    self._trigger_scrobble('scrobble')
                 if self.btn_dsp_perf.isChecked() and self.engine.dsp_hist_count > 0:
                     budget_ms = (self.engine.block_size / self.engine.fs) * 1000.0
                     samples = self.engine.dsp_hist[:self.engine.dsp_hist_count]
@@ -3960,6 +4258,7 @@ class MainWindow(QMainWindow):
                 "glass_rim": getattr(self, "glass_rim", 20),
                 "low_end_mode": self.engine.low_end_mode,
                 "spectrum_fill": getattr(self, "spectrum_fill_enabled", True),
+                "scrobble_cfg": getattr(self, "scrobble_cfg", {}),
                 "sofa_path": self.engine.sofa_path if (self.engine.sofa_path and os.path.exists(self.engine.sofa_path) and os.path.abspath(self.engine.sofa_path) != os.path.abspath(get_resource_path("default.sofa"))) else "",
             }
             with open(self._state_file_path(), "w", encoding="utf-8") as f:
@@ -3983,6 +4282,8 @@ class MainWindow(QMainWindow):
             self.btn_shuffle.setChecked(shuf)
             self.toggle_shuffle(shuf)
 
+            if isinstance(state.get("scrobble_cfg"), dict):
+                self.scrobble_cfg.update(state["scrobble_cfg"])
             self.toggle_spectrum_fill(bool(state.get("spectrum_fill", True)))
             low = bool(state.get("low_end_mode", False))
             self.engine.low_end_mode = low
@@ -4071,6 +4372,7 @@ class MainWindow(QMainWindow):
                     self._last_cover_render_key = None
                     self.update_cover_art_size()
 
+                self._current_meta = dict(track)
                 self._pending_load_path = track['path']
                 self._pending_resume_sec = pos_sec
                 self.lbl_time_current.setText(self.format_time(pos_sec))

@@ -14,3 +14,4 @@ android_app/build/
 android_app/app/build/
 android_app/app/src/main/jniLibs/
 *.apk
+player_ui/lfm_keys.py
