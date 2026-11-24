@@ -121,7 +121,7 @@ jobs:
             --add-data "player_ui/assets/icon.png:assets" \
             --icon "player_ui/assets/icon.icns" \
             --add-data "player_ui/assets/icon.png:assets" \
-            --add-data "player_ui/default.sofa:." \
+            --add-data "player_ui/default.sofa:." --add-data "player_ui/default_sofa.npz:." \
             player_ui/main.py
           /usr/libexec/PlistBuddy -c "Add :NSAudioCaptureUsageDescription string 'REXA captures system audio to apply real-time binaural HRTF processing.'" "dist/REXA.app/Contents/Info.plist" 
 

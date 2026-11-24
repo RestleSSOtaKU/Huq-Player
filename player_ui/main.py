@@ -2166,12 +2166,18 @@ class MainWindow(QMainWindow):
 
     def load_default_sofa(self):
         default_path = get_resource_path("default.sofa")
-        if os.path.exists(default_path):
+        prebaked_npz = get_resource_path("default_sofa.npz")
+        if os.path.exists(prebaked_npz):
+            npz = np.load(prebaked_npz)
+            self.engine.sofa_data = _FastSofaData(npz["time"], int(npz["fs"]))
+            self.engine.sofa_coords = _FastSofaCoords(npz["cart"])
+            self.engine.sofa_path = default_path if os.path.exists(default_path) else prebaked_npz
+            self.engine._update_hrirs()
+            self.lbl_sofa_file.setText("default.sofa (Built-in)")
+        elif os.path.exists(default_path):
             is_cached = os.path.exists(self.engine._sofa_cache_path(default_path))
             if not is_cached:
                 self.lbl_sofa_file.setText("Caching HRTF (first launch)...")
-                self._set_dev_status("First launch: caching HRTF acoustic profile — next startups will be instant.", None)
-                QApplication.processEvents()
             t_s = time.perf_counter()
             self.engine.load_sofa(default_path)
             dt_s = (time.perf_counter() - t_s) * 1000.0
@@ -2304,7 +2310,7 @@ class MainWindow(QMainWindow):
         dev_layout.addWidget(self.lbl_sr)
         top_card_layout.addLayout(dev_layout)
 
-        _is_first = not os.path.exists(self.engine._sofa_cache_path(get_resource_path("default.sofa"))) if os.path.exists(get_resource_path("default.sofa")) else False
+        _is_first = (not os.path.exists(get_resource_path("default_sofa.npz"))) and (not os.path.exists(self.engine._sofa_cache_path(get_resource_path("default.sofa"))) if os.path.exists(get_resource_path("default.sofa")) else False)
         self.lbl_dev_status = QLabel("First launch: caching HRTF acoustic profile — subsequent startups will be instant." if _is_first else "Tip: Select your DAC directly instead of System Default for native sample-rate switching.")
         if _is_first:
             self.lbl_dev_status.setStyleSheet("color: #64d2ff; font-size: 12px; font-weight: bold; margin-bottom: 4px;")
