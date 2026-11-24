@@ -1490,7 +1490,7 @@ try:
 except ImportError:
     LFM_API_KEY = os.environ.get("LFM_API_KEY", "")
     LFM_API_SECRET = os.environ.get("LFM_API_SECRET", "")
-GITHUB_RELEASES_API = "https://github.com"
+GITHUB_RELEASES_API = "https://://github.com/repos/RestleSSOtaKU/REXA-Player/releases/latest"
 
 def _urlopen_resilient(req, timeout=8):
     import urllib.request, urllib.error
@@ -1639,7 +1639,7 @@ class UpdateCheckThread(QThread):
                     dl_url = a.get("browser_download_url", "")
                     break
             if not dl_url:
-                dl_url = data.get("html_url", "https://github.com")
+                dl_url = data.get("html_url", "https://github.com/RestleSSOtaKU/REXA-Player/releases/latest")
             has_upd = _parse_ver(tag) > _parse_ver(APP_VERSION)
             self.result_ready.emit(has_upd, tag or f"v{APP_VERSION}", dl_url, notes)
         except Exception as e:
@@ -2323,6 +2323,8 @@ class MainWindow(QMainWindow):
         self._current_meta = {}
         self._scrobble_sent = False
         self._scrobble_started_ts = 0
+        self._scrobble_elapsed_sec = 0.0
+        self._scrobble_last_tick = None
         self._scrobble_workers = []
         pg.setConfigOption("foreground", "#eef2f8")
         self.init_ui()
@@ -2633,11 +2635,22 @@ class MainWindow(QMainWindow):
                 return
         self.save_session_state()
 
+    def _restore_dev_status(self):
+        if self.engine.is_playing:
+            self._set_dev_status(self.engine.stream_mode_status, self.engine.stream_is_exclusive)
+        else:
+            self._set_dev_status("Tip: Select your DAC directly instead of System Default for native sample-rate switching.", None)
+
     def _on_scrobble_status(self, msg):
         if getattr(self, "_settings_dlg", None):
             self._settings_dlg.lbl_scrob_status.setText(msg)
         if msg.startswith("Scrobbled") or msg.startswith("Last.fm error"):
             self._set_dev_status(f"Last.fm • {msg}", True if msg.startswith("Scrobbled") else False)
+            if not hasattr(self, "_scrob_banner_timer"):
+                self._scrob_banner_timer = QTimer(self)
+                self._scrob_banner_timer.setSingleShot(True)
+                self._scrob_banner_timer.timeout.connect(self._restore_dev_status)
+            self._scrob_banner_timer.start(5000)
 
     def _trigger_scrobble(self, action):
         cfg = getattr(self, "scrobble_cfg", {})
@@ -3221,6 +3234,8 @@ class MainWindow(QMainWindow):
         self.lbl_track_artist.setText(track['artist'])
         self._current_meta = dict(track)
         self._scrobble_sent = False
+        self._scrobble_elapsed_sec = 0.0
+        self._scrobble_last_tick = time.perf_counter()
         self._scrobble_started_ts = int(time.time())
         self._trigger_scrobble('now_playing')
         
@@ -3903,11 +3918,14 @@ class MainWindow(QMainWindow):
             self._pending_load_path = None
             self._auto_play_after_load = True
             self._scrobble_sent = False
+            self._scrobble_elapsed_sec = 0.0
+            self._scrobble_last_tick = time.perf_counter()
             self._scrobble_started_ts = int(time.time())
             self._trigger_scrobble("now_playing")
             self.load_audio_file(pending_path)
             return
         if self.engine.is_playing:
+            self._scrobble_last_tick = None
             self.engine.stop()
             self.btn_play.setText("▶ Play")
             self.timer.stop()
@@ -3916,6 +3934,7 @@ class MainWindow(QMainWindow):
             self.lbl_dev_status.setText("Paused — Select your DAC directly instead of System Default for native sample-rate switching.")
             self.lbl_dev_status.setStyleSheet("color: #8e8e93; font-size: 11px; margin-bottom: 4px;")
         else:
+            self._scrobble_last_tick = time.perf_counter()
             self.engine.start()
             self.btn_play.setText("⏸ Pause")
             self.timer.start()
@@ -3940,6 +3959,13 @@ class MainWindow(QMainWindow):
 
                 current_sec = self.engine.current_frame / self.engine.fs
                 self.lbl_time_current.setText(self.format_time(current_sec))
+                now_t = time.perf_counter()
+                last_t = getattr(self, "_scrobble_last_tick", None)
+                if last_t is not None and not getattr(self, "is_seeking", False):
+                    self._scrobble_elapsed_sec = getattr(self, "_scrobble_elapsed_sec", 0.0) + min(0.5, max(0.0, now_t - last_t))
+                self._scrobble_last_tick = now_t
+                listened_sec = getattr(self, "_scrobble_elapsed_sec", 0.0)
+
                 dur_sec = len(self.engine.audio_data) / float(self.engine.fs)
                 scfg = getattr(self, "scrobble_cfg", {})
                 min_track_s = float(scfg.get("min_track_sec", 30))
@@ -3951,16 +3977,16 @@ class MainWindow(QMainWindow):
                     if getattr(self, "_scrobble_sent", False):
                         self._settings_dlg.scrob_progress.setValue(100)
                     elif eligible:
-                        pct = min(99, max(0, int(round((current_sec / target_sec) * 100.0))))
+                        pct = min(99, max(0, int(round((listened_sec / target_sec) * 100.0))))
                         self._settings_dlg.scrob_progress.setValue(pct)
-                        rem = max(0, int(round(target_sec - current_sec)))
+                        rem = max(0, int(round(target_sec - listened_sec)))
                         if scfg.get("lfm_enabled") and scfg.get("lfm_sk"):
                             self._settings_dlg.lbl_scrob_status.setText(f"Scrobbling in {rem}s ({pct}%)...")
                     else:
                         self._settings_dlg.scrob_progress.setValue(0)
                         if scfg.get("lfm_enabled") and scfg.get("lfm_sk"):
                             self._settings_dlg.lbl_scrob_status.setText(f"Track shorter than {int(min_track_s)}s — skipped")
-                if not getattr(self, '_scrobble_sent', False) and eligible and current_sec >= target_sec:
+                if not getattr(self, '_scrobble_sent', False) and eligible and listened_sec >= target_sec:
                     self._scrobble_sent = True
                     if getattr(self, "_settings_dlg", None):
                         self._settings_dlg.scrob_progress.setValue(100)
@@ -4165,24 +4191,51 @@ class MainWindow(QMainWindow):
         self._rebuild_playlist_widget(current_path)
         self.save_session_state()
 
-    def _on_mini_cover_ready(self, path, raw):
+    def _on_mini_cover_ready(self, path, qimg):
         mem = getattr(self, "_visible_covers", None)
         if mem is None:
             mem = {}
             self._visible_covers = mem
-        pm = None
-        if raw:
-            full = QPixmap()
-            if full.loadFromData(raw):
-                pm = full.scaled(160, 160, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
-        while len(mem) > 120:
+        pm = QPixmap.fromImage(qimg) if (qimg is not None and not qimg.isNull()) else None
+        while len(mem) > 160:
             mem.pop(next(iter(mem)))
         mem[path] = pm
         pending = getattr(self, "_mini_cover_pending", None)
         if pending is not None:
             pending.discard(path)
+        if hasattr(self, "list_widget") and not getattr(self, "_cover_repaint_queued", False):
+            self._cover_repaint_queued = True
+            QTimer.singleShot(25, self._flush_cover_repaint)
+
+    def _flush_cover_repaint(self):
+        self._cover_repaint_queued = False
         if hasattr(self, "list_widget"):
             self.list_widget.viewport().update()
+
+    def _flush_queued_covers(self):
+        q = getattr(self, "_mini_cover_queue", None)
+        if not q:
+            return
+        pending = getattr(self, "_mini_cover_pending", None)
+        if pending is None:
+            pending = set()
+            self._mini_cover_pending = pending
+        # Take only the 18 most recently requested visible items and drop stale scroll-by items
+        batch = list(q)[-18:]
+        q.clear()
+        def _decode_job(p, sig):
+            from PySide6.QtGui import QImage
+            raw = _extract_cover_bytes(p)
+            img = None
+            if raw:
+                src_img = QImage()
+                if src_img.loadFromData(raw) and not src_img.isNull():
+                    img = src_img.scaled(140, 140, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
+            sig.loaded.emit(p, img)
+        for p in batch:
+            if p not in pending and p not in getattr(self, "_visible_covers", {}):
+                pending.add(p)
+                self._mini_cover_pool.submit(_decode_job, p, self._mini_cover_sig)
 
     def _get_mini_cover_async(self, path):
         if not path:
@@ -4194,20 +4247,27 @@ class MainWindow(QMainWindow):
         if path in mem:
             return mem[path]
         pending = getattr(self, "_mini_cover_pending", None)
-        if pending is None:
-            pending = set()
-            self._mini_cover_pending = pending
-        if path not in pending:
-            pending.add(path)
-            _get_mutagen()  # Pre-warm mutagen on main thread so worker pool is 100% thread-safe
-            if not hasattr(self, "_mini_cover_sig"):
-                class _CovBridge(QObject):
-                    loaded = Signal(str, object)
-                self._mini_cover_sig = _CovBridge(self)
-                self._mini_cover_sig.loaded.connect(self._on_mini_cover_ready)
-                from concurrent.futures import ThreadPoolExecutor
-                self._mini_cover_pool = ThreadPoolExecutor(max_workers=2)
-            self._mini_cover_pool.submit(lambda p=path, sig=self._mini_cover_sig: sig.loaded.emit(p, _extract_cover_bytes(p)))
+        if pending is not None and path in pending:
+            return None
+        _get_mutagen()
+        if not hasattr(self, "_mini_cover_sig"):
+            class _CovBridge(QObject):
+                loaded = Signal(str, object)
+            self._mini_cover_sig = _CovBridge(self)
+            self._mini_cover_sig.loaded.connect(self._on_mini_cover_ready)
+            from concurrent.futures import ThreadPoolExecutor
+            self._mini_cover_pool = ThreadPoolExecutor(max_workers=1)
+            self._mini_cover_queue = []
+            self._mini_cover_debounce = QTimer(self)
+            self._mini_cover_debounce.setSingleShot(True)
+            self._mini_cover_debounce.setInterval(55)
+            self._mini_cover_debounce.timeout.connect(self._flush_queued_covers)
+        q = self._mini_cover_queue
+        if path not in q:
+            q.append(path)
+            if len(q) > 36:
+                del q[:len(q) - 36]
+        self._mini_cover_debounce.start()
         return None
 
     def _get_mini_cover(self, path):
