@@ -46,3 +46,8 @@ For prebuilt Windows (`REXA-Windows.zip`) and macOS Apple Silicon (`REXA-macOS-A
 * **Cross-Platform Window & Safe Checks:**
   * macOS: Seamless full-bleed titlebar (`apply_seamless_titlebar`) and `WindowDragFilter` (click-drag anywhere, double-click zoom, triple-click fullscreen).
   * Windows: `windows_transparency_enabled()` checks `EnableTransparency` in the registry at startup so VMs or basic GPUs never render a black backing store in `Glass` mode.
+
+## What's New in v0.5.2
+- **One-Click Last.fm Browser Scrobbling:** Passwordless browser OAuth flow with Pano-style dual-threshold delay sliders (*Min Track Length*, *Percentage*, and *Minutes*) and a live scrobble progress bar.
+- **Built-In In-App Auto-Updater:** Checks GitHub Releases directly from **Settings** and seamlessly updates & relaunches on both macOS and Windows.
+- **Album-Grouped Library & Cover Art Inspector:** `Artist • Album` sorting with `44×44` album cover dividers, disc/track ordering, right-click **Show in Finder / Explorer**, and **Track Properties** with a full-window + `72%` rectangular loupe cover viewer.

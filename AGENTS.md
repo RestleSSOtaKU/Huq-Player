@@ -55,3 +55,9 @@
 5. **Layout & Text Overflow Protection:**
    * Use `MarqueeLabel` (with `QSizePolicy.Ignored`) for dynamic track metadata so long titles never compress `lbl_cover` or push right-side controls.
    * Keep `combo_group` at `min-width >= 116px` (`view().setMinimumWidth(126)`) and `btn_sort_dir` at `50px` with `padding: 6px 4px;` so `"Custom"` and `"A-Z"`/`"Z-A"` never elide or clip.
+
+## v0.5.2 Architecture & Build Notes
+- **Pre-baked HRTF Profile (`player_ui/default_sofa.npz`):** Bundled into PyInstaller releases so first startup skips importing `pyfar`/`sofar`/`netCDF4`/`h5py` (preventing Windows HDF5 thread deadlocks and enabling <0.5s cold starts).
+- **Last.fm App Keys (`player_ui/lfm_keys.py`):** Gitignored locally; injected at CI build time from `LFM_API_KEY` and `LFM_API_SECRET` GitHub Actions repository secrets.
+- **In-App Updater (`UpdateCheckThread` / `UpdateInstallThread`):** Queries `://github.com`, strips `com.apple.quarantine` on macOS `.app` updates, and uses a detached `.bat` swapper on Windows.
+- **Library Delegates & Dialogs:** `MarqueeDelegate` renders non-selectable `56 px` album cover headers (`_is_header`) and async per-track cover strips via `ThreadPoolExecutor`; `SettingsDialog` and `_show_track_properties` are non-modal so `Cmd+Q` / window close never blocks.

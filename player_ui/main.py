@@ -350,6 +350,9 @@ class MarqueeDelegate(QStyledItemDelegate):
         self._timer.timeout.connect(self._scroll_step)
 
     def sizeHint(self, option, index):
+        data = index.data(Qt.UserRole)
+        if isinstance(data, dict) and data.get("_is_header"):
+            return QSize(100, 56)
         return QSize(100, 36)
 
     def set_hover(self, index):
@@ -371,6 +374,49 @@ class MarqueeDelegate(QStyledItemDelegate):
             self.parent().viewport().update()
 
     def paint(self, painter, option, index):
+        data = index.data(Qt.UserRole)
+        if isinstance(data, dict) and data.get("_is_header"):
+            from PySide6.QtGui import QFont, QPainterPath, QPen
+            painter.save()
+            painter.setRenderHint(QPainter.Antialiasing, True)
+            is_light = getattr(self.parent().window(), 'current_theme', 'classic') == 'light'
+            r = option.rect
+            painter.setPen(QPen(QColor(0, 0, 0, 28) if is_light else QColor(255, 255, 255, 28), 1))
+            painter.drawLine(r.left() + 8, r.top() + 3, r.right() - 8, r.top() + 3)
+
+            cov_rect = r.adjusted(8, 8, 0, -4)
+            cov_rect.setWidth(44)
+            cov_rect.setHeight(44)
+            mw = self.parent().window()
+            pm = mw._get_mini_cover_async(data.get("sample_path", "")) if hasattr(mw, "_get_mini_cover_async") else None
+            clip = QPainterPath()
+            clip.addRoundedRect(cov_rect, 7, 7)
+            painter.setClipPath(clip)
+            if pm is not None and not pm.isNull():
+                painter.drawPixmap(cov_rect, pm)
+            else:
+                painter.fillRect(cov_rect, QColor(0, 0, 0, 35) if is_light else QColor(255, 255, 255, 22))
+            painter.setClipping(False)
+
+            tx = cov_rect.right() + 10
+            tw = max(40, r.right() - tx - 56)
+            fg = QColor("#161618" if is_light else "#f2f4f8")
+            sub = QColor("#636366" if is_light else "#9ca3af")
+            painter.setPen(fg)
+            painter.setFont(QFont(".AppleSystemUIFont", 12, QFont.Bold))
+            el_art = painter.fontMetrics().elidedText(data.get("artist", "Unknown Artist"), Qt.ElideRight, tw)
+            painter.drawText(tx, r.top() + 8, tw, 20, Qt.AlignVCenter | Qt.AlignLeft, el_art)
+
+            painter.setPen(sub)
+            painter.setFont(QFont(".AppleSystemUIFont", 11))
+            el_alb = painter.fontMetrics().elidedText(data.get("album", "Unknown Album"), Qt.ElideRight, tw)
+            painter.drawText(tx, r.top() + 28, tw, 18, Qt.AlignVCenter | Qt.AlignLeft, el_alb)
+
+            cnt_txt = f"{data.get('count', 0)} trk"
+            painter.drawText(r.right() - 52, r.top() + 8, 44, 20, Qt.AlignVCenter | Qt.AlignRight, cnt_txt)
+            painter.restore()
+            return
+
         opt = QStyleOptionViewItem(option)
         self.initStyleOption(opt, index)
         text = opt.text
@@ -384,6 +430,34 @@ class MarqueeDelegate(QStyledItemDelegate):
         
         if not text:
             return
+
+        mw = self.parent().window() if self.parent() else None
+        group_idx = mw.combo_group.currentIndex() if (mw and hasattr(mw, "combo_group")) else 0
+        if group_idx not in (3, 4) and isinstance(data, dict) and data.get("path") and hasattr(mw, "_get_mini_cover_async"):
+            pm = mw._get_mini_cover_async(data["path"])
+            if pm is not None and not pm.isNull():
+                from PySide6.QtGui import QPainterPath, QLinearGradient
+                painter.save()
+                painter.setRenderHint(QPainter.Antialiasing, True)
+                bg_r = option.rect.adjusted(2, 2, -2, -2)
+                clip = QPainterPath()
+                clip.addRoundedRect(bg_r, 8, 8)
+                painter.setClipPath(clip)
+                # Horizontal middle crop of cover stretched across the row at subtle opacity
+                src_h = max(8, int(pm.height() * 0.34))
+                src_y = (pm.height() - src_h) // 2
+                painter.setOpacity(0.16 if not bool(option.state & QStyle.State_Selected) else 0.12)
+                painter.drawPixmap(bg_r, pm, pm.rect().adjusted(0, src_y, 0, -(pm.height() - src_y - src_h)))
+                is_light = getattr(mw, 'current_theme', 'classic') == 'light'
+                grad = QLinearGradient(bg_r.left(), 0, bg_r.right(), 0)
+                base_c = QColor(255, 255, 255, 165) if is_light else QColor(18, 20, 26, 175)
+                edge_c = QColor(255, 255, 255, 55) if is_light else QColor(18, 20, 26, 65)
+                grad.setColorAt(0.0, base_c)
+                grad.setColorAt(0.65, edge_c)
+                grad.setColorAt(1.0, base_c)
+                painter.setOpacity(1.0)
+                painter.fillRect(bg_r, grad)
+                painter.restore()
             
         painter.save()
         text_rect = option.rect.adjusted(8, 0, -8, 0)
@@ -467,30 +541,61 @@ class HoverPlotWidget(pg.PlotWidget):
             self.legend.setOpacity(0.1)
         super().leaveEvent(event)
 
+def _read_audio_tags(path):
+    file = os.path.basename(path)
+    title, artist, album, track_no, disc_no = file, "Unknown Artist", "Unknown Album", 0, 1
+    def _first(val, default):
+        if isinstance(val, (list, tuple)):
+            return val[0] if val else default
+        return val if val else default
+    def _parse_num(val, default=0):
+        try:
+            s = str(_first(val, default)).split("/")[0]
+            digits = "".join(c for c in s if c.isdigit())
+            return int(digits) if digits else default
+        except Exception:
+            return default
+    try:
+        mutagen, FLAC, ID3, MP3, MP4 = _get_mutagen()
+        audio = mutagen.File(path)
+        if audio:
+            if isinstance(audio, FLAC):
+                title = _first(audio.get('title'), file)
+                artist = _first(audio.get('artist'), "Unknown Artist")
+                album = _first(audio.get('album'), "Unknown Album")
+                track_no = _parse_num(audio.get('tracknumber'), 0)
+                disc_no = _parse_num(audio.get('discnumber'), 1)
+            elif isinstance(audio, (MP3, MP4)) and audio.tags:
+                if isinstance(audio.tags, ID3):
+                    title = str(audio.tags.get('TIT2', file)) or file
+                    artist = str(audio.tags.get('TPE1', "Unknown Artist")) or "Unknown Artist"
+                    album = str(audio.tags.get('TALB', "Unknown Album")) or "Unknown Album"
+                    track_no = _parse_num(audio.tags.get('TRCK', 0), 0)
+                    disc_no = _parse_num(audio.tags.get('TPOS', 1), 1)
+                else:
+                    title = _first(audio.tags.get('©nam'), file)
+                    artist = _first(audio.tags.get('©ART'), "Unknown Artist")
+                    album = _first(audio.tags.get('©alb'), "Unknown Album")
+                    trkn = _first(audio.tags.get('trkn'), (0, 0))
+                    disk = _first(audio.tags.get('disk'), (1, 0))
+                    track_no = int(trkn[0]) if isinstance(trkn, (list, tuple)) and trkn else 0
+                    disc_no = int(disk[0]) if isinstance(disk, (list, tuple)) and disk else 1
+    except Exception:
+        pass
+    return {'path': path, 'title': title, 'artist': artist, 'album': album, 'track_no': track_no, 'disc_no': disc_no}
+
 class MetadataRepairThread(QThread):
     finished_repair = Signal()
     def __init__(self, tracks):
         super().__init__()
         self.tracks = tracks
     def run(self):
-        mutagen, FLAC, ID3, MP3, MP4 = _get_mutagen()
         for t in self.tracks:
-            try:
-                audio = mutagen.File(t['path'])
-                if audio:
-                    if isinstance(audio, FLAC):
-                        album = audio.get('album', ["Unknown Album"])[0]
-                        t['album'] = album if album else "Unknown Album"
-                    elif isinstance(audio, (MP3, MP4)):
-                        if audio.tags:
-                            if isinstance(audio.tags, ID3):
-                                album = str(audio.tags.get('TALB', "Unknown Album"))
-                                t['album'] = album if album else "Unknown Album"
-                            else:
-                                album = audio.tags.get('\xa9alb', ["Unknown Album"])[0]
-                                t['album'] = album if album else "Unknown Album"
-            except Exception:
-                pass
+            if os.path.exists(t.get('path', '')):
+                info = _read_audio_tags(t['path'])
+                t['album'] = info['album']
+                t['track_no'] = info['track_no']
+                t['disc_no'] = info['disc_no']
         self.finished_repair.emit()
 
 class ScannerThread(QThread):
@@ -507,38 +612,7 @@ class ScannerThread(QThread):
         for root, _, files in os.walk(self.folder):
             for file in files:
                 if file.lower().endswith(valid_exts):
-                    path = os.path.join(root, file)
-                    title = file
-                    artist = "Unknown Artist"
-                    album = "Unknown Album"
-                    
-                    try:
-                        mutagen, FLAC, ID3, MP3, MP4 = _get_mutagen()
-                        audio = mutagen.File(path)
-                        if audio:
-                            if isinstance(audio, FLAC):
-                                title = audio.get('title', [file])[0]
-                                artist = audio.get('artist', ["Unknown Artist"])[0]
-                                album = audio.get('album', ["Unknown Album"])[0]
-                            elif isinstance(audio, MP3) or isinstance(audio, MP4):
-                                if audio.tags:
-                                    if isinstance(audio.tags, ID3):
-                                        title = str(audio.tags.get('TIT2', file))
-                                        artist = str(audio.tags.get('TPE1', "Unknown Artist"))
-                                        album = str(audio.tags.get('TALB', "Unknown Album"))
-                                    else:
-                                        title = audio.tags.get('\xa9nam', [file])[0]
-                                        artist = audio.tags.get('\xa9ART', ["Unknown Artist"])[0]
-                                        album = audio.tags.get('\xa9alb', ["Unknown Album"])[0]
-                    except Exception:
-                        pass
-                        
-                    tracks.append({
-                        'path': path,
-                        'title': title,
-                        'artist': artist,
-                        'album': album,
-                    })
+                    tracks.append(_read_audio_tags(os.path.join(root, file)))
         self.finished_scanning.emit(tracks)
 
 class LoaderThread(QThread):
@@ -1866,7 +1940,7 @@ class SettingsDialog(QDialog):
         self.setAttribute(Qt.WA_TranslucentBackground, windows_transparency_enabled())
         self.setAttribute(Qt.WA_NoSystemBackground, True)
         self.setAttribute(Qt.WA_ContentsMarginsRespectsSafeArea, False)
-        self.setMinimumSize(520, 625)
+        self.setMinimumSize(540, 695)
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -1876,13 +1950,13 @@ class SettingsDialog(QDialog):
 
         lay = QVBoxLayout(root)
         lay.setContentsMargins(18, 40 if sys.platform == "darwin" else 18, 18, 18)
-        lay.setSpacing(12)
+        lay.setSpacing(16)
 
         app_card = make_glass_card()
         g = QGridLayout(app_card)
-        g.setContentsMargins(16, 14, 16, 14)
-        g.setHorizontalSpacing(14)
-        g.setVerticalSpacing(12)
+        g.setContentsMargins(18, 16, 18, 16)
+        g.setHorizontalSpacing(16)
+        g.setVerticalSpacing(14)
         g.setColumnStretch(1, 1)
 
         hdr1 = QLabel("Appearance")
@@ -1919,8 +1993,8 @@ class SettingsDialog(QDialog):
 
         perf_card = make_glass_card()
         p_lay = QVBoxLayout(perf_card)
-        p_lay.setContentsMargins(16, 14, 16, 14)
-        p_lay.setSpacing(8)
+        p_lay.setContentsMargins(18, 16, 18, 16)
+        p_lay.setSpacing(11)
         hdr2 = QLabel("Engine & Future Modules")
         hdr2.setStyleSheet("font-weight: bold; font-size: 14px;")
         p_lay.addWidget(hdr2)
@@ -1944,8 +2018,8 @@ class SettingsDialog(QDialog):
 
         scrob_card = make_glass_card()
         s_lay = QVBoxLayout(scrob_card)
-        s_lay.setContentsMargins(16, 14, 16, 14)
-        s_lay.setSpacing(8)
+        s_lay.setContentsMargins(18, 16, 18, 16)
+        s_lay.setSpacing(12)
         s_hdr = QLabel("Last.fm Scrobbling")
         s_hdr.setStyleSheet("font-weight: bold; font-size: 14px;")
         s_lay.addWidget(s_hdr)
@@ -1960,8 +2034,8 @@ class SettingsDialog(QDialog):
         s_lay.addLayout(act_row)
 
         scrob_grid = QGridLayout()
-        scrob_grid.setHorizontalSpacing(10)
-        scrob_grid.setVerticalSpacing(6)
+        scrob_grid.setHorizontalSpacing(14)
+        scrob_grid.setVerticalSpacing(11)
         scrob_grid.setColumnStretch(1, 1)
 
         scrob_grid.addWidget(QLabel("Scrobble tracks longer than:"), 0, 0)
@@ -1974,7 +2048,8 @@ class SettingsDialog(QDialog):
         scrob_grid.addWidget(self.lbl_scrob_min, 0, 2)
 
         delay_hdr = QLabel("Scrobble delay (whichever comes first)")
-        delay_hdr.setStyleSheet("font-size: 11px; font-weight: bold; opacity: 0.72; margin-top: 2px;")
+        delay_hdr.setStyleSheet("font-size: 11px; font-weight: bold; opacity: 0.72;")
+        delay_hdr.setMinimumHeight(20)
         scrob_grid.addWidget(delay_hdr, 1, 0, 1, 3)
 
         scrob_grid.addWidget(QLabel("Percentage:"), 2, 0)
@@ -2665,8 +2740,10 @@ class MainWindow(QMainWindow):
             "Custom",
             "Tracks",
             "Artist",
-            "Album"
+            "Album",
+            "Artist • Album"
         ])
+        self.combo_group.setCurrentIndex(4)
         self.combo_group.currentIndexChanged.connect(self.apply_sort)
 
         self.btn_sort_dir = QPushButton("A-Z")
@@ -2683,7 +2760,9 @@ class MainWindow(QMainWindow):
 
         self.list_widget = MarqueeListWidget()
         self.list_widget.itemDoubleClicked.connect(self.play_selected_item)
-        self.list_widget.setDragDropMode(QListWidget.InternalMove)
+        self.list_widget.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.list_widget.customContextMenuRequested.connect(self._show_playlist_context_menu)
+        self.list_widget.setDragDropMode(QListWidget.NoDragDrop if (hasattr(self, 'combo_group') and self.combo_group.currentIndex() in (3, 4)) else QListWidget.InternalMove)
         self.list_widget.setDefaultDropAction(Qt.MoveAction)
         self.list_widget.setSelectionMode(QListWidget.ExtendedSelection)
         self.list_widget.model().rowsMoved.connect(self.on_playlist_reordered)
@@ -3091,6 +3170,18 @@ class MainWindow(QMainWindow):
                 if old_track.get('artist') != track.get('artist') and track.get('artist') != "Unknown Artist":
                     old_track['artist'] = track.get('artist')
 
+        if hasattr(self, "combo_group") and self.combo_group.currentIndex() != 0:
+            self.apply_sort()
+            self.lbl_lib_info.setText(f"{len(self.library_tracks)} tracks in playlist")
+            self.btn_scan.setEnabled(True)
+            if auto_play_if_empty and was_empty and self.library_tracks:
+                target_t = self.library_tracks[0]
+                item = next((self.list_widget.item(r) for r in range(self.list_widget.count()) if (self.list_widget.item(r).data(Qt.UserRole) or {}).get('path') == target_t['path']), None)
+                if item:
+                    self.list_widget.setCurrentItem(item)
+                    self.play_selected_item(item)
+            return
+
         # Rebuild the entire widget from scratch to fix missing tracks and layout glitches
         self._rebuild_playlist_widget()
         
@@ -3122,7 +3213,9 @@ class MainWindow(QMainWindow):
             self.btn_next.setEnabled(True)
             self.btn_export.setEnabled(True)
         track = item.data(Qt.UserRole)
-        self.current_track_index = self.list_widget.row(item)
+        if not isinstance(track, dict) or track.get("_is_header"):
+            return
+        self.current_track_index = next((i for i, t in enumerate(self.library_tracks) if t['path'] == track['path']), -1)
         
         self.lbl_track_title.setText(track['title'])
         self.lbl_track_artist.setText(track['artist'])
@@ -3158,7 +3251,10 @@ class MainWindow(QMainWindow):
             self.current_track_index = random.choice(candidates)
         else:
             self.current_track_index = (self.current_track_index + 1) % n
-        item = self.list_widget.item(self.current_track_index)
+        target_t = self.library_tracks[self.current_track_index]
+        item = next((self.list_widget.item(r) for r in range(self.list_widget.count()) if (self.list_widget.item(r).data(Qt.UserRole) or {}).get('path') == target_t['path']), None)
+        if item is None:
+            return
         self.list_widget.setCurrentItem(item)
         self.play_selected_item(item)
 
@@ -3166,7 +3262,10 @@ class MainWindow(QMainWindow):
         if not self.library_tracks:
             return
         self.current_track_index = (self.current_track_index - 1) % len(self.library_tracks)
-        item = self.list_widget.item(self.current_track_index)
+        target_t = self.library_tracks[self.current_track_index]
+        item = next((self.list_widget.item(r) for r in range(self.list_widget.count()) if (self.list_widget.item(r).data(Qt.UserRole) or {}).get('path') == target_t['path']), None)
+        if item is None:
+            return
         self.list_widget.setCurrentItem(item)
         self.play_selected_item(item)
 
@@ -4018,7 +4117,10 @@ class MainWindow(QMainWindow):
         for i in range(self.list_widget.count()):
             item = self.list_widget.item(i)
             track = item.data(Qt.UserRole) or {}
-            haystack = f"{track.get('title', '')} {track.get('artist', '')}".lower()
+            if track.get("_is_header"):
+                item.setHidden(bool(query))
+                continue
+            haystack = f"{track.get('title', '')} {track.get('artist', '')} {track.get('album', '')}".lower()
             match = (query in haystack)
             item.setHidden(not match)
             if match:
@@ -4055,17 +4157,87 @@ class MainWindow(QMainWindow):
         elif group_idx == 2:
             self.library_tracks.sort(key=lambda t: (t.get('artist', '').lower(), t.get('title', '').lower()), reverse=reverse)
         elif group_idx == 3:
-            self.library_tracks.sort(key=lambda t: (t.get('album', '').lower(), t.get('title', '').lower()), reverse=reverse)
+            self.library_tracks.sort(key=lambda t: (t.get('album', '').lower(), int(t.get('disc_no', 1)), int(t.get('track_no', 0)), t.get('title', '').lower()), reverse=reverse)
+        elif group_idx == 4:
+            self.library_tracks.sort(key=lambda t: (t.get('artist', '').lower(), t.get('album', '').lower(), int(t.get('disc_no', 1)), int(t.get('track_no', 0)), t.get('title', '').lower()), reverse=reverse)
 
         self._refresh_playlist_labels()
         self._rebuild_playlist_widget(current_path)
         self.save_session_state()
 
+    def _on_mini_cover_ready(self, path, raw):
+        mem = getattr(self, "_visible_covers", None)
+        if mem is None:
+            mem = {}
+            self._visible_covers = mem
+        pm = None
+        if raw:
+            full = QPixmap()
+            if full.loadFromData(raw):
+                pm = full.scaled(160, 160, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
+        while len(mem) > 120:
+            mem.pop(next(iter(mem)))
+        mem[path] = pm
+        pending = getattr(self, "_mini_cover_pending", None)
+        if pending is not None:
+            pending.discard(path)
+        if hasattr(self, "list_widget"):
+            self.list_widget.viewport().update()
+
+    def _get_mini_cover_async(self, path):
+        if not path:
+            return None
+        mem = getattr(self, "_visible_covers", None)
+        if mem is None:
+            mem = {}
+            self._visible_covers = mem
+        if path in mem:
+            return mem[path]
+        pending = getattr(self, "_mini_cover_pending", None)
+        if pending is None:
+            pending = set()
+            self._mini_cover_pending = pending
+        if path not in pending:
+            pending.add(path)
+            _get_mutagen()  # Pre-warm mutagen on main thread so worker pool is 100% thread-safe
+            if not hasattr(self, "_mini_cover_sig"):
+                class _CovBridge(QObject):
+                    loaded = Signal(str, object)
+                self._mini_cover_sig = _CovBridge(self)
+                self._mini_cover_sig.loaded.connect(self._on_mini_cover_ready)
+                from concurrent.futures import ThreadPoolExecutor
+                self._mini_cover_pool = ThreadPoolExecutor(max_workers=2)
+            self._mini_cover_pool.submit(lambda p=path, sig=self._mini_cover_sig: sig.loaded.emit(p, _extract_cover_bytes(p)))
+        return None
+
+    def _get_mini_cover(self, path):
+        if not path:
+            return None
+        cache = getattr(self, "_mini_cover_cache", None)
+        if cache is None:
+            cache = {}
+            self._mini_cover_cache = cache
+        folder_key = os.path.dirname(os.path.abspath(path))
+        if folder_key in cache:
+            return cache[folder_key]
+        raw = _extract_cover_bytes(path)
+        pm = None
+        if raw:
+            full = QPixmap()
+            if full.loadFromData(raw):
+                pm = full.scaled(88, 88, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
+        if len(cache) > 250:
+            cache.clear()
+        cache[folder_key] = pm
+        return pm
+
     def _format_track_label(self, track):
         group_idx = self.combo_group.currentIndex() if hasattr(self, "combo_group") else 0
-        if group_idx == 3: # Album
-            return f"{track.get('album', 'Unknown Album')} - {track['title']}"
-        elif group_idx == 2: # Artist
+        t_no = int(track.get('track_no', 0) or 0)
+        if group_idx in (3, 4):
+            num_col = f"{t_no:02d}   " if t_no > 0 else "—    "
+            return f"{num_col}{track['title']} - {track['artist']}"
+        elif group_idx == 2:
             return f"{track['artist']} - {track['title']}"
         return f"{track['title']} - {track['artist']}"
 
@@ -4073,15 +4245,42 @@ class MainWindow(QMainWindow):
         for i in range(self.list_widget.count()):
             item = self.list_widget.item(i)
             track = item.data(Qt.UserRole)
-            if track:
+            if isinstance(track, dict) and not track.get("_is_header"):
                 item.setText(self._format_track_label(track))
 
     def _rebuild_playlist_widget(self, current_path=None):
         self.list_widget.setUpdatesEnabled(False)
         self.list_widget.blockSignals(True)
+        if hasattr(self, '_visible_covers'): self._visible_covers.clear()
         self.list_widget.clear()
         self.current_track_index = -1
+        group_idx = self.combo_group.currentIndex() if hasattr(self, "combo_group") else 0
+        use_headers = group_idx in (3, 4)
+
+        album_counts = {}
+        if use_headers:
+            for t in self.library_tracks:
+                k = (t.get('artist', 'Unknown Artist') if group_idx == 4 else "", t.get('album', 'Unknown Album'))
+                album_counts[k] = album_counts.get(k, 0) + 1
+
+        last_key = None
         for i, track in enumerate(self.library_tracks):
+            if use_headers:
+                art_k = track.get('artist', 'Unknown Artist') if group_idx == 4 else ""
+                alb_k = track.get('album', 'Unknown Album')
+                cur_key = (art_k, alb_k)
+                if cur_key != last_key:
+                    last_key = cur_key
+                    hdr = QListWidgetItem("")
+                    hdr.setFlags(Qt.NoItemFlags)
+                    hdr.setData(Qt.UserRole, {
+                        "_is_header": True,
+                        "artist": track.get('artist', 'Unknown Artist'),
+                        "album": alb_k,
+                        "count": album_counts.get(cur_key, 1),
+                        "sample_path": track.get('path', ''),
+                    })
+                    self.list_widget.addItem(hdr)
             item = QListWidgetItem(self._format_track_label(track))
             item.setData(Qt.UserRole, track)
             self.list_widget.addItem(item)
@@ -4187,6 +4386,372 @@ class MainWindow(QMainWindow):
             return
         super().keyPressEvent(event)
 
+    def _show_track_properties(self, track):
+        path = track.get("path", "")
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Track Properties")
+        dlg.setAttribute(Qt.WA_TranslucentBackground, windows_transparency_enabled())
+        dlg.setAttribute(Qt.WA_NoSystemBackground, True)
+        dlg.setAttribute(Qt.WA_ContentsMarginsRespectsSafeArea, False)
+        dlg.setMinimumSize(500, 580)
+
+        outer = QVBoxLayout(dlg)
+        outer.setContentsMargins(0, 0, 0, 0)
+        root = QFrame(dlg)
+        outer.addWidget(root)
+        lay = QVBoxLayout(root)
+        lay.setContentsMargins(18, 40 if sys.platform == "darwin" else 18, 18, 18)
+        lay.setSpacing(12)
+
+        card = make_glass_card()
+        card_v = QVBoxLayout(card)
+        card_v.setContentsMargins(16, 14, 16, 14)
+        card_v.setSpacing(12)
+
+        raw_cov = _extract_cover_bytes(path)
+        full_pm = QPixmap()
+        has_cov = bool(raw_cov and full_pm.loadFromData(raw_cov) and not full_pm.isNull())
+        if has_cov:
+            from PySide6.QtGui import QPainterPath
+            cov_row = QHBoxLayout()
+            cov_btn = QPushButton()
+            cov_btn.setCursor(Qt.PointingHandCursor)
+            cov_btn.setFixedSize(136, 136)
+            cov_btn.setToolTip(f"Click to view full resolution ({full_pm.width()} × {full_pm.height()} px)")
+            cov_btn.setStyleSheet("padding: 0px; border: 1px solid rgba(255,255,255,45); border-radius: 12px; background: transparent;")
+            thumb = QPixmap(136, 136)
+            thumb.fill(Qt.transparent)
+            pt = QPainter(thumb)
+            pt.setRenderHint(QPainter.Antialiasing, True)
+            cp = QPainterPath()
+            cp.addRoundedRect(0, 0, 136, 136, 11, 11)
+            pt.setClipPath(cp)
+            pt.drawPixmap(0, 0, full_pm.scaled(136, 136, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation))
+            pt.end()
+            cov_btn.setIcon(QIcon(thumb))
+            cov_btn.setIconSize(QSize(136, 136))
+
+            def _open_full_cover(_=False, pm=full_pm):
+                class _CoverInspectDialog(QDialog):
+                    def __init__(self, pix, parent=None):
+                        super().__init__(parent)
+                        self._pix = pix
+                        self._inspect = False
+                        self._held_fs = False
+                        self._norm_geom = None
+                        self._cursor_norm = QPointF(0.5, 0.5)
+                        self.setWindowTitle(f"Cover Art — {pix.width()} × {pix.height()} px (Click: Full Window • Hold Left-Click: Loupe)")
+                        self.setMouseTracking(True)
+                        scr = (parent.window().screen() or QApplication.primaryScreen()).availableGeometry()
+                        max_w, max_h = int(scr.width() * 0.78), int(scr.height() * 0.78)
+                        base = pix if (pix.width() <= max_w and pix.height() <= max_h) else pix.scaled(max_w, max_h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                        self.resize(base.width() + 24, base.height() + 24)
+                        self.setCursor(Qt.CrossCursor)
+
+                    def _target_rect(self):
+                        r = self.rect().adjusted(0, 0, 0, 0) if self._held_fs else self.rect().adjusted(12, 12, -12, -12)
+                        pw, ph = max(1, self._pix.width()), max(1, self._pix.height())
+                        scale = min(r.width() / pw, r.height() / ph)
+                        if not self._held_fs:
+                            scale = min(1.0, scale)
+                        dw, dh = int(round(pw * scale)), int(round(ph * scale))
+                        dx = r.left() + (r.width() - dw) // 2
+                        dy = r.top() + (r.height() - dh) // 2
+                        from PySide6.QtCore import QRect
+                        return QRect(dx, dy, dw, dh)
+
+                    def _toggle_fs(self):
+                        if not self._held_fs:
+                            self._norm_geom = self.geometry()
+                            self._norm_flags = self.windowFlags()
+                            self._held_fs = True
+                            scr = (self.screen() or QApplication.primaryScreen()).availableGeometry()
+                            self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+                            self.setGeometry(scr)
+                        else:
+                            self._held_fs = False
+                            self.setWindowFlags(getattr(self, "_norm_flags", Qt.Dialog))
+                            if self._norm_geom is not None:
+                                self.setGeometry(self._norm_geom)
+                        self.show()
+                        self.raise_()
+                        self.activateWindow()
+                        self.update()
+
+                    def _enable_loupe(self):
+                        if getattr(self, "_btn_down", False):
+                            self._did_hold = True
+                            self._inspect = True
+                            self.setCursor(Qt.BlankCursor)
+                            self.update()
+
+                    def keyPressEvent(self, ev):
+                        if ev.key() == Qt.Key_Escape:
+                            if self._held_fs:
+                                self._toggle_fs()
+                            else:
+                                self.close()
+                            ev.accept()
+                            return
+                        super().keyPressEvent(ev)
+
+                    def mousePressEvent(self, ev):
+                        if ev.button() == Qt.LeftButton:
+                            self._btn_down = True
+                            self._did_hold = False
+                            if not hasattr(self, "_loupe_hold_timer"):
+                                self._loupe_hold_timer = QTimer(self)
+                                self._loupe_hold_timer.setSingleShot(True)
+                                self._loupe_hold_timer.setInterval(180)
+                                self._loupe_hold_timer.timeout.connect(self._enable_loupe)
+                            self._loupe_hold_timer.start()
+                            ev.accept()
+
+                    def mouseDoubleClickEvent(self, ev):
+                        self.mousePressEvent(ev)
+
+                    def mouseReleaseEvent(self, ev):
+                        if ev.button() == Qt.LeftButton:
+                            self._btn_down = False
+                            if hasattr(self, "_loupe_hold_timer"):
+                                self._loupe_hold_timer.stop()
+                            if self._inspect or getattr(self, "_did_hold", False):
+                                self._inspect = False
+                                self.setCursor(Qt.CrossCursor)
+                                self.update()
+                            else:
+                                self._toggle_fs()
+                            ev.accept()
+
+                    def mouseMoveEvent(self, ev):
+                        tr = self._target_rect()
+                        if tr.width() > 0 and tr.height() > 0:
+                            nx = max(0.0, min(1.0, (ev.position().x() - tr.left()) / float(tr.width())))
+                            ny = max(0.0, min(1.0, (ev.position().y() - tr.top()) / float(tr.height())))
+                            self._cursor_norm = QPointF(nx, ny)
+                            if self._inspect:
+                                self.update()
+
+                    def paintEvent(self, ev):
+                        from PySide6.QtGui import QPen
+                        p = QPainter(self)
+                        p.setRenderHint(QPainter.Antialiasing, True)
+                        p.setRenderHint(QPainter.SmoothPixmapTransform, True)
+                        p.fillRect(self.rect(), QColor(8, 10, 14, 250))
+                        tr = self._target_rect()
+                        p.drawPixmap(tr, self._pix)
+                        if self._inspect and tr.width() > 20:
+                            from PySide6.QtCore import QRect
+                            from PySide6.QtGui import QPainterPath
+                            zoom = 2.5
+                            lw = max(160, int(self.width() * 0.72))
+                            lh = max(160, int(self.height() * 0.72))
+                            cx = tr.left() + self._cursor_norm.x() * tr.width()
+                            cy = tr.top() + self._cursor_norm.y() * tr.height()
+                            dst_x = max(0, min(self.width() - lw, int(round(cx - lw * 0.5))))
+                            dst_y = max(0, min(self.height() - lh, int(round(cy - lh * 0.5))))
+                            dst_rect = QRect(dst_x, dst_y, lw, lh)
+                            src_w = (lw / zoom) * (self._pix.width() / float(tr.width()))
+                            src_h = (lh / zoom) * (self._pix.height() / float(tr.height()))
+                            sx = max(0.0, min(self._pix.width() - src_w, self._cursor_norm.x() * self._pix.width() - src_w * 0.5))
+                            sy = max(0.0, min(self._pix.height() - src_h, self._cursor_norm.y() * self._pix.height() - src_h * 0.5))
+                            clip = QPainterPath()
+                            clip.addRoundedRect(dst_rect, 12, 12)
+                            p.setClipPath(clip)
+                            p.drawPixmap(dst_rect, self._pix, QRect(int(sx), int(sy), max(1, int(src_w)), max(1, int(src_h))))
+                            p.setClipping(False)
+                            p.setPen(QPen(QColor(255, 255, 255, 215), 2.0))
+                            p.drawRoundedRect(dst_rect, 12, 12)
+                        p.end()
+
+                viewer = _CoverInspectDialog(pm, dlg)
+                if getattr(self, "_cover_viewer", None) is not None:
+                    try:
+                        self._cover_viewer.close()
+                    except Exception:
+                        pass
+                self._cover_viewer = viewer
+                viewer.setAttribute(Qt.WA_DeleteOnClose, True)
+                viewer.destroyed.connect(lambda: setattr(self, "_cover_viewer", None))
+                viewer.show()
+                viewer.raise_()
+                viewer.activateWindow()
+
+            cov_btn.clicked.connect(_open_full_cover)
+            cov_info = QVBoxLayout()
+            lbl_dim = QLabel(f"Cover Art: {full_pm.width()} × {full_pm.height()} px")
+            lbl_dim.setStyleSheet("font-weight: bold; font-size: 12px;")
+            lbl_hint = QLabel("Click cover to inspect full resolution")
+            lbl_hint.setStyleSheet("font-size: 11px; opacity: 0.72;")
+            cov_info.addStretch()
+            cov_info.addWidget(lbl_dim)
+            cov_info.addWidget(lbl_hint)
+            cov_info.addStretch()
+            cov_row.addWidget(cov_btn)
+            cov_row.addSpacing(12)
+            cov_row.addLayout(cov_info, 1)
+            card_v.addLayout(cov_row)
+
+        g = QGridLayout()
+        card_v.addLayout(g)
+        g.setHorizontalSpacing(14)
+        g.setVerticalSpacing(8)
+        g.setColumnStretch(1, 1)
+
+        codec_str, sr_str, bits_str, br_str, dur_str, size_str = "-", "-", "-", "-", "-", "-"
+        if os.path.exists(path):
+            sz = os.path.getsize(path)
+            size_str = f"{sz / (1024 * 1024):.2f} MB ({sz:,} bytes)"
+            try:
+                cmd = [get_binary_path("ffprobe"), "-v", "quiet", "-print_format", "json", "-show_format", "-show_streams", path]
+                res = subprocess.run(cmd, capture_output=True, text=True, **SUBPROCESS_FLAGS)
+                info = json.loads(res.stdout)
+                st = next((s for s in info.get("streams", []) if s.get("codec_type") == "audio"), {})
+                fmt = info.get("format", {})
+                codec_str = f"{st.get('codec_long_name') or st.get('codec_name', '-')} ({st.get('channels', 2)} ch)"
+                sr_val = int(st.get("sample_rate") or 0)
+                if sr_val:
+                    sr_str = f"{sr_val / 1000.0:g} kHz ({sr_val} Hz)"
+                bps = int(st.get("bits_per_raw_sample") or st.get("bits_per_sample") or 0)
+                bits_str = f"{bps}-bit" if bps > 0 else "32-bit float / lossy"
+                br = int(st.get("bit_rate") or fmt.get("bit_rate") or 0)
+                if br > 0:
+                    br_str = f"{br // 1000} kbps"
+                dur = float(fmt.get("duration") or st.get("duration") or 0.0)
+                if dur > 0:
+                    dur_str = self.format_time(dur)
+            except Exception:
+                pass
+
+        t_no = int(track.get("track_no", 0) or 0)
+        d_no = int(track.get("disc_no", 1) or 1)
+        rows = [
+            ("Title:", track.get("title", "-")),
+            ("Artist:", track.get("artist", "-")),
+            ("Album:", track.get("album", "-")),
+            ("Track / Disc:", f"#{t_no:02d} (Disc {d_no})" if t_no > 0 else f"Disc {d_no}"),
+            ("Duration:", dur_str),
+            ("Codec:", codec_str),
+            ("Sample Rate:", sr_str),
+            ("Bit Depth:", bits_str),
+            ("Bitrate:", br_str),
+            ("File Size:", size_str),
+            ("Location:", path),
+        ]
+        for r_idx, (k, v) in enumerate(rows):
+            kl = QLabel(k)
+            kl.setStyleSheet("font-weight: bold; opacity: 0.78;")
+            vl = QLabel(str(v))
+            vl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            vl.setWordWrap(True)
+            g.addWidget(kl, r_idx, 0, Qt.AlignTop)
+            g.addWidget(vl, r_idx, 1)
+
+        lay.addWidget(card)
+        btn_row = QHBoxLayout()
+        btn_rev = QPushButton("Show in Finder" if sys.platform == "darwin" else "Show in Folder")
+        btn_rev.clicked.connect(lambda: self._reveal_in_folder(path))
+        btn_close = QPushButton("Close")
+        btn_close.clicked.connect(dlg.accept)
+        btn_row.addWidget(btn_rev)
+        btn_row.addStretch()
+        btn_row.addWidget(btn_close)
+        lay.addLayout(btn_row)
+
+        dlg.setStyleSheet(self.styleSheet())
+        if self.current_theme == "liquid_glass" and glass:
+            glass.apply_glass_to_window(dlg)
+        apply_windows_glass(dlg, self.current_theme == "liquid_glass", self.current_theme == "light")
+        apply_seamless_titlebar(dlg)
+        if getattr(self, "_props_dlg", None) is not None:
+            try:
+                self._props_dlg.close()
+            except Exception:
+                pass
+        self._props_dlg = dlg
+        dlg.setAttribute(Qt.WA_DeleteOnClose, True)
+        dlg.destroyed.connect(lambda: setattr(self, "_props_dlg", None))
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+
+    def _reveal_in_folder(self, path):
+        if not path or not os.path.exists(path):
+            QMessageBox.warning(self, "File Not Found", f"Audio file no longer exists on disk:\n{path}")
+            return
+        if sys.platform == "darwin":
+            subprocess.Popen(["open", "-R", path])
+        elif sys.platform == "win32":
+            subprocess.Popen(["explorer", "/select,", os.path.normpath(path)])
+        else:
+            subprocess.Popen(["xdg-open", os.path.dirname(os.path.abspath(path))])
+
+    def _show_playlist_context_menu(self, pos):
+        item = self.list_widget.itemAt(pos)
+        if item is None:
+            return
+        track = item.data(Qt.UserRole)
+        if not isinstance(track, dict) or track.get("_is_header"):
+            return
+        if not item.isSelected():
+            self.list_widget.setCurrentItem(item)
+
+        from PySide6.QtWidgets import QMenu
+        menu = QMenu(self)
+        menu.setAttribute(Qt.WA_TranslucentBackground, True)
+        is_light = getattr(self, "current_theme", "classic") == "light"
+        is_glass = getattr(self, "current_theme", "classic") == "liquid_glass"
+        accent = getattr(self, "current_accent", "#0a84ff")
+        if is_light:
+            bg, fg, brd = "rgba(255, 255, 255, 238)", "#1c1c1e", "rgba(0, 0, 0, 28)"
+            sep = "rgba(0, 0, 0, 22)"
+        elif is_glass:
+            bg, fg, brd = "rgba(24, 28, 38, 225)", "#f5f7fa", "rgba(255, 255, 255, 42)"
+            sep = "rgba(255, 255, 255, 28)"
+        else:
+            bg, fg, brd = "rgba(28, 30, 36, 245)", "#eef2f8", "rgba(255, 255, 255, 24)"
+            sep = "rgba(255, 255, 255, 20)"
+        menu.setStyleSheet(f"""
+            QMenu {{
+                background-color: {bg};
+                color: {fg};
+                border: 1px solid {brd};
+                border-radius: 12px;
+                padding: 6px;
+                font-size: 13px;
+            }}
+            QMenu::item {{
+                padding: 7px 18px 7px 14px;
+                border-radius: 8px;
+                margin: 1px 0px;
+            }}
+            QMenu::item:selected {{
+                background-color: {accent};
+                color: #ffffff;
+            }}
+            QMenu::separator {{
+                height: 1px;
+                background: {sep};
+                margin: 5px 10px;
+            }}
+        """)
+        act_play = menu.addAction("Play Track")
+        reveal_lbl = "Show in Finder" if sys.platform == "darwin" else ("Show in Explorer" if sys.platform == "win32" else "Show in Folder")
+        act_reveal = menu.addAction(reveal_lbl)
+        act_props = menu.addAction("Properties...")
+        menu.addSeparator()
+        act_remove = menu.addAction("Remove from Playlist")
+
+        chosen = menu.exec(self.list_widget.viewport().mapToGlobal(pos))
+        if chosen == act_play:
+            self.play_selected_item(item)
+        elif chosen == act_reveal:
+            self._reveal_in_folder(track.get("path", ""))
+        elif chosen == act_props:
+            self._show_track_properties(track)
+        elif chosen == act_remove:
+            self.remove_selected_tracks()
+
     def remove_selected_tracks(self):
         selected_rows = sorted([self.list_widget.row(item) for item in self.list_widget.selectedItems()], reverse=True)
         if not selected_rows:
@@ -4246,6 +4811,7 @@ class MainWindow(QMainWindow):
                 "group_mode": self.combo_group.currentIndex() if hasattr(self, "combo_group") else 0,
                 "sort_dir": self.btn_sort_dir.isChecked() if hasattr(self, "btn_sort_dir") else False,
                 "current_index": self.current_track_index,
+                "current_path": self.library_tracks[self.current_track_index]["path"] if 0 <= self.current_track_index < len(self.library_tracks) else "",
                 "position_sec": pos_sec,
                 "volume": getattr(self, "_pre_bp_vol", getattr(self, "_pre_live_vol", int(round(self.engine.volume * 100)))) if (self.engine.bit_perfect or self._bp_ramp_timer.isActive() or self.engine.use_mac_tap) else int(round(self.engine.volume * 100)),
                 "shuffle": self.shuffle_enabled,
@@ -4330,7 +4896,7 @@ class MainWindow(QMainWindow):
                 return
 
             saved_custom = [t for t in state.get("custom_tracks", []) if t.get("path")]
-            group_mode = state.get("group_mode", 0)
+            group_mode = state.get("group_mode", 4)
             sort_dir = state.get("sort_dir", False)
             if hasattr(self, "combo_group") and isinstance(group_mode, int) and 0 <= group_mode < self.combo_group.count():
                 self.combo_group.blockSignals(True)
@@ -4348,19 +4914,26 @@ class MainWindow(QMainWindow):
                 self.custom_tracks = saved_custom
                 
             # Only repair a small batch on startup to keep the app fast
-            needs_repair = [t for t in self.library_tracks if 'album' not in t]
+            needs_repair = [t for t in self.library_tracks if 'album' not in t or 'track_no' not in t]
             if needs_repair:
-                self.repair_thread = MetadataRepairThread(needs_repair[:50])
+                self.repair_thread = MetadataRepairThread(needs_repair)
                 self.repair_thread.finished_repair.connect(self.on_repair_finished)
                 self.repair_thread.start()
+            saved_cur_path = state.get("current_path", "")
             idx = state.get("current_index", -1)
+            if saved_cur_path:
+                found_idx = next((i for i, t in enumerate(self.library_tracks) if t.get("path") == saved_cur_path), -1)
+                if found_idx != -1:
+                    idx = found_idx
             pos_sec = float(state.get("position_sec", 0.0))
 
             if 0 <= idx < len(self.library_tracks):
-                item = self.list_widget.item(idx)
-                self.list_widget.setCurrentItem(item)
-                self.current_track_index = idx
                 track = self.library_tracks[idx]
+                item = next((self.list_widget.item(r) for r in range(self.list_widget.count()) if (self.list_widget.item(r).data(Qt.UserRole) or {}).get("path") == track["path"]), None)
+                if item is not None:
+                    self.list_widget.setCurrentItem(item)
+                    self.list_widget.scrollToItem(item, QAbstractItemView.PositionAtCenter)
+                self.current_track_index = idx
                 self.lbl_track_title.setText(track['title'])
                 self.lbl_track_artist.setText(track['artist'])
 
@@ -4483,6 +5056,13 @@ class MainWindow(QMainWindow):
 
 
     def closeEvent(self, event):
+        for attr in ("_cover_viewer", "_props_dlg", "_settings_dlg"):
+            d = getattr(self, attr, None)
+            if d is not None:
+                try:
+                    d.close()
+                except Exception:
+                    pass
         QApplication.instance().removeEventFilter(self)
         self.save_session_state()
         self.engine.stop()
