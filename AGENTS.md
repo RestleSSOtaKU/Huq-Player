@@ -42,7 +42,7 @@
   - `.github/workflows/build-release.yml` compiles `libhuq_tap.dylib`, bundles it via PyInstaller `--add-binary`, and injects `NSAudioCaptureUsageDescription` into `Info.plist`.
 - **Limiter & Bit-Perfect Safeguards (`player_ui/main.py`):**
   - Rust receives `hard_clip=False` so Python sees true unclipped post-HRTF peaks; when `Hard Clip (Exact)` (`not float_mode`) is active, `auto_trim_gain` enforces a `-0.5 dBFS` (`0.94406`) ceiling (`1.015`/block release, instant reset when lowering volume) and displays live attenuation as `Peak: -X.X dB (LIM -Y.Y dB)`.
-  - The peak label uses a fixed reserved width with right alignment and `_set_peak_readout()` eliding; changing between plain, limiter, and clipping text must never raise the spectrum card's minimum width or widen the main window.
+  - The peak label uses a `200px` reserved width with `QSizePolicy.Fixed` (not `Ignored`, which let the layout place it past the card edge), right alignment, and `_set_peak_readout()` eliding; changing between plain, limiter, and clipping text must never raise the spectrum card's minimum width or widen the main window.
   - `Bit-Perfect` uses `RightClickPushButton`: **Left-Click** runs an exact `2.0s` (`80 x 25ms`) RME-style volume ramp to `100%` before locking `bit_perfect=True`; **Right-Click** jumps instantly to `100%`. Temporary `100%` Bit-Perfect / `80%` Live volumes are never persisted to `session.json`.
 
 ## UI & Styling Architecture Rules (`player_ui/`)

@@ -131,7 +131,7 @@
 - The main-window smoke test also toggles the theme eight times with a fake glass module and asserts apply/remove counts stay balanced with no stale `_glass_view`, backdrop scale, or scale filter.
 - A native Cocoa stress test (`QT_QPA_PLATFORM=cocoa`, 12 theme changes with real `pyqt_liquidglass`) passes without a crash. It asserts the `NSGlassEffectView` count is identical on every glass theme and returns to zero on a non-glass theme; panel-glass views and `glass_effect_id` are cleared.
 - Cover-tint probes confirm both window and per-card native tints follow red/blue covers and fall back to the stock preset at zero Ambient Glow; the glass-reapply probe confirms no reapply on resize and one on a real cover change.
-- The peak-layout probe confirms every plain/limiter/clipping readout keeps the label at `220px` and the window's size/minimum hints unchanged.
+- The peak-layout probe confirms every plain/limiter/clipping readout keeps the label at `200px`, inside its card with `QSizePolicy.Fixed`, and leaves the window's size/minimum hints unchanged. `Ignored` was the wrong policy here: it made the row place the label past the card edge, so the readout looked invisible.
 
 ## Still unresolved
 - User visual check after restart: confirm only `Dark` / `Light` appear, each stage keeps its own tuning, Ambient Glow at max is strong enough, Dark rim past the middle is calmer, Dark **cards as well as the window** show native blur, Dark `Native Tint` stops at `52`, the cover/top controls keep their original proportions while the graph is taller, covers fill evenly, and the DSP panel opens at the bottom without squishing anything.

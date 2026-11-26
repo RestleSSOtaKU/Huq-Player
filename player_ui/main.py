@@ -140,7 +140,7 @@ _LIBRARY_BASE_HEIGHT = 760
 # Reserve one stable width for the longest peak/limiter readout. Letting the
 # label grow with its text raised the spectrum card's minimum width and could
 # widen the whole window on hot tracks when auto-trim engaged.
-_PEAK_LABEL_WIDTH = 220
+_PEAK_LABEL_WIDTH = 200
 
 # Panel Scrim starts at 50% (fully transparent) and ends at 100% (full scrim).
 # The lower half of the old 0-255 slider is cut off so the whole track is useful.
@@ -3691,7 +3691,7 @@ class MainWindow(QMainWindow):
         peak_layout.addStretch()
         self.lbl_peak = QLabel("Peak: -inf dB")
         self.lbl_peak.setFixedWidth(_PEAK_LABEL_WIDTH)
-        self.lbl_peak.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.lbl_peak.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Preferred)
         self.lbl_peak.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self.lbl_peak.setToolTip("Post-HRTF peak and active auto-trim attenuation")
         self.lbl_peak.setStyleSheet("color: #34c759; font-weight: bold; font-family: 'Helvetica Neue';")
