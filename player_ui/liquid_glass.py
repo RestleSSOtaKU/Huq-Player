@@ -495,6 +495,42 @@ def set_macos_glass_backdrop_scale(window, scale):
         QTimer.singleShot(delay, attempt)
 
 
+def _cover_tinted_rgb(base, stage, window, strength):
+    """Blend the current cover hue into a native glass tint.
+
+    Dark keeps near-black luminance and Light stays bright; the blend scales
+    with Ambient Glow and falls back to the stock preset at ~0.
+    """
+    owner = getattr(window, "mw", None) or window
+    try:
+        glow = max(0.0, min(1.0,
+                            float(getattr(owner, "ambient_opacity", 1.0))))
+    except Exception:
+        glow = 1.0
+    cover = getattr(owner, "_current_ambient_color", None)
+    if cover is None or glow <= 0.02:
+        return tuple(base)
+    try:
+        if hasattr(cover, "red"):
+            cr, cg, cb = (cover.red() / 255.0,
+                          cover.green() / 255.0,
+                          cover.blue() / 255.0)
+        else:
+            cr, cg, cb = (float(cover[0]) / 255.0,
+                          float(cover[1]) / 255.0,
+                          float(cover[2]) / 255.0)
+        peak = max(cr, cg, cb) or 1.0
+        mix = strength * glow
+        if stage == "light":
+            cover_rgb = tuple(0.72 + 0.28 * (c / peak) for c in (cr, cg, cb))
+        else:
+            cover_rgb = tuple(0.16 * (c / peak) for c in (cr, cg, cb))
+        return tuple((1.0 - mix) * b + mix * c
+                     for b, c in zip(base, cover_rgb))
+    except Exception:
+        return tuple(base)
+
+
 class _PanelGlassFilter(QObject):
     """Keep per-card NSGlassEffectViews aligned with translated Qt widgets."""
 
@@ -683,7 +719,10 @@ def configure_macos_panel_glass(window, theme, enable=True, profile=None,
         use_clear = bool(theme == "macos27_glass"
                          and (not profile or profile.get("style", "clear") == "clear"))
         tint_alpha = GLASS_PANEL_TINT_ALPHA.get(stage, 0.12)
-        tint_rgb = (1.0, 1.0, 1.0) if stage == "light" else (0.03, 0.033, 0.04)
+        panel_base = (1.0, 1.0, 1.0) if stage == "light" else (0.03, 0.033, 0.04)
+        # Cards cover most of the window; a fixed slightly-blue dark preset
+        # left a permanent blue cast at the centre regardless of cover accent.
+        tint_rgb = _cover_tinted_rgb(panel_base, stage, window, 0.30)
 
         for widget in cards:
             rec = known.get(id(widget))
@@ -814,37 +853,7 @@ def configure_macos_glass(window, theme="macos27_glass", enable=True, opacity=No
                 base = ((1.0, 1.0, 1.0) if stage == "light"
                         else profile["tint_rgb"])
                 tint_alpha = profile["tint_alpha"]
-                cover = getattr(owner, "_current_ambient_color", None)
-                glow = max(0.0, min(1.0,
-                                    float(getattr(owner, "ambient_opacity", 1.0))))
-                if cover is not None and glow > 0.02:
-                    try:
-                        if hasattr(cover, "red"):
-                            cr, cg, cb = (cover.red() / 255.0,
-                                          cover.green() / 255.0,
-                                          cover.blue() / 255.0)
-                        else:
-                            cr, cg, cb = (float(cover[0]) / 255.0,
-                                          float(cover[1]) / 255.0,
-                                          float(cover[2]) / 255.0)
-                        peak = max(cr, cg, cb) or 1.0
-                        mix = 0.45 * glow
-                        if stage == "light":
-                            cover_rgb = tuple(
-                                0.72 + 0.28 * (c / peak) for c in (cr, cg, cb)
-                            )
-                        else:
-                            cover_rgb = tuple(
-                                0.16 * (c / peak) for c in (cr, cg, cb)
-                            )
-                        tr, tg, tb = tuple(
-                            (1.0 - mix) * b + mix * c
-                            for b, c in zip(base, cover_rgb)
-                        )
-                    except Exception:
-                        tr, tg, tb = base
-                else:
-                    tr, tg, tb = base
+                tr, tg, tb = _cover_tinted_rgb(base, stage, window, 0.45)
             else:
                 tr = tg = tb = 0.08
                 tint_alpha = 0.0

@@ -137,6 +137,10 @@ THEME_LABELS = {
 
 _DEFAULT_WINDOW_HEIGHT = 880
 _LIBRARY_BASE_HEIGHT = 760
+# Reserve one stable width for the longest peak/limiter readout. Letting the
+# label grow with its text raised the spectrum card's minimum width and could
+# widen the whole window on hot tracks when auto-trim engaged.
+_PEAK_LABEL_WIDTH = 220
 
 # Panel Scrim starts at 50% (fully transparent) and ends at 100% (full scrim).
 # The lower half of the old 0-255 slider is cut off so the whole track is useful.
@@ -3686,6 +3690,10 @@ class MainWindow(QMainWindow):
         
         peak_layout.addStretch()
         self.lbl_peak = QLabel("Peak: -inf dB")
+        self.lbl_peak.setFixedWidth(_PEAK_LABEL_WIDTH)
+        self.lbl_peak.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.lbl_peak.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.lbl_peak.setToolTip("Post-HRTF peak and active auto-trim attenuation")
         self.lbl_peak.setStyleSheet("color: #34c759; font-weight: bold; font-family: 'Helvetica Neue';")
         peak_layout.addWidget(self.lbl_peak)
         
@@ -4598,6 +4606,19 @@ class MainWindow(QMainWindow):
         self._graph_perf_start = now
         self._graph_perf_frames = 0
 
+    def _set_peak_readout(self, text, color):
+        """Keep peak text from changing the spectrum card's minimum width."""
+        fm = self.lbl_peak.fontMetrics()
+        elided = fm.elidedText(text, Qt.ElideRight, _PEAK_LABEL_WIDTH - 4)
+        self.lbl_peak.setText(elided)
+        self.lbl_peak.setToolTip(
+            text if elided != text else
+            "Post-HRTF peak and active auto-trim attenuation"
+        )
+        self.lbl_peak.setStyleSheet(
+            f"color: {color}; font-weight: bold; font-family: 'Helvetica Neue';"
+        )
+
     def update_graph(self):
         try:
             self._track_graph_fps()
@@ -4661,20 +4682,22 @@ class MainWindow(QMainWindow):
             peak_db = 20 * np.log10(peak + 1e-12)
             if peak_db > 0.0:
                 if self.engine.float_mode:
-                    self.lbl_peak.setText(f"Peak: +{peak_db:.1f} dB (32f OVER)")
-                    self.lbl_peak.setStyleSheet("color: #ff9500; font-weight: bold; font-family: 'Helvetica Neue';")
+                    self._set_peak_readout(
+                        f"Peak: +{peak_db:.1f} dB (32f OVER)", "#ff9500"
+                    )
                 else:
-                    self.lbl_peak.setText(f"Peak: +{peak_db:.1f} dB (CLIPPING!)")
-                    self.lbl_peak.setStyleSheet("color: #ff3b30; font-weight: bold; font-family: 'Helvetica Neue';")
+                    self._set_peak_readout(
+                        f"Peak: +{peak_db:.1f} dB (CLIPPING!)", "#ff3b30"
+                    )
             else:
                 trim = getattr(self.engine, "auto_trim_gain", 1.0)
                 if trim < 0.995 and not self.engine.float_mode and not self.engine.bit_perfect:
                     gr_db = 20.0 * np.log10(max(trim, 1e-9))
-                    self.lbl_peak.setText(f"Peak: {peak_db:.1f} dB (LIM {gr_db:.1f} dB)")
-                    self.lbl_peak.setStyleSheet("color: #ff9500; font-weight: bold; font-family: 'Helvetica Neue';")
+                    self._set_peak_readout(
+                        f"Peak: {peak_db:.1f} dB (LIM {gr_db:.1f} dB)", "#ff9500"
+                    )
                 else:
-                    self.lbl_peak.setText(f"Peak: {peak_db:.1f} dB")
-                    self.lbl_peak.setStyleSheet("color: #34c759; font-weight: bold; font-family: 'Helvetica Neue';")
+                    self._set_peak_readout(f"Peak: {peak_db:.1f} dB", "#34c759")
 
             if getattr(self, 'smoothed_in', None) is None:
                 self.smoothed_in = P_in_db
