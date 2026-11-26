@@ -106,7 +106,21 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
 from PySide6.QtCore import Qt, QTimer, Signal, QObject, QThread, QSize, QEvent, QVariantAnimation, QEasingCurve, QPointF
 from PySide6.QtGui import QPixmap, QIcon, QColor, QPainter, QPalette
 from dsp_bridge import RustDspBridge
-from liquid_glass import make_glass_card, sample_ambient_rgb, build_liquid_qss, apply_seamless_titlebar, apply_windows_glass, windows_transparency_enabled, WindowDragFilter
+from liquid_glass import make_glass_card, sample_ambient_rgb, sample_ambient_palette, LavaLampOverlay, build_liquid_qss, apply_seamless_titlebar, apply_windows_glass, windows_transparency_enabled, WindowDragFilter
+from glass_lens import GlassLensOverlay
+
+GLASS_THEMES = ("liquid_glass", "macos27_glass")
+THEME_ORDER = ("classic", "light", "liquid_glass", "macos27_glass")
+THEME_LABELS = {
+    "classic": "Classic",
+    "light": "Light",
+    "liquid_glass": "Glass",
+    "macos27_glass": "Glass macOS 27",
+}
+
+
+def is_glass_theme(theme):
+    return theme in GLASS_THEMES
 
 
 _mac_tap_lib = None
@@ -1490,7 +1504,7 @@ try:
 except ImportError:
     LFM_API_KEY = os.environ.get("LFM_API_KEY", "")
     LFM_API_SECRET = os.environ.get("LFM_API_SECRET", "")
-GITHUB_RELEASES_API = "https://://github.com/repos/RestleSSOtaKU/REXA-Player/releases/latest"
+GITHUB_RELEASES_API = "https://api.github.com/repos/RestleSSOtaKU/REXA-Player/releases/latest"
 
 def _urlopen_resilient(req, timeout=8):
     import urllib.request, urllib.error
@@ -1940,7 +1954,7 @@ class SettingsDialog(QDialog):
         self.setAttribute(Qt.WA_TranslucentBackground, windows_transparency_enabled())
         self.setAttribute(Qt.WA_NoSystemBackground, True)
         self.setAttribute(Qt.WA_ContentsMarginsRespectsSafeArea, False)
-        self.setMinimumSize(540, 695)
+        self.setMinimumSize(540, 735)
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -1965,30 +1979,38 @@ class SettingsDialog(QDialog):
 
         g.addWidget(QLabel("Theme:"), 1, 0)
         self.combo_theme = QComboBox()
-        self.combo_theme.addItems(["Classic", "Light", "Glass"])
+        self.combo_theme.addItems([THEME_LABELS[t] for t in THEME_ORDER])
 
         self.combo_theme.currentIndexChanged.connect(self._on_theme)
         g.addWidget(self.combo_theme, 1, 1)
 
-        g.addWidget(QLabel("Ambient Glow:"), 2, 0)
+        g.addWidget(QLabel("Background:"), 2, 0)
+        self.combo_bg_mode = QComboBox()
+        self.combo_bg_mode.addItems(["Dynamic (Lava Lamp)", "Static"])
+        self.combo_bg_mode.currentIndexChanged.connect(lambda i: self.mw.toggle_dynamic_ambient(i == 0))
+        g.addWidget(self.combo_bg_mode, 2, 1)
+
+        g.addWidget(QLabel("Ambient Glow:"), 3, 0)
         self.s_glow = ResetSlider(30, Qt.Horizontal)
         self.s_glow.setRange(0, 100)
         self.s_glow.valueChanged.connect(mw.update_ambient_opacity)
-        g.addWidget(self.s_glow, 2, 1)
+        g.addWidget(self.s_glow, 3, 1)
 
         self.lbl_trans = QLabel("Glass Opacity:")
-        g.addWidget(self.lbl_trans, 3, 0)
+        self.lbl_trans.setToolTip("Raise to add more tint; lower to let the native macOS glass show through.")
+        g.addWidget(self.lbl_trans, 4, 0)
         self.s_trans = ResetSlider(45, Qt.Horizontal)
         self.s_trans.setRange(0, 100)
+        self.s_trans.setToolTip("Lower = cleaner native glass. Higher = stronger custom tint.")
         self.s_trans.valueChanged.connect(self._on_glass)
-        g.addWidget(self.s_trans, 3, 1)
+        g.addWidget(self.s_trans, 4, 1)
 
         self.lbl_rim = QLabel("Glass Border Rim:")
-        g.addWidget(self.lbl_rim, 4, 0)
+        g.addWidget(self.lbl_rim, 5, 0)
         self.s_rim = ResetSlider(20, Qt.Horizontal)
         self.s_rim.setRange(0, 100)
         self.s_rim.valueChanged.connect(self._on_glass)
-        g.addWidget(self.s_rim, 4, 1)
+        g.addWidget(self.s_rim, 5, 1)
         lay.addWidget(app_card)
 
         perf_card = make_glass_card()
@@ -2178,9 +2200,12 @@ class SettingsDialog(QDialog):
             self.lbl_scrob_status.setText(msg[:72])
 
     def sync_from_main(self):
-        idx_map = {"classic": 0, "light": 1, "liquid_glass": 2}
+        idx_map = {t: i for i, t in enumerate(THEME_ORDER)}
         self.combo_theme.blockSignals(True)
         self.combo_theme.setCurrentIndex(idx_map.get(self.mw.current_theme, 0))
+        self.combo_bg_mode.blockSignals(True)
+        self.combo_bg_mode.setCurrentIndex(0 if getattr(self.mw, 'dynamic_ambient', True) else 1)
+        self.combo_bg_mode.blockSignals(False)
         self.combo_theme.blockSignals(False)
         for s, val in ((self.s_glow, int(self.mw.ambient_opacity * 100)),
                        (self.s_trans, self.mw.glass_clarity),
@@ -2205,8 +2230,8 @@ class SettingsDialog(QDialog):
         self.lbl_scrob_max.setText(f"{ms // 60:02d}:{ms % 60:02d}")
         if cfg.get("lfm_sk"):
             self.lbl_scrob_status.setText(f"Connected as {cfg.get('lfm_user') or 'Last.fm user'}")
-        is_g = self.mw.current_theme == "liquid_glass"
-        self.s_glow.default_value = 100 if is_g else (20 if self.mw.current_theme == "classic" else 30)
+        is_g = is_glass_theme(self.mw.current_theme)
+        self.s_glow.default_value = 30 if is_g else (20 if self.mw.current_theme == "classic" else 30)
         self.lbl_trans.setEnabled(is_g)
         self.lbl_rim.setEnabled(is_g)
         self.s_trans.setEnabled(is_g)
@@ -2230,10 +2255,10 @@ class SettingsDialog(QDialog):
         self.setStyleSheet(self.mw.styleSheet())
 
     def _on_theme(self, idx):
-        targets = ["classic", "light", "liquid_glass"]
+        targets = list(THEME_ORDER)
         target = targets[idx]
         if self.mw.current_theme != target:
-            self.mw.current_theme = targets[(idx - 1) % 3]
+            self.mw.current_theme = targets[(idx - 1) % len(targets)]
             self.mw.toggle_theme()
         self.sync_from_main()
 
@@ -2314,11 +2339,12 @@ class MainWindow(QMainWindow):
         self.current_theme = "liquid_glass"
         self.glass_effect_id = None
         self.current_accent, self.current_accent_end = "#0a84ff", "#64d2ff"
-        self.theme_glow = {"classic": 0.20, "light": 0.30, "liquid_glass": 1.00}
+        self.theme_glow = {"classic": 0.20, "light": 0.30, "liquid_glass": 1.00, "macos27_glass": 1.00}
         self.ambient_opacity = self.theme_glow["liquid_glass"]
         self.glass_clarity = 45
         self.glass_rim = 20
         self.spectrum_fill_enabled = True
+        self.dynamic_ambient = True
         self.scrobble_cfg = {"lfm_enabled": False, "lfm_api_key": "", "lfm_api_secret": "", "lfm_user": "", "lfm_sk": ""}
         self._current_meta = {}
         self._scrobble_sent = False
@@ -2337,6 +2363,7 @@ class MainWindow(QMainWindow):
     def _on_glass_tuned(self, _=None):
         self.glass_clarity = self.slider_glass_clarity.value()
         self.glass_rim = self.slider_glass_rim.value()
+        if hasattr(self, 'lava_overlay'): self.lava_overlay.sync_active()
         self._on_ambient_color_changed(self._current_ambient_color)
         self.save_session_state()
 
@@ -2348,6 +2375,12 @@ class MainWindow(QMainWindow):
         self._settings_dlg.raise_()
         self._settings_dlg.activateWindow()
 
+    def toggle_dynamic_ambient(self, enabled):
+        self.dynamic_ambient = bool(enabled)
+        if hasattr(self, "lava_overlay"):
+            self.lava_overlay.sync_active()
+        self.save_session_state()
+
     def update_ambient_opacity(self, val):
         self.ambient_opacity = val / 100.0
         self.theme_glow[self.current_theme] = self.ambient_opacity
@@ -2356,7 +2389,7 @@ class MainWindow(QMainWindow):
 
     def _update_graph_theme(self):
         is_light = getattr(self, "current_theme", "classic") == "light"
-        is_glass = getattr(self, "current_theme", "classic") == "liquid_glass"
+        is_glass = is_glass_theme(getattr(self, "current_theme", "classic"))
         axis_color = '#1c1c1e' if is_light else '#eef2f8'
         if is_glass: axis_color = '#ffffff'
         
@@ -2431,20 +2464,18 @@ class MainWindow(QMainWindow):
         return accent_hex, accent_end_hex
 
     def toggle_theme(self):
-        if self.current_theme == "classic":
-            self.current_theme = "light"
-        elif self.current_theme == "light":
-            self.current_theme = "liquid_glass"
-        else:
-            self.current_theme = "classic"
+        try:
+            idx = THEME_ORDER.index(self.current_theme)
+        except ValueError:
+            idx = -1
+        self.current_theme = THEME_ORDER[(idx + 1) % len(THEME_ORDER)]
 
-        self.ambient_opacity = self.theme_glow.get(self.current_theme, 1.0 if self.current_theme == "liquid_glass" else (0.20 if self.current_theme == "classic" else 0.30))
-        theme_names = {"classic": "Classic", "light": "Light", "liquid_glass": "Glass"}
-        if hasattr(self, "btn_theme"): self.btn_theme.setText(f"Theme: {theme_names[self.current_theme]}")
+        self.ambient_opacity = self.theme_glow.get(self.current_theme, 1.0 if is_glass_theme(self.current_theme) else (0.20 if self.current_theme == "classic" else 0.30))
+        if hasattr(self, "btn_theme"): self.btn_theme.setText(f"Theme: {THEME_LABELS[self.current_theme]}")
         if hasattr(self, "glass_tune_row"):
-            self.glass_tune_row.setVisible(self.current_theme == "liquid_glass")
+            self.glass_tune_row.setVisible(is_glass_theme(self.current_theme))
 
-        if self.current_theme == "liquid_glass":
+        if is_glass_theme(self.current_theme):
             if glass and getattr(self, "glass_effect_id", None) is None:
                 self.glass_effect_id = glass.apply_glass_to_window(self)
             apply_windows_glass(self, True, False)
@@ -2474,6 +2505,8 @@ class MainWindow(QMainWindow):
         ))
         
         # Force layout recalculation and repaint
+        if hasattr(self, 'lava_overlay'): self.lava_overlay.sync_active()
+        if hasattr(self, 'glass_lens'): self.glass_lens.sync_active()
         self.centralWidget().layout().activate()
         self.update()
         self.repaint()
@@ -2680,6 +2713,7 @@ class MainWindow(QMainWindow):
         self.engine.low_end_mode = low
         if hasattr(self, "btn_cpu_mode"): self.btn_cpu_mode.setText("CPU: Low-End" if low else "CPU: Full Quality")
         self.combo_fps.setCurrentIndex(0 if low else 3)
+        if hasattr(self, 'lava_overlay'): self.lava_overlay.sync_active()
         if self.engine.sofa_data is not None:
             self.engine._update_hrirs()
         self.save_session_state()
@@ -2717,6 +2751,8 @@ class MainWindow(QMainWindow):
         central = QWidget()
         central.setObjectName("centralWidget")
         self.setCentralWidget(central)
+        self.lava_overlay = LavaLampOverlay(self, central)
+        self.lava_overlay.lower()
         main_layout = QHBoxLayout(central)
         main_layout.setSpacing(10)
         main_layout.setContentsMargins(20, 40 if sys.platform == 'darwin' else 20, 20, 20)
@@ -2848,6 +2884,8 @@ class MainWindow(QMainWindow):
         self.lbl_cover = QLabel()
         self.lbl_cover.setFixedSize(120, 120)
         self.lbl_cover.setStyleSheet("background-color: rgba(0,0,0,90); border: 1px solid rgba(255,255,255,45); border-radius: 12px;")
+        self.glass_lens = GlassLensOverlay(self, self.lbl_cover)
+        self.glass_lens.sync_active()
         
         track_text_layout = QVBoxLayout()
         self.lbl_track_title = MarqueeLabel("No Track Playing")
@@ -4024,6 +4062,9 @@ class MainWindow(QMainWindow):
         visible = bool(checked)
         self.dsp_panel.setVisible(visible)
         self.btn_toggle_dsp_panel.setText("DSP Controls ▲" if visible else "DSP Controls ▼")
+        if hasattr(self, "lava_overlay") and self.centralWidget():
+            self.lava_overlay.setGeometry(self.centralWidget().rect())
+            self.lava_overlay.lower()
         if hasattr(self, "lbl_cover"):
             self.update_cover_art_size()
         if hasattr(self, 'save_session_state'):
@@ -4205,7 +4246,7 @@ class MainWindow(QMainWindow):
             pending.discard(path)
         if hasattr(self, "list_widget") and not getattr(self, "_cover_repaint_queued", False):
             self._cover_repaint_queued = True
-            QTimer.singleShot(25, self._flush_cover_repaint)
+            QTimer.singleShot(12, self._flush_cover_repaint)
 
     def _flush_cover_repaint(self):
         self._cover_repaint_queued = False
@@ -4220,9 +4261,28 @@ class MainWindow(QMainWindow):
         if pending is None:
             pending = set()
             self._mini_cover_pending = pending
-        # Take only the 18 most recently requested visible items and drop stale scroll-by items
-        batch = list(q)[-18:]
+
+        # Prioritize strictly what is currently visible in the viewport right now
+        visible_paths = []
+        if hasattr(self, "list_widget"):
+            vp = self.list_widget.viewport().rect()
+            top_idx = self.list_widget.indexAt(vp.topLeft())
+            bot_idx = self.list_widget.indexAt(vp.bottomLeft())
+            r0 = max(0, top_idx.row() if top_idx.isValid() else 0)
+            r1 = min(self.list_widget.count() - 1, (bot_idx.row() if bot_idx.isValid() else r0 + 25) + 2)
+            for r in range(r0, r1 + 1):
+                it = self.list_widget.item(r)
+                if it is None or it.isHidden():
+                    continue
+                d = it.data(Qt.UserRole)
+                if isinstance(d, dict):
+                    p = d.get("sample_path") if d.get("_is_header") else d.get("path")
+                    if p and p not in visible_paths:
+                        visible_paths.append(p)
+
+        batch = visible_paths if visible_paths else list(q)[-14:]
         q.clear()
+
         def _decode_job(p, sig):
             from PySide6.QtGui import QImage
             raw = _extract_cover_bytes(p)
@@ -4230,9 +4290,10 @@ class MainWindow(QMainWindow):
             if raw:
                 src_img = QImage()
                 if src_img.loadFromData(raw) and not src_img.isNull():
-                    img = src_img.scaled(140, 140, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
+                    img = src_img.scaled(88, 88, Qt.KeepAspectRatioByExpanding, Qt.FastTransformation)
             sig.loaded.emit(p, img)
-        for p in batch:
+
+        for p in batch[:16]:
             if p not in pending and p not in getattr(self, "_visible_covers", {}):
                 pending.add(p)
                 self._mini_cover_pool.submit(_decode_job, p, self._mini_cover_sig)
@@ -4256,11 +4317,11 @@ class MainWindow(QMainWindow):
             self._mini_cover_sig = _CovBridge(self)
             self._mini_cover_sig.loaded.connect(self._on_mini_cover_ready)
             from concurrent.futures import ThreadPoolExecutor
-            self._mini_cover_pool = ThreadPoolExecutor(max_workers=1)
+            self._mini_cover_pool = ThreadPoolExecutor(max_workers=2)
             self._mini_cover_queue = []
             self._mini_cover_debounce = QTimer(self)
             self._mini_cover_debounce.setSingleShot(True)
-            self._mini_cover_debounce.setInterval(55)
+            self._mini_cover_debounce.setInterval(20)
             self._mini_cover_debounce.timeout.connect(self._flush_queued_covers)
         q = self._mini_cover_queue
         if path not in q:
@@ -4719,9 +4780,9 @@ class MainWindow(QMainWindow):
         lay.addLayout(btn_row)
 
         dlg.setStyleSheet(self.styleSheet())
-        if self.current_theme == "liquid_glass" and glass:
+        if is_glass_theme(self.current_theme) and glass:
             glass.apply_glass_to_window(dlg)
-        apply_windows_glass(dlg, self.current_theme == "liquid_glass", self.current_theme == "light")
+        apply_windows_glass(dlg, is_glass_theme(self.current_theme), self.current_theme == "light")
         apply_seamless_titlebar(dlg)
         if getattr(self, "_props_dlg", None) is not None:
             try:
@@ -4760,7 +4821,7 @@ class MainWindow(QMainWindow):
         menu = QMenu(self)
         menu.setAttribute(Qt.WA_TranslucentBackground, True)
         is_light = getattr(self, "current_theme", "classic") == "light"
-        is_glass = getattr(self, "current_theme", "classic") == "liquid_glass"
+        is_glass = is_glass_theme(getattr(self, "current_theme", "classic"))
         accent = getattr(self, "current_accent", "#0a84ff")
         if is_light:
             bg, fg, brd = "rgba(255, 255, 255, 238)", "#1c1c1e", "rgba(0, 0, 0, 28)"
@@ -4846,6 +4907,8 @@ class MainWindow(QMainWindow):
             self.lbl_track_artist.setText("Unknown Artist")
             self._raw_cover_pixmap = None
             self.lbl_cover.clear()
+            if hasattr(self, "glass_lens"):
+                self.glass_lens.set_source(None)
             self.slider_seek.setValue(0)
             self.lbl_time_current.setText("00:00")
             self.lbl_time_total.setText("00:00")
@@ -4879,11 +4942,12 @@ class MainWindow(QMainWindow):
                 "stereo_scope_open": self.btn_stereo_scope.isChecked() if hasattr(self, "btn_stereo_scope") else False,
                 "theme": getattr(self, "current_theme", "liquid_glass"),
                 "ambient_opacity": getattr(self, "ambient_opacity", 0.30),
-                "theme_glow": getattr(self, "theme_glow", {"classic": 0.20, "light": 0.30, "liquid_glass": 1.00}),
+                "theme_glow": getattr(self, "theme_glow", {"classic": 0.20, "light": 0.30, "liquid_glass": 1.00, "macos27_glass": 1.00}),
                 "glass_clarity": getattr(self, "glass_clarity", 45),
                 "glass_rim": getattr(self, "glass_rim", 20),
                 "low_end_mode": self.engine.low_end_mode,
                 "spectrum_fill": getattr(self, "spectrum_fill_enabled", True),
+                "dynamic_ambient": getattr(self, "dynamic_ambient", True),
                 "scrobble_cfg": getattr(self, "scrobble_cfg", {}),
                 "sofa_path": self.engine.sofa_path if (self.engine.sofa_path and os.path.exists(self.engine.sofa_path) and os.path.abspath(self.engine.sofa_path) != os.path.abspath(get_resource_path("default.sofa"))) else "",
             }
@@ -4911,6 +4975,7 @@ class MainWindow(QMainWindow):
             if isinstance(state.get("scrobble_cfg"), dict):
                 self.scrobble_cfg.update(state["scrobble_cfg"])
             self.toggle_spectrum_fill(bool(state.get("spectrum_fill", True)))
+            self.toggle_dynamic_ambient(bool(state.get("dynamic_ambient", True)))
             low = bool(state.get("low_end_mode", False))
             self.engine.low_end_mode = low
             if hasattr(self, "btn_cpu_mode"):
@@ -4924,7 +4989,7 @@ class MainWindow(QMainWindow):
             saved_glow = state.get("theme_glow")
             if isinstance(saved_glow, dict):
                 self.theme_glow.update({k: float(v) for k, v in saved_glow.items() if k in self.theme_glow})
-            self.ambient_opacity = self.theme_glow.get(theme, float(state.get("ambient_opacity", 1.0 if theme == "liquid_glass" else 0.30)))
+            self.ambient_opacity = self.theme_glow.get(theme, float(state.get("ambient_opacity", 1.0 if is_glass_theme(theme) else 0.30)))
             self.glass_clarity = int(state.get("glass_clarity", 45))
             self.glass_rim = int(state.get("glass_rim", 20))
             if hasattr(self, "slider_glass_clarity"):
@@ -4934,9 +4999,8 @@ class MainWindow(QMainWindow):
                 self.slider_glow.blockSignals(True)
                 self.slider_glow.setValue(int(self.ambient_opacity * 100))
                 self.slider_glow.blockSignals(False)
-            if theme in ("classic", "light", "liquid_glass") and self.current_theme != theme:
-                order = ["classic", "light", "liquid_glass"]
-                self.current_theme = order[(order.index(theme) - 1) % 3]
+            if theme in THEME_ORDER and self.current_theme != theme:
+                self.current_theme = THEME_ORDER[(THEME_ORDER.index(theme) - 1) % len(THEME_ORDER)]
                 self.toggle_theme()
             panel_open = bool(state.get("dsp_panel_open", False))
             self.btn_toggle_dsp_panel.setChecked(panel_open)
@@ -5049,6 +5113,8 @@ class MainWindow(QMainWindow):
         if getattr(self, "_last_cover_render_key", None) != render_key:
             self._last_cover_render_key = render_key
             r, g, b = sample_ambient_rgb(raw)
+            if hasattr(self, "lava_overlay"):
+                self.lava_overlay.set_palette(sample_ambient_palette(raw))
             
             target_color = QColor(r, g, b)
             self.current_accent, self.current_accent_end = self._get_accent_color(r, g, b)
@@ -5083,6 +5149,11 @@ class MainWindow(QMainWindow):
                     raw.scaled(stepped_size, stepped_size, Qt.KeepAspectRatioByExpanding, Qt.FastTransformation if getattr(self, '_is_resizing', False) else Qt.SmoothTransformation)
                 )
 
+        if hasattr(self, "glass_lens"):
+            self.glass_lens.sync_geometry()
+            self.glass_lens.set_source(self.lbl_cover.pixmap())
+            self.glass_lens.sync_active()
+
         scale = max(1.0, min(1.5, h / 820.0))
         title_px = int(round(18 * scale))
         if getattr(self, "_last_title_px", None) == title_px:
@@ -5111,6 +5182,9 @@ class MainWindow(QMainWindow):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        if hasattr(self, "lava_overlay") and self.centralWidget():
+            self.lava_overlay.setGeometry(self.centralWidget().rect())
+            self.lava_overlay.lower()
         if hasattr(self, "lbl_cover"):
             self.update_cover_art_size()
 
@@ -5141,14 +5215,14 @@ if __name__ == "__main__":
     window._drag_filter = WindowDragFilter(window)
     app.installEventFilter(window._drag_filter)
     window.show()
-    if window.current_theme == "liquid_glass":
+    if is_glass_theme(window.current_theme):
         if glass and getattr(window, "glass_effect_id", None) is None:
             window.glass_effect_id = glass.apply_glass_to_window(window)
         apply_windows_glass(window, True, False)
         c = window._current_ambient_color
         window.setStyleSheet(build_liquid_qss(
             c.red(), c.green(), c.blue(),
-            theme="liquid_glass",
+            theme=window.current_theme,
             ambient_opacity=window.ambient_opacity,
             accent=window.current_accent,
             accent_end=window.current_accent_end,

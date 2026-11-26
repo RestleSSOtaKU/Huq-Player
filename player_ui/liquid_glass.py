@@ -153,28 +153,46 @@ def build_liquid_qss(r=26, g=36, b=58, glass_pct=50, theme="classic", ambient_op
     except:
         btn_text = "#ffffff"
     
-    if theme == "liquid_glass":
+    if theme in ("liquid_glass", "macos27_glass"):
+        is_m27 = theme == "macos27_glass"
         text_color = "#ffffff"
-        secondary_text = "rgba(255, 255, 255, 190)"
+        secondary_text = "rgba(255, 255, 255, 220)" if is_m27 else "rgba(255, 255, 255, 190)"
         c_f = max(0.0, min(1.0, glass_clarity / 100.0))
         r_f = max(0.0, min(1.0, glass_rim / 100.0))
 
-        card_a = int(14 + 95 * c_f)
-        rim_a = int(24 + 76 * r_f)
-        btn_a = int(16 + 24 * r_f)
+        # The native NSGlassEffectView / DWM acrylic is the actual glass.
+        # QSS only adds a thin veil and rim so the backdrop stays visible
+        # instead of being buried under an opaque dark gradient.
+        if is_m27:
+            card_a = int(10 + 26 * c_f)
+            rim_a = int(28 + 58 * r_f)
+            btn_a = int(8 + 16 * r_f)
+            card_bg = f"rgba(255, 255, 255, {card_a})"
+            list_bg = f"rgba(0, 0, 0, {int(8 + 24 * c_f)})"
+            input_bg = f"rgba(255, 255, 255, {int(8 + 14 * r_f)})"
+            tint_a = int(2 + 18 * ambient_opacity)
+            base_a = int(2 + 16 * c_f)
+            mid_rgb, low_rgb = "16, 19, 28", "8, 10, 16"
+            set_mid, set_low = "18, 21, 30", "10, 12, 18"
+        else:
+            card_a = int(12 + 70 * c_f)
+            rim_a = int(24 + 70 * r_f)
+            btn_a = int(14 + 22 * r_f)
+            card_bg = f"rgba(255, 255, 255, {card_a})"
+            list_bg = f"rgba(0, 0, 0, {int(12 + 52 * c_f)})"
+            input_bg = f"rgba(255, 255, 255, {int(12 + 18 * r_f)})"
+            tint_a = int(5 + 48 * ambient_opacity)
+            base_a = int(6 + 82 * c_f)
+            mid_rgb, low_rgb = "14, 16, 24", "8, 10, 16"
+            set_mid, set_low = "16, 18, 26", "10, 12, 18"
 
-        card_bg = f"rgba(24, 26, 34, {card_a})"
         card_hi = f"rgba(255, 255, 255, {rim_a})"
-        card_lo = f"rgba(255, 255, 255, {rim_a})"
-        list_bg = f"rgba(14, 16, 22, {int(18 + 90 * c_f)})"
-        input_bg = f"rgba(255, 255, 255, {int(14 + 20 * r_f)})"
+        card_lo = card_hi
         btn_bg = f"rgba(255, 255, 255, {btn_a})"
-        slider_bg = "rgba(255, 255, 255, 50)"
+        slider_bg = "rgba(255, 255, 255, 46)"
         slider_handle = "#ffffff"
-        tint_a = int(8 + 75 * ambient_opacity)
-        base_a = int(12 + 150 * c_f)
-        bg_gradient = f"qradialgradient(cx:0.28, cy:0.18, radius:1.4, stop:0 rgba({r},{g},{b},{tint_a}), stop:0.55 rgba(14,16,24,{base_a}), stop:1 rgba(8,10,16,{base_a}))"
-        settings_bg = f"qlineargradient(x1:1, y1:0.9, x2:0, y2:0, stop:0 rgba({r},{g},{b},{int(tint_a*0.85)}), stop:0.45 rgba(16,18,26,{base_a}), stop:1 rgba(10,12,18,{base_a}))"
+        bg_gradient = f"qradialgradient(cx:0.28, cy:0.18, radius:1.4, stop:0 rgba({r},{g},{b},{tint_a}), stop:0.55 rgba({mid_rgb},{base_a}), stop:1 rgba({low_rgb},{base_a}))"
+        settings_bg = f"qlineargradient(x1:1, y1:0.9, x2:0, y2:0, stop:0 rgba({r},{g},{b},{int(tint_a*0.85)}), stop:0.45 rgba({set_mid},{base_a}), stop:1 rgba({set_low},{base_a}))"
     
     elif theme == "light":
         import colorsys
@@ -233,7 +251,7 @@ def build_liquid_qss(r=26, g=36, b=58, glass_pct=50, theme="classic", ambient_op
     QLineEdit, QComboBox, QSpinBox {{ background-color: {input_bg}; color: {text_color}; border: 1px solid {card_lo}; border-radius: 9px; padding: 5px 10px; }}
     QComboBox {{ combobox-popup: 0; }}
     QComboBox QAbstractItemView {{
-        background-color: {'#ffffff' if theme=='light' else ('rgba(22, 25, 34, 236)' if theme=='liquid_glass' else '#1d212b')}; color: {text_color}; border: 1px solid {card_hi}; border-radius: 10px; padding: 4px; outline: none;
+        background-color: {'#ffffff' if theme=='light' else ('rgba(22, 25, 34, 236)' if theme in ('liquid_glass', 'macos27_glass') else '#1d212b')}; color: {text_color}; border: 1px solid {card_hi}; border-radius: 10px; padding: 4px; outline: none;
     }}
     QComboBox QAbstractItemView::item {{ padding: 3px 8px; border-radius: 5px; margin: 1px 2px; min-height: 14px; font-size: 12px; }}
     QComboBox QAbstractItemView::item:selected {{ background-color: {accent}; color: {btn_text}; }}
@@ -356,3 +374,115 @@ class WindowDragFilter(QObject):
         elif t == QEvent.MouseButtonRelease:
             self._press_pos = None
         return False
+
+def sample_ambient_palette(pixmap):
+    r, g, b = sample_ambient_rgb(pixmap)
+    import colorsys
+    h, l, s = colorsys.rgb_to_hls(r / 255.0, g / 255.0, b / 255.0)
+    s = max(0.38, min(0.85, s * 1.25))
+    l = max(0.32, min(0.58, l))
+    c1 = tuple(int(round(v * 255)) for v in colorsys.hls_to_rgb(h, l, s))
+    c2 = tuple(int(round(v * 255)) for v in colorsys.hls_to_rgb((h + 0.08) % 1.0, min(0.65, l + 0.07), s))
+    c3 = tuple(int(round(v * 255)) for v in colorsys.hls_to_rgb((h - 0.09) % 1.0, max(0.28, l - 0.05), min(0.9, s * 1.1)))
+    return [c1, c2, c3]
+
+
+from PySide6.QtWidgets import QWidget
+from PySide6.QtCore import QTimer
+
+class LavaLampOverlay(QWidget):
+    def __init__(self, mw, parent=None):
+        super().__init__(parent)
+        self.mw = mw
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WA_NoSystemBackground, True)
+        self._phase = 0.0
+        self._palette = [(26, 86, 180), (96, 52, 175), (18, 128, 155)]
+        self._timer = QTimer(self)
+        self._timer.setInterval(50)  # Smooth 20 FPS slow drift
+        self._timer.timeout.connect(self._tick)
+
+    def set_palette(self, colors):
+        if colors and len(colors) >= 3:
+            self._palette = list(colors[:3])
+            self.update()
+
+    def sync_active(self):
+        theme = getattr(self.mw, "current_theme", "classic")
+        glow = float(getattr(self.mw, "ambient_opacity", 0.3))
+        dyn = bool(getattr(self.mw, "dynamic_ambient", True))
+        low_cpu = bool(getattr(getattr(self.mw, "engine", None), "low_end_mode", False))
+        show = dyn and theme in ("classic", "light", "liquid_glass", "macos27_glass") and glow > 0.01
+        active = show and not low_cpu
+        self.setVisible(show)
+        if active and not self._timer.isActive():
+            self._timer.start()
+        elif not active and self._timer.isActive():
+            self._timer.stop()
+        self.update()
+
+    def _tick(self):
+        if not self.isVisible() or self.window().isMinimized():
+            return
+        self._phase += 0.012
+        self.update()
+
+    def paintEvent(self, event):
+        from PySide6.QtGui import QPainter, QImage, QPixmap
+        from PySide6.QtCore import Qt
+        import math, numpy as np
+        theme = getattr(self.mw, "current_theme", "classic")
+        if theme not in ("classic", "light", "liquid_glass", "macos27_glass"):
+            return
+        glow = max(0.0, min(1.0, float(getattr(self.mw, "ambient_opacity", 0.3))))
+        if glow <= 0.01 or self.width() < 16 or self.height() < 16:
+            return
+
+        gw, gh = 320, 200
+        if not hasattr(self, "_grid_xy"):
+            xs = np.linspace(0.0, 1.0, gw, dtype=np.float32)[None, :]
+            ys = np.linspace(0.0, 1.0, gh, dtype=np.float32)[:, None]
+            # Large 512x512 non-repeating 1-LSB micro-grain tile (zero wallpaper pattern)
+            rng = np.random.default_rng(1337)
+            tile_arr = np.zeros((512, 512, 4), dtype=np.uint8)
+            n = rng.integers(-1, 2, size=(512, 512), dtype=np.int16)
+            tile_arr[:, :, :3] = np.where(n[:, :, None] > 0, 2, 0)
+            tile_arr[:, :, 3] = np.where(n != 0, 2, 0)
+            t_img = QImage(tile_arr.data, 512, 512, 512 * 4, QImage.Format_RGBA8888_Premultiplied).copy()
+            self._grid_xy = (xs, ys, QPixmap.fromImage(t_img))
+        xs, ys, dither_tile = self._grid_xy
+
+        is_light = theme == "light"
+        peak_a = (0.05 if theme == "macos27_glass" else (0.12 if theme == "liquid_glass" else (0.36 if is_light else 0.44))) * glow
+        t = self._phase
+        p0, p1, p2 = self._palette[0], self._palette[1], self._palette[2]
+        orbs = (
+            (0.28 + 0.22 * math.sin(t * 0.7), 0.30 + 0.20 * math.cos(t * 0.5), 0.24, p0),
+            (0.72 + 0.20 * math.cos(t * 0.6), 0.65 + 0.22 * math.sin(t * 0.8), 0.28, p1),
+            (0.50 + 0.25 * math.sin(t * 0.4 + 1.4), 0.48 + 0.24 * math.cos(t * 0.65 + 0.8), 0.22, p2),
+        )
+
+        # True premultiplied alpha blending so overlapping orbs never create moire/floral shapes
+        acc_rgb = np.zeros((gh, gw, 3), dtype=np.float32)
+        rem_a = np.ones((gh, gw), dtype=np.float32)
+        for ox, oy, inv_var, (cr, cg, cb) in orbs:
+            dx = xs - np.float32(ox)
+            dy = (ys - np.float32(oy)) * np.float32(0.75)
+            w_orb = np.exp(-(dx * dx + dy * dy) / np.float32(inv_var)) * np.float32(peak_a)
+            contrib = w_orb * rem_a
+            acc_rgb[:, :, 0] += contrib * np.float32(cr)
+            acc_rgb[:, :, 1] += contrib * np.float32(cg)
+            acc_rgb[:, :, 2] += contrib * np.float32(cb)
+            rem_a *= (np.float32(1.0) - w_orb)
+
+        total_a = np.clip(np.float32(1.0) - rem_a, 0.0, 1.0)
+        rgba = np.empty((gh, gw, 4), dtype=np.uint8)
+        rgba[:, :, :3] = np.clip(acc_rgb, 0.0, 255.0).astype(np.uint8)
+        rgba[:, :, 3] = np.clip(total_a * np.float32(255.0), 0.0, 255.0).astype(np.uint8)
+
+        img = QImage(rgba.data, gw, gh, gw * 4, QImage.Format_RGBA8888_Premultiplied)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        p.drawImage(self.rect(), img)
+        p.drawTiledPixmap(self.rect(), dither_tile)
+        p.end()

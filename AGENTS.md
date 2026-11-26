@@ -22,8 +22,10 @@
   - `HRIR Only (Raw)` is computed directly in the frequency domain from `P_in * (|H_LL_raw|^2 + |H_RL_raw|^2)` (and equals `P_in_db` when bypassed) so it stays phase-locked with zero ring-buffer seam jumps.
 
 # Git & Release Workflow
+- **NEVER push to GitHub unless the user explicitly says it can be pushed** (e.g. “you can push now”, “push it”, “it can be pushed”). Local commits are allowed; `git push`, pushing tags, and opening PRs require explicit approval every time. If unsure, do not push.
 - Pushing tags matching `v*` (currently `v0.3.5`) triggers `.github/workflows/build-release.yml` to build Windows (`REXA-Windows.zip`) and macOS Apple Silicon (`REXA-macOS-AppleSilicon.dmg`) releases titled `REXA vX.Y.Z`.
 - When sharing terminal patches for `player_ui/main.py`, keep scripts compact (under ~60 lines) or split into two parts so they fit cleanly in terminal paste buffers.
+- See `docs/LIQUID_GLASS_HANDOFF.md` for the current liquid-glass / `Glass macOS 27` work state and exact local-only commit commands.
 
 # Planned Roadmap
 - Refactor into a modular single-repo architecture: `anechoic_core/` (Rust DSP), `anechoic_engine/` (shared Python audio/SOFA bridge), and `editions/` (hot-swappable UI themes + DSP feature profiles, starting with a midnight-black and crimson-ruby theme for `ɦuk`).

@@ -54,6 +54,7 @@ jobs:
             --icon "player_ui\assets\icon.ico" `
             --add-data "player_ui\assets\icon.png;assets" `
             --add-data "player_ui\default.sofa;." `
+            --add-data "player_ui\LICENSES\liquid-glass-webgpu.LICENSE;LICENSES" `
             player_ui\main.py
           Compress-Archive -Path "dist\REXA\*" -DestinationPath "REXA-Windows.zip" -Force
 
@@ -122,6 +123,7 @@ jobs:
             --icon "player_ui/assets/icon.icns" \
             --add-data "player_ui/assets/icon.png:assets" \
             --add-data "player_ui/default.sofa:." --add-data "player_ui/default_sofa.npz:." \
+            --add-data "player_ui/LICENSES/liquid-glass-webgpu.LICENSE:LICENSES" \
             player_ui/main.py
           /usr/libexec/PlistBuddy -c "Add :NSAudioCaptureUsageDescription string 'REXA captures system audio to apply real-time binaural HRTF processing.'" "dist/REXA.app/Contents/Info.plist" 
 
