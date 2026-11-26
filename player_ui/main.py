@@ -1,9 +1,13 @@
 import sys
 import os
+import threading
 import subprocess
 import json
 import time
 import random
+import hashlib
+import tempfile
+from collections import OrderedDict
 import numpy as np
 import colorsys
 import sounddevice as sd
@@ -16,6 +20,7 @@ except ImportError:
 _pf = None
 _resample_poly = None
 _mutagen_mods = None
+_mutagen_lock = threading.Lock()
 
 def _get_pyfar():
     global _pf
@@ -34,12 +39,14 @@ def _get_resample_poly():
 def _get_mutagen():
     global _mutagen_mods
     if _mutagen_mods is None:
-        import mutagen
-        from mutagen.flac import FLAC
-        from mutagen.id3 import ID3
-        from mutagen.mp3 import MP3
-        from mutagen.mp4 import MP4
-        _mutagen_mods = (mutagen, FLAC, ID3, MP3, MP4)
+        with _mutagen_lock:
+            if _mutagen_mods is None:
+                import mutagen
+                from mutagen.flac import FLAC
+                from mutagen.id3 import ID3
+                from mutagen.mp3 import MP3
+                from mutagen.mp4 import MP4
+                _mutagen_mods = (mutagen, FLAC, ID3, MP3, MP4)
     return _mutagen_mods
 
 def _fast_fftconvolve(a, b):
@@ -103,15 +110,19 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                                QHBoxLayout, QPushButton, QSlider, QLabel, 
                                QFileDialog, QCheckBox, QSpinBox, QMessageBox,
                                QComboBox, QListWidget, QListWidgetItem, QSplitter, QLineEdit, QStyledItemDelegate, QStyle, QStyleOptionViewItem, QAbstractItemView, QToolTip, QScrollArea, QSizePolicy)
-from PySide6.QtCore import Qt, QTimer, Signal, QObject, QThread, QSize, QEvent, QVariantAnimation, QEasingCurve, QPointF, QPoint
+from PySide6.QtCore import Qt, QTimer, Signal, QObject, QThread, QSize, QRect, QEvent, QVariantAnimation, QEasingCurve, QPointF, QPoint
 from PySide6.QtGui import QPixmap, QIcon, QColor, QPainter, QPalette
 from dsp_bridge import RustDspBridge
 from liquid_glass import (make_glass_card, sample_ambient_rgb, sample_ambient_palette,
                           LavaLampOverlay, build_liquid_qss, apply_seamless_titlebar,
                           apply_windows_glass, configure_macos_glass,
+                          clear_macos_glass_state,
+                          schedule_macos_panel_glass_sync,
+                          remove_macos_panel_glass,
                           windows_transparency_enabled, read_system_glass_preferences,
                           WindowDragFilter, GLASS_STAGES, GLASS_STAGE_LABELS,
-                          GLASS_STAGE_MATERIAL, canonical_glass_material,
+                          GLASS_STAGE_MATERIAL, GLASS_STAGE_TINT_MAX, DEFAULT_GLASS_RIM,
+                          canonical_glass_material,
                           glass_material_profile, normalize_glass_overrides)
 from glass_lens import GlassLensOverlay
 
@@ -121,8 +132,85 @@ THEME_LABELS = {
     "classic": "Classic",
     "light": "Light",
     "liquid_glass": "Glass",
-    "macos27_glass": "Glass macOS 27",
+    "macos27_glass": "Glass 2.0",
 }
+
+_DEFAULT_WINDOW_HEIGHT = 880
+_LIBRARY_BASE_HEIGHT = 760
+
+# Panel Scrim starts at 50% (fully transparent) and ends at 100% (full scrim).
+# The lower half of the old 0-255 slider is cut off so the whole track is useful.
+_SCRIM_SLIDER_MIN = 50
+_SCRIM_SLIDER_MAX = 100
+
+# Live graph performance readout. The target comes from the Graph FPS selector;
+# the achieved rate is measured from actual update_graph() callbacks, not from
+# the timer interval, so dropped frames are visible.
+GRAPH_FPS_TARGETS = (10, 30, 60, 120)
+GRAPH_FPS_INTERVALS_MS = (100, 33, 16, 8)
+# Full Quality ships at a sustainable 60 FPS; 120 stays an opt-in stress target.
+GRAPH_FPS_DEFAULT_INDEX = 2
+_GRAPH_PERF_WINDOW_SEC = 0.7
+_GRAPH_PERF_SMOOTHING = 0.4
+
+
+def _scrim_slider_to_alpha(value):
+    value = max(_SCRIM_SLIDER_MIN, min(_SCRIM_SLIDER_MAX, int(value)))
+    return int(round(255.0 * (value - _SCRIM_SLIDER_MIN) /
+                     (_SCRIM_SLIDER_MAX - _SCRIM_SLIDER_MIN)))
+
+
+def _alpha_to_scrim_slider(alpha):
+    alpha = max(0, min(255, int(alpha)))
+    return _SCRIM_SLIDER_MIN + int(round(
+        50.0 * alpha / 255.0
+    ))
+
+
+def graph_fps_target(index):
+    if 0 <= index < len(GRAPH_FPS_TARGETS):
+        return GRAPH_FPS_TARGETS[index]
+    return GRAPH_FPS_TARGETS[-1]
+
+
+def graph_fps_interval(index):
+    if 0 <= index < len(GRAPH_FPS_INTERVALS_MS):
+        return GRAPH_FPS_INTERVALS_MS[index]
+    return GRAPH_FPS_INTERVALS_MS[-1]
+
+
+def is_light_surface(theme, appearance="dark"):
+    """True for any bright surface, including the Glass 2.0 Light stage."""
+    return theme == "light" or (theme == "macos27_glass" and appearance == "light")
+
+
+def muted_text_color(theme, appearance="dark"):
+    """Readable secondary text on light glass; old grey on dark themes."""
+    return "#3c3c43" if is_light_surface(theme, appearance) else "#8e8e93"
+
+
+def performance_advice(target, achieved, *, low_end_mode=False,
+                       spectrum_fill=True, theme=""):
+    """Return (status, tip, color) for an achieved/target graph FPS pair."""
+    ratio = float(achieved) / float(max(1, target))
+    if ratio >= 0.90:
+        return ("Full speed", "Graph updates are keeping up with the selected target.",
+                "#34c759")
+
+    tips = []
+    if target >= 120:
+        tips.append("switch to the 60 FPS graph target for a steadier display")
+    if spectrum_fill:
+        tips.append("disable Spectrum Gradient Fill to cut full-screen paint cost")
+    if not low_end_mode:
+        tips.append("enable Low-End CPU Mode if glass still stutters (Rust DSP stays active)")
+    if theme == "macos27_glass":
+        tips.append("Glass 2.0 adds per-card native blur, so 120 FPS is best-effort")
+    if not tips:
+        tips.append("close unused dialogs and lower Ambient Glow")
+    status = "Near target" if ratio >= 0.70 else "Below target"
+    color = "#ff9500" if ratio >= 0.70 else "#ff3b30"
+    return (status, "Try: " + "; ".join(tips[:4]) + ".", color)
 
 
 def is_glass_theme(theme):
@@ -264,30 +352,199 @@ def _high_shelf_sos(fc, gain_db, Q, fs):
     a2 =       (A + 1) - (A - 1) * cw - 2 * sqA * alpha
     return np.array([[b0/a0, b1/a0, b2/a0, 1.0, a1/a0, a2/a0]])
 
-def _extract_cover_bytes(path):
-    # 1. Check embedded tags (FLAC, MP3/ID3, MP4/M4A, Ogg/Opus)
-    try:
-        mutagen, FLAC, ID3, MP3, MP4 = _get_mutagen()
-        audio = mutagen.File(path)
-        if audio:
-            if isinstance(audio, FLAC) and audio.pictures:
-                return audio.pictures[0].data
-            if getattr(audio, "tags", None):
-                if isinstance(audio.tags, ID3) or hasattr(audio.tags, "getall"):
-                    for tag in audio.tags.values():
-                        if getattr(tag, "FrameID", "") in ("APIC", "PIC"):
-                            return tag.data
-                if "covr" in audio.tags:
-                    return bytes(audio.tags["covr"][0])
-                if "metadata_block_picture" in audio.tags:
-                    import base64
-                    from mutagen.flac import Picture
-                    pic = Picture(base64.b64decode(audio.tags["metadata_block_picture"][0]))
-                    return pic.data
-    except Exception:
-        pass
+# Cover extraction is lazy. Stamp-based LRU caches make repeated rows instant,
+# and a content-keyed thumbnail cache avoids decoding the same large cover art
+# once per track in an album.
+_COVER_CACHE_LOCK = threading.Lock()
+_COVER_MISS = object()
+_COVER_CACHE_LIMIT = 512
+_COVER_PATH_CACHE = OrderedDict()    # audio path -> (size, mtime_ns, embedded bytes or None)
+_COVER_IMAGE_CACHE = OrderedDict()   # image path -> (size, mtime_ns, bytes)
+_COVER_FOLDER_CACHE = OrderedDict()  # folder -> (dir_mtime_ns, chosen image path or None)
 
-    # 2. Fallback to external cover image in the track's folder (and parent folder for CD1/Disc1)
+_MINI_THUMB_SIZE = 88
+_MINI_THUMB_CACHE_LIMIT = 768
+_MINI_THUMB_CACHE = OrderedDict()    # cover bytes digest -> 88x88 QImage
+
+
+def _thumb_cache_get(key):
+    if not key:
+        return None
+    from PySide6.QtGui import QImage
+    with _COVER_CACHE_LOCK:
+        img = _MINI_THUMB_CACHE.get(key)
+        if img is None:
+            return None
+        _MINI_THUMB_CACHE.move_to_end(key)
+        return QImage(img)
+
+
+def _thumb_cache_set(key, img):
+    if not key or img is None or img.isNull():
+        return
+    from PySide6.QtGui import QImage
+    with _COVER_CACHE_LOCK:
+        if key in _MINI_THUMB_CACHE:
+            _MINI_THUMB_CACHE.move_to_end(key)
+        elif len(_MINI_THUMB_CACHE) >= _MINI_THUMB_CACHE_LIMIT:
+            _MINI_THUMB_CACHE.popitem(last=False)
+        _MINI_THUMB_CACHE[key] = QImage(img)
+
+
+def _decode_mini_thumb(raw):
+    """Decode cover bytes straight to an 88x88 thumbnail, cached by content."""
+    if not raw:
+        return None
+    from PySide6.QtCore import QBuffer, QByteArray, QIODevice, QSize
+    from PySide6.QtGui import QImage, QImageReader
+
+    key = hashlib.blake2b(raw, digest_size=16).digest()
+    cached = _thumb_cache_get(key)
+    if cached is not None and not cached.isNull():
+        return cached
+
+    data = QByteArray(raw)  # keep the buffer alive for the whole decode
+    buf = QBuffer(data)
+    buf.open(QIODevice.ReadOnly)
+    reader = QImageReader(buf)
+    original = reader.size()
+    if original.isValid() and original.width() > 0 and original.height() > 0:
+        if original.width() >= original.height():
+            target = QSize(
+                _MINI_THUMB_SIZE,
+                max(1, int(round(_MINI_THUMB_SIZE * original.height() / original.width()))),
+            )
+        else:
+            target = QSize(
+                max(1, int(round(_MINI_THUMB_SIZE * original.width() / original.height()))),
+                _MINI_THUMB_SIZE,
+            )
+    else:
+        target = QSize(_MINI_THUMB_SIZE, _MINI_THUMB_SIZE)
+    reader.setScaledSize(target)
+    img = reader.read()
+    if img.isNull():
+        src = QImage()
+        if src.loadFromData(raw) and not src.isNull():
+            img = src.scaled(_MINI_THUMB_SIZE, _MINI_THUMB_SIZE,
+                             Qt.KeepAspectRatioByExpanding, Qt.FastTransformation)
+    elif img.size() != QSize(_MINI_THUMB_SIZE, _MINI_THUMB_SIZE):
+        img = img.scaled(_MINI_THUMB_SIZE, _MINI_THUMB_SIZE,
+                         Qt.KeepAspectRatioByExpanding, Qt.FastTransformation)
+    if not img.isNull():
+        _thumb_cache_set(key, img)
+        return img
+    return None
+
+
+def _cover_stamp(path):
+    try:
+        st = os.stat(path)
+        return (st.st_size, st.st_mtime_ns)
+    except OSError:
+        return None
+
+
+def _cover_cache_get(cache, key, stamp):
+    if stamp is None:
+        return _COVER_MISS
+    with _COVER_CACHE_LOCK:
+        hit = cache.get(key, _COVER_MISS)
+        if hit is _COVER_MISS or hit[0] != stamp:
+            return _COVER_MISS
+        cache.move_to_end(key)
+        return hit[1]
+
+
+def _cover_cache_set(cache, key, stamp, value):
+    if stamp is None:
+        return
+    with _COVER_CACHE_LOCK:
+        if key in cache:
+            cache.move_to_end(key)
+        elif len(cache) >= _COVER_CACHE_LIMIT:
+            cache.popitem(last=False)
+        cache[key] = (stamp, value)
+
+
+def _cached_image_bytes(path):
+    stamp = _cover_stamp(path)
+    hit = _cover_cache_get(_COVER_IMAGE_CACHE, path, stamp)
+    if hit is not _COVER_MISS:
+        return hit
+    with open(path, "rb") as f:
+        data = f.read()
+    _cover_cache_set(_COVER_IMAGE_CACHE, path, stamp, data)
+    return data
+
+
+def _folder_cover_image(folder, priority_names, img_exts):
+    stamp = _cover_stamp(folder)
+    hit = _cover_cache_get(_COVER_FOLDER_CACHE, folder, stamp)
+    if hit is not _COVER_MISS:
+        return hit
+    chosen = None
+    try:
+        entries = [e for e in os.listdir(folder)
+                   if e.lower().endswith(img_exts) and not e.startswith(".")]
+        if entries:
+            for p_name in priority_names:
+                for e in entries:
+                    stem = os.path.splitext(e)[0].lower()
+                    if stem == p_name or stem.startswith(p_name):
+                        chosen = os.path.join(folder, e)
+                        break
+                if chosen:
+                    break
+            if not chosen:
+                entries.sort(key=lambda e: os.path.getsize(os.path.join(folder, e)),
+                             reverse=True)
+                chosen = os.path.join(folder, entries[0])
+    except OSError:
+        chosen = None
+    _cover_cache_set(_COVER_FOLDER_CACHE, folder, stamp, chosen)
+    return chosen
+
+
+def _extract_cover_bytes(path):
+    stamp = _cover_stamp(path)
+    embedded = _cover_cache_get(_COVER_PATH_CACHE, path, stamp)
+    if embedded is not _COVER_MISS and embedded:
+        return embedded
+
+    # Only the embedded-tag result is keyed by the audio file stamp. External
+    # art is rechecked every time because adding/replacing cover.jpg does not
+    # touch the track's mtime; folder/image caches keep that lookup cheap.
+    # 1. Check embedded tags (FLAC, MP3/ID3, MP4/M4A, Ogg/Opus)
+    if embedded is _COVER_MISS:
+        embedded = None
+        try:
+            mutagen, FLAC, ID3, MP3, MP4 = _get_mutagen()
+            audio = mutagen.File(path)
+            if audio:
+                if isinstance(audio, FLAC) and audio.pictures:
+                    embedded = audio.pictures[0].data
+                elif getattr(audio, "tags", None):
+                    if isinstance(audio.tags, ID3) or hasattr(audio.tags, "getall"):
+                        for tag in audio.tags.values():
+                            if getattr(tag, "FrameID", "") in ("APIC", "PIC"):
+                                embedded = tag.data
+                                break
+                    if not embedded and "covr" in audio.tags:
+                        embedded = bytes(audio.tags["covr"][0])
+                    if not embedded and "metadata_block_picture" in audio.tags:
+                        import base64
+                        from mutagen.flac import Picture
+                        pic = Picture(base64.b64decode(audio.tags["metadata_block_picture"][0]))
+                        embedded = pic.data
+        except Exception:
+            embedded = None
+        _cover_cache_set(_COVER_PATH_CACHE, path, stamp, embedded)
+    if embedded:
+        return embedded
+
+    # 2. Fallback to external cover art in the track's folder (and the parent
+    #    folder for CD1/Disc1). Folder scans are cached by directory mtime.
     try:
         folder = os.path.dirname(os.path.abspath(path))
         search_dirs = [folder]
@@ -297,23 +554,10 @@ def _extract_cover_bytes(path):
 
         img_exts = (".jpg", ".jpeg", ".png", ".webp", ".bmp")
         priority_names = ("cover", "folder", "front", "album", "albumart", "artwork", "scan")
-
         for d in search_dirs:
-            if not os.path.isdir(d):
-                continue
-            entries = [e for e in os.listdir(d) if e.lower().endswith(img_exts) and not e.startswith(".")]
-            if not entries:
-                continue
-            for p_name in priority_names:
-                for e in entries:
-                    stem = os.path.splitext(e)[0].lower()
-                    if stem == p_name or stem.startswith(p_name):
-                        with open(os.path.join(d, e), "rb") as f:
-                            return f.read()
-            # Otherwise pick the largest image file in the album folder
-            entries.sort(key=lambda e: os.path.getsize(os.path.join(d, e)), reverse=True)
-            with open(os.path.join(d, entries[0]), "rb") as f:
-                return f.read()
+            image_path = _folder_cover_image(d, priority_names, img_exts)
+            if image_path:
+                return _cached_image_bytes(image_path)
     except Exception:
         pass
     return None
@@ -419,7 +663,10 @@ class MarqueeDelegate(QStyledItemDelegate):
             from PySide6.QtGui import QFont, QPainterPath, QPen
             painter.save()
             painter.setRenderHint(QPainter.Antialiasing, True)
-            is_light = getattr(self.parent().window(), 'current_theme', 'classic') == 'light'
+            mw = self.parent().window() if self.parent() else None
+            is_light = is_light_surface(
+                getattr(mw, 'current_theme', 'classic'),
+                getattr(mw, 'glass_appearance', 'dark'))
             r = option.rect
             painter.setPen(QPen(QColor(0, 0, 0, 28) if is_light else QColor(255, 255, 255, 28), 1))
             painter.drawLine(r.left() + 8, r.top() + 3, r.right() - 8, r.top() + 3)
@@ -427,8 +674,7 @@ class MarqueeDelegate(QStyledItemDelegate):
             cov_rect = r.adjusted(8, 8, 0, -4)
             cov_rect.setWidth(44)
             cov_rect.setHeight(44)
-            mw = self.parent().window()
-            pm = mw._get_mini_cover_async(data.get("sample_path", "")) if hasattr(mw, "_get_mini_cover_async") else None
+            pm = mw._get_mini_cover_async(data.get("sample_path", "")) if (mw and hasattr(mw, "_get_mini_cover_async")) else None
             clip = QPainterPath()
             clip.addRoundedRect(cov_rect, 7, 7)
             painter.setClipPath(clip)
@@ -488,7 +734,9 @@ class MarqueeDelegate(QStyledItemDelegate):
                 src_y = (pm.height() - src_h) // 2
                 painter.setOpacity(0.16 if not bool(option.state & QStyle.State_Selected) else 0.12)
                 painter.drawPixmap(bg_r, pm, pm.rect().adjusted(0, src_y, 0, -(pm.height() - src_y - src_h)))
-                is_light = getattr(mw, 'current_theme', 'classic') == 'light'
+                is_light = is_light_surface(
+                    getattr(mw, 'current_theme', 'classic'),
+                    getattr(mw, 'glass_appearance', 'dark'))
                 grad = QLinearGradient(bg_r.left(), 0, bg_r.right(), 0)
                 base_c = QColor(255, 255, 255, 165) if is_light else QColor(18, 20, 26, 175)
                 edge_c = QColor(255, 255, 255, 55) if is_light else QColor(18, 20, 26, 65)
@@ -514,7 +762,9 @@ class MarqueeDelegate(QStyledItemDelegate):
             except Exception:
                 painter.setPen(QColor("#ffffff"))
         else:
-            is_light = getattr(self.parent().window(), 'current_theme', 'dark') == 'light'
+            is_light = is_light_surface(
+                getattr(mw, 'current_theme', 'classic'),
+                getattr(mw, 'glass_appearance', 'dark'))
             painter.setPen(QColor("#1c1c1e") if is_light else QColor("#eef2f8"))
             
         try:
@@ -1488,43 +1738,52 @@ def reset_macos_window_opaque(window):
     if sys.platform != "darwin":
         return
     try:
-        import ctypes
-        objc = ctypes.CDLL("/usr/lib/libobjc.A.dylib")
-        objc.objc_getClass.restype = ctypes.c_void_p
-        objc.objc_getClass.argtypes = [ctypes.c_char_p]
-        objc.sel_registerName.restype = ctypes.c_void_p
-        objc.sel_registerName.argtypes = [ctypes.c_char_p]
+        # PyObjC returns real NSString class names. The previous ctypes version
+        # read -className as char*, which reads raw NSString bytes and can
+        # segfault after a few theme switches.
+        from AppKit import NSColor
+        from pyqt_liquidglass._bridge import (get_nswindow_from_widget,
+                                              get_nsview_from_widget)
 
-        def msg(obj, sel, res=ctypes.c_void_p, types=(), *args):
-            fn = ctypes.cast(objc.objc_msgSend, ctypes.CFUNCTYPE(res, ctypes.c_void_p, ctypes.c_void_p, *types))
-            return fn(obj, objc.sel_registerName(sel.encode()), *args)
+        ns_window = get_nswindow_from_widget(window)
+        if ns_window is None:
+            return
+        ns_window.setOpaque_(True)
+        ns_window.setBackgroundColor_(NSColor.windowBackgroundColor())
 
-        ns_win = msg(ctypes.c_void_p(int(window.winId())), "window")
-        if not ns_win: return
+        content_view = ns_window.contentView()
+        root_view = get_nsview_from_widget(window)
+        managed = [v for v in (
+            [getattr(window, "_glass_view", None)] +
+            [rec.get("view") for rec in
+             (getattr(window, "_panel_glass_views", []) or [])]
+        ) if v is not None]
 
-        # Force window to be Opaque
-        msg(ns_win, "setOpaque:", None, (ctypes.c_bool,), True)
-        
-        # Reset background color to the default system window color
-        ns_color = msg(objc.objc_getClass(b"NSColor"), "windowBackgroundColor")
-        msg(ns_win, "setBackgroundColor:", None, (ctypes.c_void_p,), ns_color)
+        def is_same(a, b):
+            if a is b:
+                return True
+            try:
+                return bool(a.isEqual_(b))
+            except Exception:
+                return False
 
-        # Physically remove the Native Blur View from the window hierarchy
-        content_view = msg(ns_win, "contentView")
-        subviews = msg(content_view, "subviews")
-        count = msg(subviews, "count", ctypes.c_ulong)
-        
-        for i in reversed(range(count)):
-            view = msg(subviews, "objectAtIndex:", ctypes.c_void_p, (ctypes.c_ulong,), i)
-            class_name = msg(view, "className", ctypes.c_char_p)
-            if class_name and b"VisualEffectView" in class_name:
-                msg(view, "removeFromSuperview")
+        for view in list(content_view.subviews() or []):
+            if root_view is not None and is_same(view, root_view):
+                continue
+            if any(is_same(view, other) for other in managed):
+                continue
+            try:
+                name = str(view.className() or "")
+            except Exception:
+                continue
+            if "VisualEffectView" in name or "GlassEffectView" in name:
+                view.removeFromSuperview()
     except Exception as e:
         print(f"Failed to reset window opacity: {e}")
 
 from PySide6.QtWidgets import QDialog, QGridLayout, QFrame, QProgressBar
 
-APP_VERSION = "0.5.2"
+APP_VERSION = "0.5.3"
 try:
     from lfm_keys import LFM_API_KEY, LFM_API_SECRET
 except ImportError:
@@ -1791,7 +2050,9 @@ class StereoAnalyzerWidget(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing, True)
         w, h = float(self.width()), float(self.height())
-        is_light = getattr(self.mw, "current_theme", "classic") == "light"
+        is_light = is_light_surface(
+            getattr(self.mw, "current_theme", "classic"),
+            getattr(self.mw, "glass_appearance", "dark"))
 
         fg = QColor("#161618" if is_light else "#f2f4f8")
         sub = QColor(0, 0, 0, 45) if is_light else QColor(255, 255, 255, 42)
@@ -1880,7 +2141,9 @@ class PeakSchemeWidget(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing, True)
         w, h = float(self.width()), float(self.height())
-        is_light = getattr(self.mw, "current_theme", "classic") == "light"
+        is_light = is_light_surface(
+            getattr(self.mw, "current_theme", "classic"),
+            getattr(self.mw, "glass_appearance", "dark"))
         is_float = bool(self.mw.engine.float_mode)
 
         # Background box
@@ -1975,6 +2238,8 @@ class SettingsDialog(QDialog):
     def __init__(self, mw):
         super().__init__(mw)
         self.mw = mw
+        muted = muted_text_color(getattr(mw, "current_theme", "classic"),
+                                 getattr(mw, "glass_appearance", "dark"))
         self._glass_id = None
         self.setWindowTitle("Settings")
         self.setAttribute(Qt.WA_TranslucentBackground, windows_transparency_enabled())
@@ -1994,14 +2259,18 @@ class SettingsDialog(QDialog):
         self.settings_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.settings_scroll.setWidgetResizable(True)
         self.settings_scroll.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.settings_scroll.setAttribute(Qt.WA_TranslucentBackground, True)
-        self.settings_scroll.viewport().setAttribute(Qt.WA_TranslucentBackground, True)
-        self.settings_scroll.viewport().setAttribute(Qt.WA_NoSystemBackground, True)
+        translucent = windows_transparency_enabled()
+        self.settings_scroll.setAttribute(Qt.WA_TranslucentBackground, translucent)
+        self.settings_scroll.viewport().setAttribute(Qt.WA_TranslucentBackground, translucent)
+        self.settings_scroll.viewport().setAttribute(Qt.WA_NoSystemBackground, translucent)
         outer.addWidget(self.settings_scroll)
 
         root = QFrame(self.settings_scroll)
         root.setObjectName("settingsRoot")
         self.settings_scroll.setWidget(root)
+        self.settings_scroll.verticalScrollBar().valueChanged.connect(
+            lambda *_: schedule_macos_panel_glass_sync(self)
+        )
 
         lay = QVBoxLayout(root)
         lay.setContentsMargins(18, 40 if sys.platform == "darwin" else 18, 18, 18)
@@ -2028,6 +2297,9 @@ class SettingsDialog(QDialog):
         g.addWidget(QLabel("Background:"), 2, 0)
         self.combo_bg_mode = QComboBox()
         self.combo_bg_mode.addItems(["Dynamic (Lava Lamp)", "Static"])
+        self.combo_bg_mode.setToolTip(
+            "Lava drifts at 30 FPS idle and a lighter 15 FPS during playback so Classic/Glass keep full graph FPS; ambient colors stay live."
+        )
         self.combo_bg_mode.currentIndexChanged.connect(lambda i: self.mw.toggle_dynamic_ambient(i == 0))
         g.addWidget(self.combo_bg_mode, 2, 1)
 
@@ -2057,34 +2329,33 @@ class SettingsDialog(QDialog):
 
         self.lbl_rim = QLabel("Glass Border Rim:")
         g.addWidget(self.lbl_rim, 5, 0)
-        self.s_rim = ResetSlider(20, Qt.Horizontal)
+        self.s_rim = ResetSlider(DEFAULT_GLASS_RIM, Qt.Horizontal)
         self.s_rim.setRange(0, 100)
         self.s_rim.valueChanged.connect(self._on_glass)
         g.addWidget(self.s_rim, 5, 1)
 
-        g.addWidget(QLabel("Backdrop Downsample:"), 6, 0)
-        self.s_glass_backdrop = ResetSlider(35, Qt.Horizontal)
-        self.s_glass_backdrop.setRange(20, 50)
-        self.s_glass_backdrop.setToolTip(
-            "Experimental backdrop downsample, 20 (softest) .. 50 (sharpest). "
-            "macOS has no public blur-radius API."
-        )
-        self.s_glass_backdrop.valueChanged.connect(self._on_glass_tuning)
-        g.addWidget(self.s_glass_backdrop, 6, 1)
-
-        g.addWidget(QLabel("Native Tint:"), 7, 0)
+        self.lbl_glass_tint = QLabel("Native Tint:")
+        self.lbl_glass_tint.setToolTip("Glass 2.0 only.")
+        g.addWidget(self.lbl_glass_tint, 6, 0)
         self.s_glass_tint = ResetSlider(34, Qt.Horizontal)
         self.s_glass_tint.setRange(0, 100)
         self.s_glass_tint.valueChanged.connect(self._on_glass_tuning)
-        g.addWidget(self.s_glass_tint, 7, 1)
+        g.addWidget(self.s_glass_tint, 6, 1)
 
-        g.addWidget(QLabel("Panel Scrim:"), 8, 0)
-        self.s_glass_scrim = ResetSlider(174, Qt.Horizontal)
-        self.s_glass_scrim.setRange(0, 255)
+        self.lbl_glass_scrim = QLabel("Panel Scrim:")
+        self.lbl_glass_scrim.setToolTip("Glass 2.0 only.")
+        g.addWidget(self.lbl_glass_scrim, 7, 0)
+        self.s_glass_scrim = ResetSlider(_alpha_to_scrim_slider(174), Qt.Horizontal)
+        self.s_glass_scrim.setRange(_SCRIM_SLIDER_MIN, _SCRIM_SLIDER_MAX)
+        self.s_glass_scrim.setToolTip(
+            "50% leaves panels transparent; 100% is a full scrim over the native glass."
+        )
         self.s_glass_scrim.valueChanged.connect(self._on_glass_tuning)
-        g.addWidget(self.s_glass_scrim, 8, 1)
+        g.addWidget(self.s_glass_scrim, 7, 1)
 
-        g.addWidget(QLabel("Native Style:"), 9, 0)
+        self.lbl_glass_style = QLabel("Native Style:")
+        self.lbl_glass_style.setToolTip("Glass 2.0 only.")
+        g.addWidget(self.lbl_glass_style, 8, 0)
         self.combo_glass_style = QComboBox()
         self.combo_glass_style.addItems(["Clear", "Regular"])
         self.combo_glass_style.setItemData(0, "clear")
@@ -2093,11 +2364,11 @@ class SettingsDialog(QDialog):
             "Public NSGlassEffectView style. Regular is softer but can smear."
         )
         self.combo_glass_style.currentIndexChanged.connect(self._on_glass_tuning)
-        g.addWidget(self.combo_glass_style, 9, 1)
+        g.addWidget(self.combo_glass_style, 8, 1)
 
         self.btn_reset_glass = QPushButton("Reset Stage Tuning")
         self.btn_reset_glass.clicked.connect(self._reset_glass_tuning)
-        g.addWidget(self.btn_reset_glass, 10, 1)
+        g.addWidget(self.btn_reset_glass, 9, 1)
         lay.addWidget(app_card)
 
         perf_card = make_glass_card()
@@ -2116,9 +2387,20 @@ class SettingsDialog(QDialog):
         self.chk_spec_fill.toggled.connect(mw.toggle_spectrum_fill)
         p_lay.addWidget(self.chk_spec_fill)
 
+        self.lbl_perf_status = QLabel(getattr(mw, "_graph_perf_text", "Perf: idle"))
+        self.lbl_perf_status.setStyleSheet(f"font-size: 12px; font-weight: bold; color: {muted};")
+        self.lbl_perf_status.setWordWrap(True)
+        self.lbl_perf_status.setToolTip(getattr(mw, "_graph_perf_tip", "Start playback to measure real graph FPS."))
+        p_lay.addWidget(self.lbl_perf_status)
+
+        self.lbl_perf_tips = QLabel(getattr(mw, "_graph_perf_tip", "Start playback to measure real graph FPS."))
+        self.lbl_perf_tips.setStyleSheet(f"font-size: 11px; color: {muted};")
+        self.lbl_perf_tips.setWordWrap(True)
+        p_lay.addWidget(self.lbl_perf_tips)
+
         upd_row = QHBoxLayout()
         self.lbl_upd = QLabel(f"REXA v{APP_VERSION}")
-        self.lbl_upd.setStyleSheet("font-size: 11px; opacity: 0.78;")
+        self.lbl_upd.setStyleSheet(f"font-size: 11px; color: {muted};")
         self.btn_check_upd = QPushButton("Check for Updates")
         self.btn_check_upd.clicked.connect(self._on_check_updates)
         upd_row.addWidget(self.lbl_upd, 1)
@@ -2156,10 +2438,10 @@ class SettingsDialog(QDialog):
         scrob_grid.addWidget(self.s_scrob_min, 0, 1)
         scrob_grid.addWidget(self.lbl_scrob_min, 0, 2)
 
-        delay_hdr = QLabel("Scrobble delay (whichever comes first)")
-        delay_hdr.setStyleSheet("font-size: 11px; font-weight: bold; opacity: 0.72;")
-        delay_hdr.setMinimumHeight(20)
-        scrob_grid.addWidget(delay_hdr, 1, 0, 1, 3)
+        self.lbl_delay_hdr = QLabel("Scrobble delay (whichever comes first)")
+        self.lbl_delay_hdr.setStyleSheet(f"font-size: 11px; font-weight: bold; color: {muted};")
+        self.lbl_delay_hdr.setMinimumHeight(20)
+        scrob_grid.addWidget(self.lbl_delay_hdr, 1, 0, 1, 3)
 
         scrob_grid.addWidget(QLabel("Percentage:"), 2, 0)
         self.s_scrob_pct = ResetSlider(50, Qt.Horizontal)
@@ -2191,24 +2473,46 @@ class SettingsDialog(QDialog):
         s_lay.addWidget(self.scrob_progress)
 
         self.lbl_scrob_status = QLabel("Not connected")
-        self.lbl_scrob_status.setStyleSheet("font-size: 11px; opacity: 0.78;")
+        self.lbl_scrob_status.setStyleSheet(f"font-size: 11px; color: {muted};")
         s_lay.addWidget(self.lbl_scrob_status)
 
         self.chk_lfm.toggled.connect(self._save_scrobble_ui)
         lay.addWidget(scrob_card)
 
-        note = QLabel("Layout presets coming soon.")
-        note.setWordWrap(True)
-        note.setStyleSheet("opacity: 0.7; font-size: 12px;")
-        p_lay.addWidget(note)
+        self.lbl_note = QLabel("Layout presets coming soon.")
+        self.lbl_note.setWordWrap(True)
+        self.lbl_note.setStyleSheet(f"font-size: 12px; color: {muted};")
+        p_lay.addWidget(self.lbl_note)
         lay.addWidget(perf_card)
         lay.addStretch()
         self.sync_from_main()
 
+    def _clear_native_glass(self):
+        if glass and getattr(self, "_glass_id", None) is not None:
+            try:
+                glass.remove_glass_effect(self._glass_id)
+            except Exception:
+                pass
+            self._glass_id = None
+        clear_macos_glass_state(self)
+        remove_macos_panel_glass(self)
+
     def showEvent(self, event):
         super().showEvent(event)
+        # AppKit drops the dialog's native glass views while it is hidden; the
+        # cached effect id/container are stale on the next open. Rebuild both
+        # layers before sync_from_main() reconfigures them.
+        self._clear_native_glass()
         self.sync_from_main()
         self._fit_to_screen()
+
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        # Dialog-owned NSGlassEffectViews used to survive close(). The next
+        # activation re-composited them over the main window, which is why the
+        # first Settings close darkened the panels. Drop them on hide so every
+        # open/close cycle starts and ends clean.
+        self._clear_native_glass()
 
     def _fit_to_screen(self):
         screen = self.screen() or QApplication.primaryScreen()
@@ -2303,6 +2607,29 @@ class SettingsDialog(QDialog):
         else:
             self.lbl_scrob_status.setText(msg[:72])
 
+    def _refresh_muted_styles(self):
+        muted = muted_text_color(getattr(self.mw, "current_theme", "classic"),
+                                 getattr(self.mw, "glass_appearance", "dark"))
+        styles = (
+            (self.lbl_perf_tips, "font-size: 11px;"),
+            (self.lbl_upd, "font-size: 11px;"),
+            (self.lbl_delay_hdr, "font-size: 11px; font-weight: bold;"),
+            (self.lbl_scrob_status, "font-size: 11px;"),
+            (self.lbl_note, "font-size: 12px;"),
+        )
+        for label, base in styles:
+            label.setStyleSheet(f"{base} color: {muted};")
+
+    def update_graph_perf(self, text, tip, color):
+        if hasattr(self, "lbl_perf_status"):
+            self.lbl_perf_status.setText(text)
+            self.lbl_perf_status.setStyleSheet(
+                f"font-size: 12px; font-weight: bold; color: {color};"
+            )
+            self.lbl_perf_status.setToolTip(tip)
+        if hasattr(self, "lbl_perf_tips"):
+            self.lbl_perf_tips.setText(tip)
+
     def sync_from_main(self):
         idx_map = {t: i for i, t in enumerate(THEME_ORDER)}
         self.combo_theme.blockSignals(True)
@@ -2326,22 +2653,24 @@ class SettingsDialog(QDialog):
         self.combo_glass_stage.setCurrentIndex(GLASS_STAGES.index(stage))
         self.combo_glass_stage.blockSignals(False)
         material_key = GLASS_STAGE_MATERIAL[stage]
-        per = normalize_glass_overrides((self.glass_overrides or {}).get(stage))
+        per = normalize_glass_overrides((self.glass_overrides or {}).get(stage), stage)
         profile = glass_material_profile(
-            material_key, getattr(self.mw, "glass_clarity", 45) / 100.0, per
+            material_key, getattr(self.mw, "glass_clarity", 45) / 100.0, per, stage
         )
         defaults = glass_material_profile(
-            material_key, getattr(self.mw, "glass_clarity", 45) / 100.0
+            material_key, getattr(self.mw, "glass_clarity", 45) / 100.0, stage=stage
         )
+        tint_max = int(round(GLASS_STAGE_TINT_MAX.get(stage, 1.0) * 100))
+        self.s_glass_tint.blockSignals(True)
+        self.s_glass_tint.setRange(0, tint_max)
+        self.s_glass_tint.blockSignals(False)
         tuning = {
-            self.s_glass_backdrop: int(round(profile["backdrop_scale"] * 100)),
             self.s_glass_tint: int(round(profile["tint_alpha"] * 100)),
-            self.s_glass_scrim: int(profile["card_alpha"]),
+            self.s_glass_scrim: _alpha_to_scrim_slider(profile["card_alpha"]),
         }
         default_tuning = {
-            self.s_glass_backdrop: int(round(defaults["backdrop_scale"] * 100)),
             self.s_glass_tint: int(round(defaults["tint_alpha"] * 100)),
-            self.s_glass_scrim: int(defaults["card_alpha"]),
+            self.s_glass_scrim: _alpha_to_scrim_slider(defaults["card_alpha"]),
         }
         for slider, val in tuning.items():
             slider.default_value = default_tuning[slider]
@@ -2352,8 +2681,9 @@ class SettingsDialog(QDialog):
         self.combo_glass_style.blockSignals(False)
         tuning_enabled = self.mw.current_theme == "macos27_glass"
         for widget in (self.lbl_stage, self.combo_glass_stage,
-                       self.s_glass_backdrop, self.s_glass_tint,
-                       self.s_glass_scrim, self.combo_glass_style,
+                       self.lbl_glass_tint, self.s_glass_tint,
+                       self.lbl_glass_scrim, self.s_glass_scrim,
+                       self.lbl_glass_style, self.combo_glass_style,
                        self.btn_reset_glass):
             widget.setEnabled(tuning_enabled)
 
@@ -2363,6 +2693,12 @@ class SettingsDialog(QDialog):
         self.chk_spec_fill.blockSignals(True)
         self.chk_spec_fill.setChecked(getattr(self.mw, 'spectrum_fill_enabled', True))
         self.chk_spec_fill.blockSignals(False)
+        self.update_graph_perf(
+            getattr(self.mw, "_graph_perf_text", "Perf: idle"),
+            getattr(self.mw, "_graph_perf_tip", "Start playback to measure real graph FPS."),
+            getattr(self.mw, "_graph_perf_color", "#8e8e93"),
+        )
+        self._refresh_muted_styles()
         cfg = getattr(self.mw, "scrobble_cfg", {})
         self.chk_lfm.blockSignals(True); self.chk_lfm.setChecked(bool(cfg.get("lfm_enabled", False))); self.chk_lfm.blockSignals(False)
         min_s = int(cfg.get("min_track_sec", 30))
@@ -2397,6 +2733,7 @@ class SettingsDialog(QDialog):
                     except Exception:
                         pass
                     self._glass_id = None
+                clear_macos_glass_state(self)
                 if glass:
                     configure_macos_glass(self, self.mw.current_theme, False)
                 reset_macos_window_opaque(self)
@@ -2431,6 +2768,9 @@ class SettingsDialog(QDialog):
                                   getattr(self.mw, "glass_clarity", 45) / 100.0,
                                   material=self.mw.glass_material)
         self.mw._on_ambient_color_changed(self.mw._current_ambient_color)
+        graph_theme = getattr(self.mw, "_update_graph_theme", None)
+        if graph_theme:
+            graph_theme()
         self.mw.save_session_state()
         self.setStyleSheet(self.mw.styleSheet())
 
@@ -2445,12 +2785,12 @@ class SettingsDialog(QDialog):
             stage = "dark"
         overrides = dict(getattr(self.mw, "glass_overrides", {}) or {})
         per = dict(overrides.get(stage, {}) or {})
-        per["backdrop_scale"] = self.s_glass_backdrop.value() / 100.0
         per["tint_alpha"] = self.s_glass_tint.value() / 100.0
-        per["card_alpha"] = self.s_glass_scrim.value()
-        per["list_alpha"] = max(0, self.s_glass_scrim.value() - 8)
+        card_alpha = _scrim_slider_to_alpha(self.s_glass_scrim.value())
+        per["card_alpha"] = card_alpha
+        per["list_alpha"] = max(0, card_alpha - 8)
         per["style"] = self.combo_glass_style.currentData() or "clear"
-        overrides[stage] = normalize_glass_overrides(per)
+        overrides[stage] = normalize_glass_overrides(per, stage)
         self.mw.glass_overrides = overrides
         self._on_glass()
 
@@ -2495,6 +2835,11 @@ class MainWindow(QMainWindow):
         self.setAttribute(Qt.WA_ContentsMarginsRespectsSafeArea, False)
 
         self.setMinimumSize(1100, 820)
+        # A little extra default height goes to the spectrum graph only;
+        # left library and top controls keep their previous proportions.
+        avail = QApplication.primaryScreen().availableGeometry() if QApplication.primaryScreen() else None
+        default_h = min(880, max(820, avail.height() - 20)) if avail else 880
+        self.resize(1100, max(820, default_h))
         
         pg.setConfigOptions(antialias=False, useOpenGL=False, enableExperimental=False)
         
@@ -2528,8 +2873,16 @@ class MainWindow(QMainWindow):
         self.timer.timeout.connect(self.update_ui_seekbar)
 
         self.viz_timer = QTimer(self)
-        self.viz_timer.setInterval(8) 
+        self.viz_timer.setTimerType(Qt.PreciseTimer)
+        self.viz_timer.setInterval(graph_fps_interval(GRAPH_FPS_DEFAULT_INDEX))
         self.viz_timer.timeout.connect(self.update_graph)
+
+        self._graph_perf_start = 0.0
+        self._graph_perf_frames = 0
+        self._graph_fps_ema = None
+        self._graph_perf_text = "Perf: idle"
+        self._graph_perf_tip = "Start playback to measure real graph FPS."
+        self._graph_perf_color = "#8e8e93"
 
         self.debounce_timer = QTimer(self)
         self.debounce_timer.setSingleShot(True)
@@ -2558,7 +2911,7 @@ class MainWindow(QMainWindow):
         self.glass_appearance = "dark"
         self.glass_overrides = {}
         self.glass_clarity = 45
-        self.glass_rim = 20
+        self.glass_rim = DEFAULT_GLASS_RIM
         self.spectrum_fill_enabled = True
         self.dynamic_ambient = True
         self.scrobble_cfg = {"lfm_enabled": False, "lfm_api_key": "", "lfm_api_secret": "", "lfm_user": "", "lfm_sk": ""}
@@ -2570,7 +2923,9 @@ class MainWindow(QMainWindow):
         self._scrobble_workers = []
         pg.setConfigOption("foreground", "#eef2f8")
         self.init_ui()
-        
+        self._sync_main_content_height()
+        self._reset_graph_perf("Perf: idle")
+
         self.sys_device_timer = QTimer(self)
         self.sys_device_timer.setInterval(1000)
         self.sys_device_timer.timeout.connect(self.check_sys_default)
@@ -2610,10 +2965,11 @@ class MainWindow(QMainWindow):
         self.save_session_state()
 
     def _update_graph_theme(self):
-        is_light = getattr(self, "current_theme", "classic") == "light"
-        is_glass = is_glass_theme(getattr(self, "current_theme", "classic"))
-        axis_color = '#1c1c1e' if is_light else '#eef2f8'
-        if is_glass: axis_color = '#ffffff'
+        theme = getattr(self, "current_theme", "classic")
+        appearance = getattr(self, "glass_appearance", "dark")
+        is_light = is_light_surface(theme, appearance)
+        is_glass = is_glass_theme(theme)
+        axis_color = '#1c1c1e' if is_light else ('#ffffff' if is_glass else '#eef2f8')
         
         pg.setConfigOption('foreground', axis_color)
 
@@ -2622,6 +2978,9 @@ class MainWindow(QMainWindow):
             axis = self.plot_widget.getAxis(axis_name)
             axis.setPen(pg.mkPen(axis_color))
             axis.setTextPen(pg.mkPen(axis_color))
+            axis.setTickPen(pg.mkPen(axis_color))
+            if axis.label is not None:
+                axis.label.setDefaultTextColor(pg.mkColor(axis_color))
         
         # Stronger grid in light mode for visibility
         self.plot_widget.showGrid(x=True, y=True, alpha=0.35 if is_light else 0.25)
@@ -2668,7 +3027,7 @@ class MainWindow(QMainWindow):
         theme = getattr(self, "current_theme", "classic")
         is_m27 = theme == "macos27_glass"
         is_light = theme == "light"
-        # With Ambient Glow at minimum, macOS 27 should stay neutral instead
+        # With Ambient Glow at minimum, Glass 2.0 should stay neutral instead
         # of amplifying the sampled album-art hue.
         if s < 0.04 or (is_m27 and getattr(self, "ambient_opacity", 0.3) <= 0.02):
             return ("#8e8e93", "#c7c7cc")
@@ -2720,6 +3079,7 @@ class MainWindow(QMainWindow):
                 except Exception:
                     pass
                 self.glass_effect_id = None
+            clear_macos_glass_state(self)
             if glass:
                 configure_macos_glass(self, self.current_theme, False)
             reset_macos_window_opaque(self)
@@ -2727,20 +3087,8 @@ class MainWindow(QMainWindow):
             apply_seamless_titlebar(self)
 
         self._update_graph_theme()
-        c = self._current_ambient_color
-        
-        self.setStyleSheet(build_liquid_qss(
-            c.red(), c.green(), c.blue(), 
-            theme=self.current_theme, 
-            ambient_opacity=self.ambient_opacity, 
-            accent=getattr(self, 'current_accent', '#0a84ff'), 
-            accent_end=getattr(self, 'current_accent_end', '#64d2ff'),
-            glass_clarity=self.glass_clarity,
-            glass_rim=self.glass_rim,
-            glass_material=getattr(self, "glass_material", None),
-            glass_overrides=getattr(self, "glass_overrides", None),
-            glass_appearance=getattr(self, "glass_appearance", "dark")
-        ))
+        self._refresh_muted_text()
+        self._apply_theme_style()
         
         # Force layout recalculation and repaint
         if hasattr(self, 'lava_overlay'): self.lava_overlay.sync_active()
@@ -2752,15 +3100,38 @@ class MainWindow(QMainWindow):
             self._settings_dlg.sync_from_main()
         self.save_session_state()
 
-    def _on_ambient_color_changed(self, color):
+    def _apply_theme_style(self, color=None):
+        """Rebuild QSS from the current theme/overrides.
+
+        Theme changes, session restore, and ambient-color changes all go through
+        here so a saved Panel Scrim is never skipped when the saved theme already
+        matches the in-memory default.
+        """
+        if color is None:
+            color = self._current_ambient_color
         # Re-derive the accent from the current Ambient Glow value. Otherwise
         # lowering the slider leaves the previously amplified color in QSS.
         self.current_accent, self.current_accent_end = self._get_accent_color(
             color.red(), color.green(), color.blue()
         )
-        self.setStyleSheet(build_liquid_qss(color.red(), color.green(), color.blue(), theme=self.current_theme, ambient_opacity=self.ambient_opacity, accent=self.current_accent, accent_end=self.current_accent_end, glass_clarity=self.glass_clarity, glass_rim=self.glass_rim, glass_material=getattr(self, "glass_material", None), glass_overrides=getattr(self, "glass_overrides", None), glass_appearance=getattr(self, "glass_appearance", "dark")))
+        self.setStyleSheet(build_liquid_qss(
+            color.red(), color.green(), color.blue(),
+            theme=self.current_theme,
+            ambient_opacity=self.ambient_opacity,
+            accent=self.current_accent,
+            accent_end=self.current_accent_end,
+            glass_clarity=self.glass_clarity,
+            glass_rim=self.glass_rim,
+            glass_material=getattr(self, "glass_material", None),
+            glass_overrides=getattr(self, "glass_overrides", None),
+            glass_appearance=getattr(self, "glass_appearance", "dark"),
+        ))
+        self._refresh_muted_text()
         if getattr(self, "_settings_dlg", None) and self._settings_dlg.isVisible():
             self._settings_dlg.setStyleSheet(self.styleSheet())
+
+    def _on_ambient_color_changed(self, color):
+        self._apply_theme_style(color)
 
     def _get_macos_default_output_name(self):
         try:
@@ -2874,6 +3245,10 @@ class MainWindow(QMainWindow):
         t0 = time.perf_counter()
         self.load_default_sofa()
         self.load_session_state()
+        # AppKit can defer the native material render until after the first
+        # activation; without this second push the panels read too transparent
+        # until the user opens and closes Settings.
+        QTimer.singleShot(200, self._reapply_native_glass)
         self._check_cpu_benchmark((time.perf_counter() - t0) * 1000.0)
 
     def _check_cpu_benchmark(self, startup_ms):
@@ -2951,12 +3326,29 @@ class MainWindow(QMainWindow):
         if hasattr(self, "save_session_state"):
             self.save_session_state()
 
+    def _reapply_native_glass(self):
+        """Re-push native glass after a mode/CPU change (backdrop scale too)."""
+        if not glass or not is_glass_theme(self.current_theme):
+            return
+        configure_macos_glass(self, self.current_theme, True,
+                              getattr(self, "glass_clarity", 45) / 100.0,
+                              material=getattr(self, "glass_material", None))
+        dlg = getattr(self, "_settings_dlg", None)
+        if dlg is not None and dlg.isVisible():
+            dlg.sync_from_main()
+        props = getattr(self, "_props_dlg", None)
+        if props is not None and props.isVisible() and hasattr(props, "mw"):
+            configure_macos_glass(props, self.current_theme, True,
+                                  getattr(self, "glass_clarity", 45) / 100.0,
+                                  material=self.glass_material)
+
     def toggle_cpu_mode(self, checked):
         low = bool(checked)
         self.engine.low_end_mode = low
         if hasattr(self, "btn_cpu_mode"): self.btn_cpu_mode.setText("CPU: Low-End" if low else "CPU: Full Quality")
-        self.combo_fps.setCurrentIndex(0 if low else 3)
+        self.combo_fps.setCurrentIndex(0 if low else GRAPH_FPS_DEFAULT_INDEX)
         if hasattr(self, 'lava_overlay'): self.lava_overlay.sync_active()
+        self._reapply_native_glass()
         if self.engine.sofa_data is not None:
             self.engine._update_hrirs()
         self.save_session_state()
@@ -2996,12 +3388,52 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
         self.lava_overlay = LavaLampOverlay(self, central)
         self.lava_overlay.lower()
-        main_layout = QHBoxLayout(central)
+
+        # Keep the whole player scrollable so opening DSP controls never
+        # squishes the cover / transport / spectrum. Transparent viewport so
+        # the native glass material and lava wash stay visible behind it.
+        outer_layout = QVBoxLayout(central)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+        outer_layout.setSpacing(0)
+        self.main_scroll = QScrollArea(central)
+        self.main_scroll.setObjectName("mainScroll")
+        self.main_scroll.setFrameShape(QScrollArea.NoFrame)
+        self.main_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.main_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.main_scroll.setWidgetResizable(True)
+        self.main_scroll.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        translucent = windows_transparency_enabled()
+        self.main_scroll.setAttribute(Qt.WA_TranslucentBackground, translucent)
+        self.main_scroll.setAutoFillBackground(False)
+        viewport = self.main_scroll.viewport()
+        viewport.setAttribute(Qt.WA_TranslucentBackground, translucent)
+        viewport.setAttribute(Qt.WA_NoSystemBackground, translucent)
+        viewport.setAutoFillBackground(False)
+        outer_layout.addWidget(self.main_scroll)
+        content = QWidget(self.main_scroll)
+        content.setObjectName("mainContent")
+        # A plain QWidget paints the palette window color by default; that
+        # opaque fill hid the native NSGlassEffectView behind the scroll area.
+        content.setAttribute(Qt.WA_TranslucentBackground, translucent)
+        content.setAttribute(Qt.WA_NoSystemBackground, translucent)
+        content.setAutoFillBackground(False)
+        self.main_content = content
+        self.main_scroll.setWidget(content)
+        self.main_scroll.verticalScrollBar().valueChanged.connect(
+            lambda *_: schedule_macos_panel_glass_sync(self)
+        )
+        self.lava_overlay.lower()
+
+        main_layout = QHBoxLayout(content)
         main_layout.setSpacing(10)
         main_layout.setContentsMargins(20, 40 if sys.platform == 'darwin' else 20, 20, 20)
 
         # --- LEFT SIDE: LIBRARY ---
         left_card = make_glass_card()
+        self.left_card = left_card
+        # Default window is slightly taller for the graph; keep the library
+        # card at its original 820px-window proportion.
+        left_card.setFixedHeight(_LIBRARY_BASE_HEIGHT)
         left_layout = QVBoxLayout(left_card)
         left_layout.setContentsMargins(14, 14, 14, 14)
         
@@ -3060,7 +3492,7 @@ class MainWindow(QMainWindow):
         self.list_widget.model().rowsMoved.connect(self.on_playlist_reordered)
         left_layout.addWidget(self.list_widget, 1)
         
-        main_layout.addWidget(left_card, stretch=1)
+        main_layout.addWidget(left_card, stretch=1, alignment=Qt.AlignTop)
 
         # --- RIGHT SIDE: PLAYER & DSP ---
         right_layout = QVBoxLayout()
@@ -3075,7 +3507,6 @@ class MainWindow(QMainWindow):
         self.btn_load_sofa = QPushButton("Load SOFA")
         self.btn_load_sofa.clicked.connect(self.load_sofa)
         self.lbl_sofa_file = QLabel("No SOFA loaded")
-        from PySide6.QtWidgets import QSizePolicy
         self.lbl_sofa_file.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         
         self.btn_export = QPushButton("Export Track")
@@ -3115,11 +3546,12 @@ class MainWindow(QMainWindow):
 
         _is_first = (not os.path.exists(get_resource_path("default_sofa.npz"))) and (not os.path.exists(self.engine._sofa_cache_path(get_resource_path("default.sofa"))) if os.path.exists(get_resource_path("default.sofa")) else False)
         self.lbl_dev_status = QLabel("First launch: caching HRTF acoustic profile — subsequent startups will be instant." if _is_first else "Tip: Select your DAC directly instead of System Default for native sample-rate switching.")
+        self._dev_status_exclusive = "info" if _is_first else None
         if _is_first:
             self.lbl_dev_status.setStyleSheet("color: #64d2ff; font-size: 12px; font-weight: bold; margin-bottom: 4px;")
         self.lbl_dev_status.setWordWrap(True)
         if not _is_first:
-            self.lbl_dev_status.setStyleSheet("color: #8e8e93; font-size: 11px; margin-bottom: 4px;")
+            self.lbl_dev_status.setStyleSheet(self._dev_status_style())
         top_card_layout.addWidget(self.lbl_dev_status)
 
         # Album Art & Track Info
@@ -3236,7 +3668,7 @@ class MainWindow(QMainWindow):
         peak_layout.addWidget(QLabel("Graph FPS:"))
         self.combo_fps = QComboBox()
         self.combo_fps.addItems(["10 FPS", "30 FPS", "60 FPS", "120 FPS"])
-        self.combo_fps.setCurrentIndex(3) 
+        self.combo_fps.setCurrentIndex(GRAPH_FPS_DEFAULT_INDEX)
         self.combo_fps.setFixedWidth(120) 
         self.combo_fps.currentIndexChanged.connect(self.change_fps)
         peak_layout.addWidget(self.combo_fps)
@@ -3261,6 +3693,17 @@ class MainWindow(QMainWindow):
         peak_layout.addWidget(self.lbl_peak)
         
         spec_layout.addLayout(peak_layout)
+
+        perf_row = QHBoxLayout()
+        perf_row.setContentsMargins(0, 0, 0, 0)
+        perf_row.setSpacing(6)
+        self.lbl_perf = QLabel("Perf: idle")
+        self.lbl_perf.setMaximumHeight(16)
+        self.lbl_perf.setStyleSheet(f"color: {self._muted_text_color()}; font-size: 11px; font-weight: bold;")
+        self.lbl_perf.setToolTip("Start playback to measure real graph FPS.")
+        perf_row.addWidget(self.lbl_perf)
+        perf_row.addStretch()
+        spec_layout.addLayout(perf_row)
 
         # Graph
         self.plot_widget = HoverPlotWidget(title="Real-time Spectrum: Input vs Output")
@@ -3349,7 +3792,6 @@ class MainWindow(QMainWindow):
         dsp_card_layout.addLayout(dsp_header_layout)
 
         self.dsp_panel = QWidget()
-        from PySide6.QtWidgets import QSizePolicy
         self.dsp_panel.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         self.dsp_panel.setVisible(False)
         ctrl_layout = QVBoxLayout(self.dsp_panel)
@@ -3837,10 +4279,33 @@ class MainWindow(QMainWindow):
             self.viz_timer.stop()
             self._set_dev_status("Live Stopped — Press Play or select a track.", None)
 
+    def _muted_text_color(self):
+        return muted_text_color(getattr(self, "current_theme", "classic"),
+                                getattr(self, "glass_appearance", "dark"))
+
+    def _dev_status_style(self, *, bold=False):
+        weight = " font-weight: bold;" if bold else ""
+        return (f"color: {self._muted_text_color()}; font-size: 11px;"
+                f"{weight} margin-bottom: 4px;")
+
+    def _refresh_muted_text(self):
+        muted = self._muted_text_color()
+        if (hasattr(self, "lbl_dev_status")
+                and getattr(self, "_dev_status_exclusive", None) is None):
+            self.lbl_dev_status.setStyleSheet(self._dev_status_style())
+        # Keep the idle perf readout in step with the surface; live green/orange
+        # results keep their own status color.
+        if getattr(self, "_graph_perf_color", None) in ("#8e8e93", "#3c3c43"):
+            self._graph_perf_color = muted
+            if hasattr(self, "lbl_perf"):
+                self.lbl_perf.setStyleSheet(
+                    f"color: {muted}; font-size: 11px; font-weight: bold;")
+
     def _set_dev_status(self, text, exclusive):
         self.lbl_dev_status.setText(text)
+        self._dev_status_exclusive = exclusive
         if exclusive is None:
-            self.lbl_dev_status.setStyleSheet("color: #8e8e93; font-size: 11px; margin-bottom: 4px;")
+            self.lbl_dev_status.setStyleSheet(self._dev_status_style())
         else:
             color = "#34c759" if exclusive else "#ff9500"
             self.lbl_dev_status.setStyleSheet(f"color: {color}; font-size: 11px; font-weight: bold; margin-bottom: 4px;")
@@ -3859,9 +4324,8 @@ class MainWindow(QMainWindow):
             self._set_dev_status(self.engine.stream_mode_status, self.engine.stream_is_exclusive)
 
     def change_fps(self, index):
-        fps_map = {0: 100, 1: 33, 2: 16, 3: 8}
-        ms = fps_map.get(index, 100)
-        self.viz_timer.setInterval(ms)
+        self.viz_timer.setInterval(graph_fps_interval(index))
+        self._reset_graph_perf()
 
     def change_smoothing(self, index):
         taus_ms = [0.0, 20.0, 42.0, 70.0]
@@ -4074,8 +4538,72 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+    def _reset_graph_perf(self, text="Perf: measuring…"):
+        self._graph_perf_start = 0.0
+        self._graph_perf_frames = 0
+        self._graph_fps_ema = None
+        self._graph_perf_text = text
+        self._graph_perf_tip = "Start playback to measure real graph FPS."
+        self._graph_perf_color = self._muted_text_color()
+        if hasattr(self, "lbl_perf"):
+            self.lbl_perf.setText(text)
+            self.lbl_perf.setStyleSheet(
+                f"color: {self._graph_perf_color}; font-size: 11px; font-weight: bold;"
+            )
+            self.lbl_perf.setToolTip(self._graph_perf_tip)
+        dlg = getattr(self, "_settings_dlg", None)
+        if dlg is not None:
+            dlg.update_graph_perf(self._graph_perf_text, self._graph_perf_tip,
+                                  self._graph_perf_color)
+
+    def _set_graph_perf(self, achieved):
+        target = graph_fps_target(self.combo_fps.currentIndex())
+        status, tip, color = performance_advice(
+            target, achieved,
+            low_end_mode=bool(self.engine.low_end_mode),
+            spectrum_fill=bool(getattr(self, "spectrum_fill_enabled", True)),
+            theme=getattr(self, "current_theme", ""),
+        )
+        text = f"Perf: {achieved:.0f}/{target} FPS · {status}"
+        full_tip = f"Measured from real graph callbacks (target {target} FPS). {tip}"
+        self._graph_perf_text = text
+        self._graph_perf_tip = full_tip
+        self._graph_perf_color = color
+        if hasattr(self, "lbl_perf"):
+            self.lbl_perf.setText(text)
+            self.lbl_perf.setStyleSheet(
+                f"color: {color}; font-size: 11px; font-weight: bold;"
+            )
+            self.lbl_perf.setToolTip(full_tip)
+        dlg = getattr(self, "_settings_dlg", None)
+        if dlg is not None:
+            dlg.update_graph_perf(text, full_tip, color)
+
+    def _track_graph_fps(self, now=None):
+        if not getattr(self.engine, "is_playing", False):
+            return
+        if now is None:
+            now = time.perf_counter()
+        if not getattr(self, "_graph_perf_start", 0.0):
+            self._graph_perf_start = now
+            self._graph_perf_frames = 0
+            return
+        self._graph_perf_frames += 1
+        elapsed = now - self._graph_perf_start
+        if elapsed < _GRAPH_PERF_WINDOW_SEC:
+            return
+        achieved = self._graph_perf_frames / elapsed
+        ema = getattr(self, "_graph_fps_ema", None)
+        self._graph_fps_ema = (achieved if ema is None else
+                               (1.0 - _GRAPH_PERF_SMOOTHING) * ema +
+                               _GRAPH_PERF_SMOOTHING * achieved)
+        self._set_graph_perf(self._graph_fps_ema)
+        self._graph_perf_start = now
+        self._graph_perf_frames = 0
+
     def update_graph(self):
         try:
+            self._track_graph_fps()
             if not self.engine.is_playing or (self.engine.audio_data is None and self.engine.input_device is None and not self.engine.use_mac_tap):
                 return
             if getattr(self.engine, 'latest_stereo_out', None) is not None and hasattr(self, 'stereo_analyzer') and self.stereo_analyzer.isVisible():
@@ -4211,15 +4739,17 @@ class MainWindow(QMainWindow):
             self.btn_play.setText("▶ Play")
             self.timer.stop()
             self.viz_timer.stop()
+            self._reset_graph_perf("Perf: idle")
             self.smoothed_in = None
             self.lbl_dev_status.setText("Paused — Select your DAC directly instead of System Default for native sample-rate switching.")
-            self.lbl_dev_status.setStyleSheet("color: #8e8e93; font-size: 11px; margin-bottom: 4px;")
+            self.lbl_dev_status.setStyleSheet(self._dev_status_style())
         else:
             self._scrobble_last_tick = time.perf_counter()
             self.engine.start()
             self.btn_play.setText("⏸ Pause")
             self.timer.start()
             self.viz_timer.start()
+            self._reset_graph_perf()
             self._set_dev_status(self.engine.stream_mode_status, self.engine.stream_is_exclusive)
 
     def seek_audio(self, value):
@@ -4291,13 +4821,69 @@ class MainWindow(QMainWindow):
         self.btn_play.setText("▶ Play")
         self.timer.stop()
         self.viz_timer.stop()
+        self._reset_graph_perf("Perf: idle")
         self.smoothed_in = None
         self._set_dev_status("Stopped — Select your DAC directly instead of System Default for native sample-rate switching.", None)
+
+    def _sync_main_content_height(self):
+        """Keep stock proportions; only add scrollable height for DSP panel."""
+        scroll = getattr(self, "main_scroll", None)
+        content = getattr(self, "main_content", None)
+        if scroll is None or content is None:
+            return
+        vh = scroll.viewport().height()
+        if vh < 200:  # not laid out yet; retry after the first show/resize
+            QTimer.singleShot(0, self._sync_main_content_height)
+            return
+        # At the stock size the library keeps its original 760px proportion.
+        # When the window is maximized or fullscreen, grow it by the same extra
+        # height so it does not stay short while the right column fills the
+        # screen.
+        left = getattr(self, "left_card", None)
+        if left is not None:
+            # During a zoom/fullscreen transition keep the library at its
+            # stock height. Growing it mid-animation raises the effective
+            # minimum size and Qt/AppKit clamps the shrink part way.
+            if getattr(self, "_is_resizing", False):
+                target_h = _LIBRARY_BASE_HEIGHT
+            else:
+                target_h = _LIBRARY_BASE_HEIGHT + max(0, vh - _DEFAULT_WINDOW_HEIGHT)
+            if left.height() != target_h:
+                left.setFixedHeight(target_h)
+        extra = 0
+        panel = getattr(self, "dsp_panel", None)
+        if panel is not None and panel.isVisible():
+            extra = panel.sizeHint().height() + 8
+        content.setMaximumHeight(vh + extra)
+
+    def _reset_library_height_for_shrink(self):
+        """Drop the grown library before a window shrink.
+
+        ``_sync_main_content_height()`` grows the library with the viewport.
+        Keeping that larger fixed height while the window shrinks raises the
+        effective minimum size, so Qt/AppKit can only shrink part way and the
+        spectrum card stays too tall. Reset to the stock height first; the
+        following resizeEvent() grows it back to the correct size.
+        """
+        left = getattr(self, "left_card", None)
+        if left is not None and left.height() > _LIBRARY_BASE_HEIGHT:
+            left.setFixedHeight(_LIBRARY_BASE_HEIGHT)
+
+    def _scroll_main_to_bottom(self):
+        """Show the newly opened bottom controls without shrinking the UI."""
+        scroll = getattr(self, "main_scroll", None)
+        if scroll is None:
+            return
+        bar = scroll.verticalScrollBar()
+        bar.setValue(bar.maximum())
 
     def toggle_stereo_scope(self, checked):
         visible = bool(checked)
         self.stereo_analyzer.setVisible(visible)
         self.btn_stereo_scope.setText("Stereo: On" if visible else "Stereo: Off")
+        self._sync_main_content_height()
+        if visible:
+            QTimer.singleShot(0, self._scroll_main_to_bottom)
         if hasattr(self, "save_session_state"):
             self.save_session_state()
 
@@ -4308,8 +4894,14 @@ class MainWindow(QMainWindow):
         if hasattr(self, "lava_overlay") and self.centralWidget():
             self.lava_overlay.setGeometry(self.centralWidget().rect())
             self.lava_overlay.lower()
+        self._sync_main_content_height()
         if hasattr(self, "lbl_cover"):
             self.update_cover_art_size()
+        if visible:
+            # Let the layout settle once, then re-pin to the bottom after the
+            # cover repaint in case the content height changed again.
+            QTimer.singleShot(0, self._scroll_main_to_bottom)
+            QTimer.singleShot(80, self._scroll_main_to_bottom)
         if hasattr(self, 'save_session_state'):
             self.save_session_state()
 
@@ -4487,6 +5079,9 @@ class MainWindow(QMainWindow):
         pending = getattr(self, "_mini_cover_pending", None)
         if pending is not None:
             pending.discard(path)
+        futures = getattr(self, "_mini_cover_futures", None)
+        if futures is not None:
+            futures.pop(path, None)
         if hasattr(self, "list_widget") and not getattr(self, "_cover_repaint_queued", False):
             self._cover_repaint_queued = True
             QTimer.singleShot(12, self._flush_cover_repaint)
@@ -4526,20 +5121,33 @@ class MainWindow(QMainWindow):
         batch = visible_paths if visible_paths else list(q)[-14:]
         q.clear()
 
+        # Rows that scrolled out of view no longer need their work. Cancel the
+        # queued ones immediately so visible rows are not stuck behind them.
+        futures = getattr(self, "_mini_cover_futures", None)
+        if futures is None:
+            futures = {}
+            self._mini_cover_futures = futures
+        desired = set(batch)
+        for p, future in list(futures.items()):
+            if p not in desired and not future.done() and future.cancel():
+                futures.pop(p, None)
+                pending.discard(p)
+
         def _decode_job(p, sig):
-            from PySide6.QtGui import QImage
-            raw = _extract_cover_bytes(p)
             img = None
-            if raw:
-                src_img = QImage()
-                if src_img.loadFromData(raw) and not src_img.isNull():
-                    img = src_img.scaled(88, 88, Qt.KeepAspectRatioByExpanding, Qt.FastTransformation)
+            try:
+                raw = _extract_cover_bytes(p)
+                if raw:
+                    img = _decode_mini_thumb(raw)
+            except Exception:
+                img = None
             sig.loaded.emit(p, img)
 
-        for p in batch[:16]:
+        for p in batch:
             if p not in pending and p not in getattr(self, "_visible_covers", {}):
                 pending.add(p)
-                self._mini_cover_pool.submit(_decode_job, p, self._mini_cover_sig)
+                future = self._mini_cover_pool.submit(_decode_job, p, self._mini_cover_sig)
+                futures[p] = future
 
     def _get_mini_cover_async(self, path):
         if not path:
@@ -4553,14 +5161,18 @@ class MainWindow(QMainWindow):
         pending = getattr(self, "_mini_cover_pending", None)
         if pending is not None and path in pending:
             return None
-        _get_mutagen()
+        # Mutagen is imported inside the worker on first decode; doing it here
+        # would block the UI thread for the first scroll.
         if not hasattr(self, "_mini_cover_sig"):
             class _CovBridge(QObject):
                 loaded = Signal(str, object)
             self._mini_cover_sig = _CovBridge(self)
             self._mini_cover_sig.loaded.connect(self._on_mini_cover_ready)
             from concurrent.futures import ThreadPoolExecutor
-            self._mini_cover_pool = ThreadPoolExecutor(max_workers=2)
+            # Four small decoders keep visible rows filling at an even pace;
+            # tag/folder reads are cached and cancellation drops stale rows.
+            self._mini_cover_pool = ThreadPoolExecutor(max_workers=4)
+            self._mini_cover_futures = {}
             self._mini_cover_queue = []
             self._mini_cover_debounce = QTimer(self)
             self._mini_cover_debounce.setSingleShot(True)
@@ -4587,9 +5199,9 @@ class MainWindow(QMainWindow):
         raw = _extract_cover_bytes(path)
         pm = None
         if raw:
-            full = QPixmap()
-            if full.loadFromData(raw):
-                pm = full.scaled(88, 88, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
+            img = _decode_mini_thumb(raw)
+            if img is not None and not img.isNull():
+                pm = QPixmap.fromImage(img)
         if len(cache) > 250:
             cache.clear()
         cache[folder_key] = pm
@@ -4946,7 +5558,7 @@ class MainWindow(QMainWindow):
             lbl_dim = QLabel(f"Cover Art: {full_pm.width()} × {full_pm.height()} px")
             lbl_dim.setStyleSheet("font-weight: bold; font-size: 12px;")
             lbl_hint = QLabel("Click cover to inspect full resolution")
-            lbl_hint.setStyleSheet("font-size: 11px; opacity: 0.72;")
+            lbl_hint.setStyleSheet(f"font-size: 11px; color: {self._muted_text_color()};")
             cov_info.addStretch()
             cov_info.addWidget(lbl_dim)
             cov_info.addWidget(lbl_hint)
@@ -5004,7 +5616,7 @@ class MainWindow(QMainWindow):
         ]
         for r_idx, (k, v) in enumerate(rows):
             kl = QLabel(k)
-            kl.setStyleSheet("font-weight: bold; opacity: 0.78;")
+            kl.setStyleSheet(f"font-weight: bold; color: {self._muted_text_color()};")
             vl = QLabel(str(v))
             vl.setTextInteractionFlags(Qt.TextSelectableByMouse)
             vl.setWordWrap(True)
@@ -5023,6 +5635,7 @@ class MainWindow(QMainWindow):
         lay.addLayout(btn_row)
 
         dlg.setStyleSheet(self.styleSheet())
+        dlg.mw = self  # let configure_macos_glass see Low-End CPU mode
         if is_glass_theme(self.current_theme) and glass:
             glass.apply_glass_to_window(dlg)
             configure_macos_glass(dlg, self.current_theme, True,
@@ -5066,8 +5679,9 @@ class MainWindow(QMainWindow):
         from PySide6.QtWidgets import QMenu
         menu = QMenu(self)
         menu.setAttribute(Qt.WA_TranslucentBackground, True)
-        is_light = getattr(self, "current_theme", "classic") == "light"
-        is_glass = is_glass_theme(getattr(self, "current_theme", "classic"))
+        theme = getattr(self, "current_theme", "classic")
+        is_light = is_light_surface(theme, getattr(self, "glass_appearance", "dark"))
+        is_glass = is_glass_theme(theme)
         accent = getattr(self, "current_accent", "#0a84ff")
         if is_light:
             bg, fg, brd = "rgba(255, 255, 255, 238)", "#1c1c1e", "rgba(0, 0, 0, 28)"
@@ -5184,7 +5798,6 @@ class MainWindow(QMainWindow):
                 "position_sec": pos_sec,
                 "volume": getattr(self, "_pre_bp_vol", getattr(self, "_pre_live_vol", int(round(self.engine.volume * 100)))) if (self.engine.bit_perfect or self._bp_ramp_timer.isActive() or self.engine.use_mac_tap) else int(round(self.engine.volume * 100)),
                 "shuffle": self.shuffle_enabled,
-                "dsp_panel_open": self.btn_toggle_dsp_panel.isChecked(),
                 "stereo_scope_open": self.btn_stereo_scope.isChecked() if hasattr(self, "btn_stereo_scope") else False,
                 "theme": getattr(self, "current_theme", "liquid_glass"),
                 "ambient_opacity": getattr(self, "ambient_opacity", 0.30),
@@ -5193,15 +5806,32 @@ class MainWindow(QMainWindow):
                 "glass_appearance": getattr(self, "glass_appearance", "dark"),
                 "glass_overrides": getattr(self, "glass_overrides", {}),
                 "glass_clarity": getattr(self, "glass_clarity", 45),
-                "glass_rim": getattr(self, "glass_rim", 20),
+                "glass_rim": getattr(self, "glass_rim", DEFAULT_GLASS_RIM),
                 "low_end_mode": self.engine.low_end_mode,
                 "spectrum_fill": getattr(self, "spectrum_fill_enabled", True),
                 "dynamic_ambient": getattr(self, "dynamic_ambient", True),
                 "scrobble_cfg": getattr(self, "scrobble_cfg", {}),
                 "sofa_path": self.engine.sofa_path if (self.engine.sofa_path and os.path.exists(self.engine.sofa_path) and os.path.abspath(self.engine.sofa_path) != os.path.abspath(get_resource_path("default.sofa"))) else "",
             }
-            with open(self._state_file_path(), "w", encoding="utf-8") as f:
-                json.dump(state, f, indent=2)
+            state_path = self._state_file_path()
+            # Atomic replace prevents a startup read (or another REXA process)
+            # from seeing a half-written JSON file and losing saved tuning.
+            tmp = tempfile.NamedTemporaryFile(
+                "w", encoding="utf-8", dir=os.path.dirname(state_path),
+                prefix=".session-", suffix=".tmp", delete=False
+            )
+            try:
+                with tmp:
+                    json.dump(state, tmp, indent=2)
+                    tmp.flush()
+                    os.fsync(tmp.fileno())
+                os.replace(tmp.name, state_path)
+            except Exception:
+                try:
+                    os.unlink(tmp.name)
+                except OSError:
+                    pass
+                raise
         except Exception as e:
             print(f"Failed to save session: {e}")
 
@@ -5264,13 +5894,14 @@ class MainWindow(QMainWindow):
                     else:
                         legacy_key = canonical_glass_material(k)
                         stage = ("dark" if legacy_key == "dark"
-                                 else "light" if legacy_key == "clear" else None)
+                                 else "light" if legacy_key == "clear"
+                                 else "dark" if legacy_clarity >= 70 else "light")
                     if not stage:
                         continue
-                    per = normalize_glass_overrides(value)
+                    per = normalize_glass_overrides(value, stage)
                     if per:
                         self.glass_overrides[stage] = per
-            self.glass_rim = int(state.get("glass_rim", 20))
+            self.glass_rim = int(state.get("glass_rim", DEFAULT_GLASS_RIM))
             if hasattr(self, "slider_glass_clarity"):
                 self.slider_glass_clarity.blockSignals(True); self.slider_glass_clarity.setValue(self.glass_clarity); self.slider_glass_clarity.blockSignals(False)
                 self.slider_glass_rim.blockSignals(True); self.slider_glass_rim.setValue(self.glass_rim); self.slider_glass_rim.blockSignals(False)
@@ -5281,9 +5912,15 @@ class MainWindow(QMainWindow):
             if theme in THEME_ORDER and self.current_theme != theme:
                 self.current_theme = THEME_ORDER[(THEME_ORDER.index(theme) - 1) % len(THEME_ORDER)]
                 self.toggle_theme()
-            panel_open = bool(state.get("dsp_panel_open", False))
-            self.btn_toggle_dsp_panel.setChecked(panel_open)
-            self.toggle_dsp_panel(panel_open)
+            self._reapply_native_glass()
+            # Native glass is one half of the panel; QSS scrim is the other.
+            # Rebuild it here too, because toggle_theme() only runs when the
+            # saved theme differs from the startup default.
+            self._apply_theme_style()
+            # DSP controls always start closed so the default proportions and
+            # hidden scrollbar are predictable, regardless of older sessions.
+            self.btn_toggle_dsp_panel.setChecked(False)
+            self.toggle_dsp_panel(False)
             stereo_open = bool(state.get("stereo_scope_open", False))
             if hasattr(self, "btn_stereo_scope"):
                 self.btn_stereo_scope.setChecked(stereo_open)
@@ -5372,10 +6009,13 @@ class MainWindow(QMainWindow):
         return QSize(1100, 820)
 
     def update_cover_art_size(self):
-        h = self.height()
+        # Cover and top controls keep the stock 820px-window proportion; the
+        # taller default window adds its extra height only to the spectrum.
+        h = min(self.height(), 820)
         w = self.width()
-        panel_h = self.dsp_panel.sizeHint().height() if (hasattr(self, "dsp_panel") and self.dsp_panel.isVisible()) else 0
-        free_for_cover = (h - panel_h - 555) * 0.72
+        # DSP controls live in the scroll area now; opening them must not
+        # shrink the cover, so size only from the viewport height.
+        free_for_cover = (h - 555) * 0.72
         size = max(108, min(280, int(free_for_cover)))
         stepped_size = size
 
@@ -5384,8 +6024,7 @@ class MainWindow(QMainWindow):
             self.stereo_analyzer.setFixedWidth(sa_w)
 
         self.lbl_cover.setMinimumSize(100, 100)
-        if self.lbl_cover.width() != stepped_size or self.lbl_cover.height() != stepped_size:
-            self.lbl_cover.setFixedSize(stepped_size, stepped_size)
+        self.lbl_cover.setFixedSize(stepped_size, stepped_size)
 
         raw = getattr(self, "_raw_cover_pixmap", None)
         render_key = (id(raw), stepped_size)
@@ -5453,6 +6092,47 @@ class MainWindow(QMainWindow):
             f.setPixelSize(artist_px)
             self.lbl_track_artist.setFont(f)
 
+    def event(self, event):
+        # AppKit can defer/rerender NSGlassEffectView material on show or
+        # activation changes. Without a fresh push the panels read too
+        # transparent until the user opens and closes Settings.
+        if event.type() in (QEvent.Show, QEvent.WindowActivate):
+            if not getattr(self, "_native_glass_refresh_pending", False):
+                self._native_glass_refresh_pending = True
+                QTimer.singleShot(0, self._flush_native_glass_refresh)
+        return super().event(event)
+
+    def _flush_native_glass_refresh(self):
+        self._native_glass_refresh_pending = False
+        self._reapply_native_glass()
+
+    def showFullScreen(self):
+        self._pre_fullscreen_geometry = QRect(self.geometry())
+        super().showFullScreen()
+
+    def showNormal(self):
+        was_fullscreen = self.isFullScreen()
+        saved = getattr(self, "_pre_fullscreen_geometry", None)
+        self._reset_library_height_for_shrink()
+        # Exiting fullscreen goes through the native window path, not
+        # WindowDragFilter._animate_to(), so own the same resize guard here.
+        self._is_resizing = True
+        def _finish():
+            self._is_resizing = False
+            self._sync_main_content_height()
+            self.update_cover_art_size()
+        QTimer.singleShot(420, _finish)
+        super().showNormal()
+        if was_fullscreen and saved is not None:
+            # Settle in this event turn so the fullscreen-sized spectrum is
+            # never painted after the window returns to normal.
+            for _ in range(8):
+                self.setGeometry(saved)
+                QApplication.processEvents()
+                if self.geometry().size() == saved.size():
+                    break
+            self._pre_fullscreen_geometry = None
+
     def changeEvent(self, event):
         if event.type() == QEvent.WindowStateChange:
             if hasattr(self, "lbl_cover"):
@@ -5464,6 +6144,8 @@ class MainWindow(QMainWindow):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        self._sync_main_content_height()
+        QTimer.singleShot(0, self._sync_main_content_height)
         if hasattr(self, "lava_overlay") and self.centralWidget():
             self.lava_overlay.setGeometry(self.centralWidget().rect())
             self.lava_overlay.lower()

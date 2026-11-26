@@ -1,7 +1,8 @@
 import os, sys, time, ctypes
-from PySide6.QtWidgets import (QFrame, QAbstractButton, QAbstractSlider, QComboBox,
-                               QLineEdit, QAbstractSpinBox, QAbstractItemView, QScrollBar)
-from PySide6.QtCore import QObject, QEvent, Qt, QTimer, QRect
+from PySide6.QtWidgets import (QApplication, QFrame, QAbstractButton, QAbstractSlider,
+                               QComboBox, QLineEdit, QAbstractSpinBox,
+                               QAbstractItemView, QScrollBar)
+from PySide6.QtCore import QObject, QEvent, Qt, QTimer, QRect, QPoint
 from PySide6.QtGui import QImage
 
 def make_glass_card(parent=None, radius=16):
@@ -49,16 +50,37 @@ GLASS_STAGES = ("dark", "light")
 GLASS_STAGE_LABELS = {"dark": "Dark", "light": "Light"}
 GLASS_STAGE_MATERIAL = {"dark": "dark", "light": "clear"}
 
+# Dark's native tint is intentionally capped at its stock level; brighter
+# tints washed the panel out over picture backgrounds. Light keeps full range.
+GLASS_STAGE_TINT_MAX = {"dark": 0.52, "light": 1.0}
+
+# Stock Glass Border Rim: shared by QSS generation, the Settings reset slider,
+# and fresh/missing session state.
+DEFAULT_GLASS_RIM = 10
+
+# Backdrop downsample is not user-tunable: keep the sharpest/full-scale value
+# in normal mode and ease to ~1/3 only for Low-End CPU mode.
+GLASS_BACKDROP_SCALE_FULL = 0.50
+GLASS_BACKDROP_SCALE_LOW_END = 0.33
+
+# Per-card native glass. The QSS scrim stays fairly light so this material is
+# actually visible; the window-level material remains behind it.
+GLASS_PANEL_TINT_ALPHA = {"dark": 0.16, "light": 0.06}
+_PANEL_GLASS_WINDOW_BELOW = -1
+_PANEL_GLASS_RESIZE_MASK = 2 | 16  # NSViewWidthSizable | NSViewHeightSizable
+
 _GLASS_OVERRIDE_RANGES = {
-    "backdrop_scale": (0.20, 0.50),
     "tint_alpha": (0.0, 1.0),
     "card_alpha": (0, 255),
     "list_alpha": (0, 255),
 }
 
 
-def normalize_glass_overrides(value):
-    """Clamp user tuning values to safe ranges; ignore unknown keys."""
+def normalize_glass_overrides(value, stage=None):
+    """Clamp user tuning values to safe ranges; ignore unknown keys.
+
+    ``stage`` also enforces the per-stage Native Tint ceiling.
+    """
     out = {}
     if not isinstance(value, dict):
         return out
@@ -70,6 +92,8 @@ def normalize_glass_overrides(value):
         except (TypeError, ValueError):
             continue
         number = max(lo, min(hi, number))
+        if key == "tint_alpha" and stage in GLASS_STAGE_TINT_MAX:
+            number = min(number, GLASS_STAGE_TINT_MAX[stage])
         out[key] = int(round(number)) if key in ("card_alpha", "list_alpha") else number
     style = str(value.get("style", "")).strip().lower()
     if style in ("clear", "regular"):
@@ -87,9 +111,13 @@ _GLASS_MATERIAL_PROFILES = {
     "default": {"opacity": 0.62, "style": "clear", "tint_alpha": 0.34,
                 "tint_rgb": (0.05, 0.055, 0.065), "card_alpha": 174,
                 "list_alpha": 166, "backdrop_scale": 0.35},
-    "dark": {"opacity": 0.82, "style": "clear", "tint_alpha": 0.46,
-             "tint_rgb": (0.035, 0.038, 0.045), "card_alpha": 194,
-             "list_alpha": 186, "backdrop_scale": 0.33},
+    # Dark stage panels lean deliberately dark: the native Clear material
+    # still supplies the blur, while a denser tint + QSS scrim gives text a
+    # steadier background over bright wallpapers. This is not a blur-radius
+    # control; it is a best-effort visual preset.
+    "dark": {"opacity": 0.82, "style": "clear", "tint_alpha": 0.52,
+             "tint_rgb": (0.028, 0.031, 0.038), "card_alpha": 176,
+             "list_alpha": 168, "backdrop_scale": 0.33},
     "clear": {"opacity": 0.48, "style": "clear", "tint_alpha": 0.27,
               "tint_rgb": (0.05, 0.055, 0.065), "card_alpha": 162,
               "list_alpha": 154, "backdrop_scale": 0.36},
@@ -104,13 +132,13 @@ def canonical_glass_material(material):
     return key if key in GLASS_MATERIALS else "automatic"
 
 
-def glass_material_profile(material, opacity=None, overrides=None):
+def glass_material_profile(material, opacity=None, overrides=None, stage=None):
     """Return the native-glass preset for a discrete material mode.
 
-    Every macOS 27 mode uses the public Clear style by default; Regular is an
+    Every Glass 2.0 mode uses the public Clear style by default; Regular is an
     advanced opt-in override. ``automatic`` follows the last system-synced
     clarity. User overrides are clamped experimental values, not a public
-    numeric blur control.
+    numeric blur control. ``stage`` enforces the Dark/Light Native Tint cap.
     """
     key = canonical_glass_material(material)
     if key == "automatic":
@@ -126,7 +154,7 @@ def glass_material_profile(material, opacity=None, overrides=None):
     else:
         profile = dict(_GLASS_MATERIAL_PROFILES[key])
         profile["material"] = key
-    profile.update(normalize_glass_overrides(overrides))
+    profile.update(normalize_glass_overrides(overrides, stage))
     return profile
 
 
@@ -352,28 +380,69 @@ def _backdrop_layers(layer):
 class _MacosGlassScaleFilter(QObject):
     """Reapply the backdrop scale after AppKit rebuilds it on move/resize."""
 
+    def __init__(self, owner):
+        super().__init__(owner)
+        self.owner = owner
+        self._pending = 0
+
     def eventFilter(self, obj, event):
         try:
             if event.type() in (QEvent.Move, QEvent.Resize):
                 scale = getattr(obj, "_glass_backdrop_scale", None)
-                if scale is not None:
-                    def reapply(w=obj, s=scale):
-                        _apply_macos_glass_backdrop_scale(w, s)
-                    QTimer.singleShot(0, reapply)
-                    QTimer.singleShot(120, reapply)
+                if scale is not None and self._pending == 0:
+                    # Coalesce a burst of Move/Resize events into one pair of
+                    # callbacks; repeated theme changes used to queue dozens.
+                    self._pending = 2
+                    QTimer.singleShot(0, self._flush_scale)
+                    QTimer.singleShot(120, self._flush_scale)
         except Exception:
             pass
         return False
 
+    def _flush_scale(self):
+        if self._pending <= 0:
+            return
+        self._pending -= 1
+        try:
+            scale = getattr(self.owner, "_glass_backdrop_scale", None)
+            if scale is not None:
+                _apply_macos_glass_backdrop_scale(self.owner, scale)
+        except Exception:
+            pass
+
 
 def _ensure_macos_glass_scale_filter(window):
     if getattr(window, "_glass_scale_filter", None) is None:
-        filt = _MacosGlassScaleFilter()
+        filt = _MacosGlassScaleFilter(window)
         window._glass_scale_filter = filt
         try:
             window.installEventFilter(filt)
         except Exception:
             pass
+
+
+def clear_macos_glass_state(window):
+    """Forget native glass objects/filters after an effect is removed.
+
+    ``pyqt_liquidglass.remove_glass_effect()`` removes the view from its
+    superview but leaves ``window._glass_view`` pointing at it. Touching that
+    stale AppKit view on later theme switches is both needless and a plausible
+    source of intermittent crashes, so drop every cached reference here.
+    """
+    window._glass_view = None
+    window._glass_backdrop_scale = None
+    window._glass_scale_token = int(getattr(window, "_glass_scale_token", 0)) + 1
+    filt = getattr(window, "_glass_scale_filter", None)
+    if filt is not None:
+        try:
+            window.removeEventFilter(filt)
+        except Exception:
+            pass
+        try:
+            filt.deleteLater()
+        except Exception:
+            pass
+        window._glass_scale_filter = None
 
 
 def _apply_macos_glass_backdrop_scale(window, scale):
@@ -426,6 +495,230 @@ def set_macos_glass_backdrop_scale(window, scale):
         QTimer.singleShot(delay, attempt)
 
 
+class _PanelGlassFilter(QObject):
+    """Keep per-card NSGlassEffectViews aligned with translated Qt widgets."""
+
+    def __init__(self, owner):
+        super().__init__(owner)
+        self.owner = owner
+
+    def eventFilter(self, obj, event):
+        try:
+            if event.type() in (QEvent.Move, QEvent.Resize,
+                                QEvent.Show, QEvent.Hide):
+                schedule_macos_panel_glass_sync(self.owner)
+        except Exception:
+            pass
+        return False
+
+
+def schedule_macos_panel_glass_sync(window):
+    """Coalesce per-card glass syncs from many widgets into one callback."""
+    if getattr(window, "_panel_glass_sync_pending", False):
+        return
+    generation = int(getattr(window, "_panel_glass_generation", 0))
+    window._panel_glass_sync_pending = True
+
+    def run():
+        if not getattr(window, "_panel_glass_sync_pending", False):
+            return
+        if int(getattr(window, "_panel_glass_generation", 0)) != generation:
+            window._panel_glass_sync_pending = False
+            return
+        window._panel_glass_sync_pending = False
+        _sync_macos_panel_glass(window)
+
+    QTimer.singleShot(0, run)
+
+
+def remove_macos_panel_glass(window):
+    records = list(getattr(window, "_panel_glass_views", []) or [])
+    filt = getattr(window, "_panel_glass_filter", None)
+    for rec in records:
+        try:
+            rec["view"].removeFromSuperview()
+        except Exception:
+            pass
+        if filt is not None:
+            try:
+                rec["widget"].removeEventFilter(filt)
+            except Exception:
+                pass
+    window._panel_glass_views = []
+    window._panel_glass_container = None
+    window._panel_glass_generation = int(
+        getattr(window, "_panel_glass_generation", 0)) + 1
+    window._panel_glass_sync_pending = False
+    if filt is not None:
+        try:
+            window.removeEventFilter(filt)
+        except Exception:
+            pass
+        try:
+            filt.deleteLater()
+        except Exception:
+            pass
+        window._panel_glass_filter = None
+
+
+def _sync_macos_panel_glass(window):
+    records = getattr(window, "_panel_glass_views", None)
+    if not records:
+        return
+    try:
+        from Foundation import NSMakeRect
+        from pyqt_liquidglass._bridge import get_nswindow_from_widget
+
+        ns_window = get_nswindow_from_widget(window)
+        container = getattr(window, "_panel_glass_container", None)
+        if ns_window is None or container is None:
+            return
+        bounds = container.bounds()
+        container_height = float(bounds.size.height)
+        origin_x = float(bounds.origin.x)
+        origin_y = float(bounds.origin.y)
+    except Exception:
+        return
+
+    # One destroyed/dialog-owned widget must not abort sync for every card.
+    for rec in list(records):
+        widget = rec["widget"]
+        view = rec["view"]
+        try:
+            if widget.window() is not window:
+                view.setHidden_(True)
+                continue
+            visible = bool(widget.isVisible() and not widget.isHidden())
+            view.setHidden_(not visible)
+            if not visible:
+                continue
+            pos = widget.mapTo(window, QPoint(0, 0))
+            view.setFrame_(NSMakeRect(
+                origin_x + float(pos.x()),
+                origin_y + container_height - float(pos.y()) - float(widget.height()),
+                float(widget.width()),
+                float(widget.height()),
+            ))
+        except Exception:
+            try:
+                view.setHidden_(True)
+            except Exception:
+                pass
+
+
+def configure_macos_panel_glass(window, theme, enable=True, profile=None,
+                                stage="dark"):
+    """Give each glass card its own native glass layer.
+
+    QSS cannot blur the wallpaper behind a panel; it can only tint it. These
+    NSGlassEffectViews sit behind the Qt content and above the window-wide
+    material, so darker cards read as real glass instead of flat scrim.
+    """
+    if sys.platform != "darwin":
+        return
+    if not enable or theme not in ("liquid_glass", "macos27_glass"):
+        remove_macos_panel_glass(window)
+        return
+    try:
+        import objc
+        from AppKit import NSColor
+        from Foundation import NSMakeRect
+        from pyqt_liquidglass._bridge import (get_nswindow_from_widget,
+                                              get_nsview_from_widget)
+
+        try:
+            from AppKit import (NSGlassEffectViewStyleClear,
+                                NSGlassEffectViewStyleRegular)
+        except ImportError:
+            NSGlassEffectViewStyleClear, NSGlassEffectViewStyleRegular = 1, 0
+
+        ns_window = get_nswindow_from_widget(window)
+        root_view = get_nsview_from_widget(window)
+        if ns_window is None or root_view is None:
+            return
+        content_view = ns_window.contentView()
+        # Match pyqt_liquidglass's sibling-injection strategy: the glass view
+        # must be inserted into root_view's superview, not the window content
+        # view when a custom container was swapped in. Otherwise AppKit treats
+        # root_view as an invalid sibling and stacks the glass above Qt.
+        superview = root_view.superview()
+        container = superview if superview is not None else content_view
+        if getattr(window, "_panel_glass_container", None) != container:
+            remove_macos_panel_glass(window)
+            window._panel_glass_container = container
+        glass_cls = objc.lookUpClass("NSGlassEffectView")
+
+        records = getattr(window, "_panel_glass_views", None)
+        if records is None:
+            records = []
+            window._panel_glass_views = records
+
+        filt = getattr(window, "_panel_glass_filter", None)
+        if filt is None:
+            filt = _PanelGlassFilter(window)
+            window._panel_glass_filter = filt
+            try:
+                window.installEventFilter(filt)
+            except Exception:
+                pass
+
+        # Dialogs are parented to MainWindow; their cards get their own native
+        # views when the dialog is configured and must not be duplicated here.
+        cards = [w for w in window.findChildren(QFrame, "glassCard")
+                 if w.window() is window]
+        wanted = {id(widget) for widget in cards}
+        for rec in list(records):
+            if id(rec["widget"]) not in wanted:
+                try:
+                    rec["view"].removeFromSuperview()
+                except Exception:
+                    pass
+                try:
+                    rec["widget"].removeEventFilter(filt)
+                except Exception:
+                    pass
+                records.remove(rec)
+        known = {id(rec["widget"]): rec for rec in records}
+
+        use_clear = bool(theme == "macos27_glass"
+                         and (not profile or profile.get("style", "clear") == "clear"))
+        tint_alpha = GLASS_PANEL_TINT_ALPHA.get(stage, 0.12)
+        tint_rgb = (1.0, 1.0, 1.0) if stage == "light" else (0.03, 0.033, 0.04)
+
+        for widget in cards:
+            rec = known.get(id(widget))
+            if rec is None:
+                view = glass_cls.alloc().initWithFrame_(NSMakeRect(0, 0, 1, 1))
+                view.setAutoresizingMask_(_PANEL_GLASS_RESIZE_MASK)
+                if superview is not None:
+                    container.addSubview_positioned_relativeTo_(
+                        view, _PANEL_GLASS_WINDOW_BELOW, root_view
+                    )
+                else:
+                    container.addSubview_positioned_relativeTo_(
+                        view, _PANEL_GLASS_WINDOW_BELOW, None
+                    )
+                rec = {"widget": widget, "view": view}
+                records.append(rec)
+            # Qt ignores duplicate installs; this also re-attaches cards whose
+            # filter was dropped by remove_macos_panel_glass().
+            try:
+                widget.installEventFilter(filt)
+            except Exception:
+                pass
+            view = rec["view"]
+            view.setStyle_(NSGlassEffectViewStyleClear if use_clear
+                           else NSGlassEffectViewStyleRegular)
+            view.setCornerRadius_(16.0)
+            view.setTintColor_(NSColor.colorWithCalibratedRed_green_blue_alpha_(
+                tint_rgb[0], tint_rgb[1], tint_rgb[2], tint_alpha
+            ))
+            view.setAlphaValue_(1.0)
+        _sync_macos_panel_glass(window)
+    except Exception:
+        pass
+
+
 def configure_macos_glass(window, theme="macos27_glass", enable=True, opacity=None,
                           material=None):
     """Match the native glass material to the selected theme and mode.
@@ -433,13 +726,13 @@ def configure_macos_glass(window, theme="macos27_glass", enable=True, opacity=No
     ``macos27_glass`` uses DarkAqua by default and the public Clear style for
     every preset; ``Glass Stage`` (Dark/Light only) switches DarkAqua/Aqua and
     controls native tint + QSS scrim density. The Regular style reads as a
-    smeared blur over picture backgrounds, so it stays opt-in. macOS 27 also applies an
-    intermediate native backdrop downsample (0.33..0.36) for soft,
-    bokeh-like diffusion that breaks up bright text; it is best-effort
-    private KVC, reapplied after AppKit rebuilds the layer and on move/resize,
-    and falls back silently. ``opacity`` is only a fallback for
-    old numeric sessions and Automatic's last system sync. The native view
-    stays at full alpha so AppKit keeps rendering the material.
+    smeared blur over picture backgrounds, so it stays opt-in. Glass 2.0 keeps
+    the native backdrop downsample at its full/sharpest value in normal mode
+    and drops it to ~1/3 in Low-End CPU mode; it is best-effort private KVC,
+    reapplied after AppKit rebuilds the layer and on move/resize, and falls
+    back silently. ``opacity`` is only a fallback for old numeric sessions
+    and Automatic's last system sync. The native view stays at full alpha so
+    AppKit keeps rendering the material.
     """
     if sys.platform != "darwin":
         return
@@ -464,7 +757,8 @@ def configure_macos_glass(window, theme="macos27_glass", enable=True, opacity=No
                         else canonical_glass_material(material))
         overrides = ((getattr(window, "glass_overrides", {}) or {}).get(stage)
                      if is_m27 else None)
-        profile = glass_material_profile(material_key, opacity, overrides) if is_m27 else None
+        profile = (glass_material_profile(material_key, opacity, overrides, stage)
+                   if is_m27 else None)
 
         ns_window = get_nswindow_from_widget(window)
         if ns_window is not None:
@@ -479,7 +773,9 @@ def configure_macos_glass(window, theme="macos27_glass", enable=True, opacity=No
             else:
                 ns_window.setAppearance_(NSAppearance.appearanceNamed_(NSAppearanceNameVibrantDark))
 
-        glass_view = getattr(window, "_glass_view", None)
+        # When disabling glass, never touch the stale AppKit view left behind
+        # by remove_glass_effect(); clear_macos_glass_state() drops it instead.
+        glass_view = getattr(window, "_glass_view", None) if enable else None
         if glass_view is not None and hasattr(glass_view, "setStyle_"):
             # Clear is the native-looking default; Regular is available as an
             # explicit advanced override for users matching other stages.
@@ -496,14 +792,21 @@ def configure_macos_glass(window, theme="macos27_glass", enable=True, opacity=No
             # leave a square edge / cut-off line under the QSS panels.
             glass_view.setCornerRadius_(14.0 if enable else 0.0)
         if enable:
-            # Clear alone (0.5) lets bright text read through; Regular (0.25)
-            # is the smeared look. Intermediate scales diffuse it softly.
-            scale = profile["backdrop_scale"] if is_m27 and profile is not None else 0.25
+            # Full quality stays at Clear's native 0.5; Low-End drops to ~1/3
+            # for cheaper diffusion. Original Glass keeps its 0.25 look.
+            if is_m27:
+                owner = getattr(window, "mw", None) or window
+                low_end = bool(getattr(getattr(owner, "engine", None),
+                                       "low_end_mode", False))
+                scale = (GLASS_BACKDROP_SCALE_LOW_END if low_end
+                         else GLASS_BACKDROP_SCALE_FULL)
+            else:
+                scale = 0.25
             set_macos_glass_backdrop_scale(window, scale)
         else:
-            # Cancel pending retries and stop the move/resize filter.
-            window._glass_backdrop_scale = None
-            window._glass_scale_token = getattr(window, "_glass_scale_token", 0) + 1
+            # Cancel pending retries and stop the move/resize filter; the view
+            # itself has already been removed from its superview.
+            clear_macos_glass_state(window)
         if glass_view is not None and hasattr(glass_view, "setTintColor_"):
             if enable and profile is not None:
                 # Clear / Light uses a white native tint so the panel reads as
@@ -526,6 +829,9 @@ def configure_macos_glass(window, theme="macos27_glass", enable=True, opacity=No
         # strength; modes are expressed through material + tint + QSS veil.
         if glass_view is not None and hasattr(glass_view, "setAlphaValue_"):
             glass_view.setAlphaValue_(1.0)
+        # Each card gets its own native material; QSS alone cannot blur the
+        # wallpaper behind a panel.
+        configure_macos_panel_glass(window, theme, enable, profile, stage)
     except Exception:
         pass
 
@@ -615,7 +921,7 @@ def sample_ambient_rgb(pixmap):
             
     return (best_rgb[0], best_rgb[1], best_rgb[2])
 
-def build_liquid_qss(r=26, g=36, b=58, glass_pct=50, theme="classic", ambient_opacity=0.3, accent="#0a84ff", accent_end="#64d2ff", glass_clarity=45, glass_rim=20, glass_material=None, glass_overrides=None, glass_appearance="dark"):
+def build_liquid_qss(r=26, g=36, b=58, glass_pct=50, theme="classic", ambient_opacity=0.3, accent="#0a84ff", accent_end="#64d2ff", glass_clarity=45, glass_rim=DEFAULT_GLASS_RIM, glass_material=None, glass_overrides=None, glass_appearance="dark"):
     stage = glass_appearance if glass_appearance in GLASS_STAGES else "dark"
 
     def hex_to_rgb(h):
@@ -643,15 +949,21 @@ def build_liquid_qss(r=26, g=36, b=58, glass_pct=50, theme="classic", ambient_op
             # densities, not a fake blur-radius control.
             key = GLASS_STAGE_MATERIAL.get(stage, "dark")
             profile = glass_material_profile(
-                key, c_f, (glass_overrides or {}).get(stage)
+                key, c_f, (glass_overrides or {}).get(stage), stage
             )
             card_a = int(profile["card_alpha"])
             list_a = int(profile["list_alpha"])
-            rim_a = int(10 + 46 * r_f)
-            btn_a = int(18 + 170 * r_f)
+            # On Dark, white rim/button highlights read much brighter than
+            # Light's black rim. Ease the upper half of the slider so moving
+            # past ~50 no longer blows out the borders; Light keeps its curve.
+            r_highlight = r_f
+            if stage == "dark":
+                r_highlight = min(r_f, 0.5) + 0.30 * max(0.0, r_f - 0.5)
+            rim_a = int(10 + 46 * r_highlight)
+            btn_a = int(18 + 170 * r_highlight)
             if stage == "light":
                 text_color = "#1d1d1f"
-                secondary_text = "rgba(60, 60, 67, 210)"
+                secondary_text = "#3c3c43"
                 card_bg = f"rgba(255, 255, 255, {card_a})"
                 card_hi = f"rgba(0, 0, 0, {max(8, rim_a // 2)})"
                 card_lo = card_hi
@@ -669,7 +981,7 @@ def build_liquid_qss(r=26, g=36, b=58, glass_pct=50, theme="classic", ambient_op
                 card_hi = f"rgba(255, 255, 255, {rim_a})"
                 card_lo = card_hi
                 list_bg = f"rgba(8, 9, 11, {list_a})"
-                input_bg = f"rgba(255, 255, 255, {int(18 + 160 * r_f)})"
+                input_bg = f"rgba(255, 255, 255, {int(18 + 160 * r_highlight)})"
                 btn_bg = f"rgba(255, 255, 255, {btn_a})"
                 slider_bg = "rgba(255, 255, 255, 46)"
                 slider_handle = "#ffffff"
@@ -747,6 +1059,8 @@ def build_liquid_qss(r=26, g=36, b=58, glass_pct=50, theme="classic", ambient_op
         settings_bg = f"qlineargradient(x1:1, y1:0.9, x2:0, y2:0, stop:0 rgba({cr},{cg},{cb},255), stop:0.42 rgba(17,20,28,255), stop:1 rgba(11,13,19,255))"
 
     light_surface = theme == "light" or (theme == "macos27_glass" and stage == "light")
+    disabled_text = "#6e6e73" if light_surface else "rgba(142, 142, 147, 140)"
+    disabled_btn_text = "#6e6e73" if light_surface else "#999"
     popup_bg = "#ffffff" if light_surface else (
         "rgba(26, 26, 28, 236)" if theme == "macos27_glass" else (
             "rgba(22, 25, 34, 236)" if theme == "liquid_glass" else "#1d212b"
@@ -780,20 +1094,21 @@ def build_liquid_qss(r=26, g=36, b=58, glass_pct=50, theme="classic", ambient_op
     QPushButton:focus {{ border: 1px solid {accent}; }}
     QLineEdit:focus, QComboBox:focus, QSpinBox:focus {{ border: 1px solid {accent}; }}
     QPushButton:checked {{ background-color: {accent}; border-top: 1px solid rgba(255,255,255,100); color: {btn_text}; }}
-    QPushButton:disabled {{ background-color: rgba(0,0,0,10); color: #999; border: none; }}
+    QPushButton:disabled {{ background-color: rgba(0,0,0,10); color: {disabled_btn_text}; border: none; }}
     QPushButton#playBtn {{ font-size: 16px; padding: 10px 20px; border-radius: 12px; }}
     QSlider::groove:horizontal {{ height: 5px; background: {slider_bg}; border-radius: 2px; }}
     QSlider::sub-page:horizontal {{ background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 {accent}, stop:1 {accent_end}); border-radius: 2px; }}
     QSlider::handle:horizontal {{ background: {slider_handle}; width: 14px; height: 14px; margin: -5px 0; border-radius: 7px; }}
     QSlider::sub-page:horizontal:disabled {{ background: {slider_bg}; }}
     QSlider::handle:horizontal:disabled {{ background: rgba(150, 150, 155, 130); }}
-    QScrollArea#settingsScroll {{ background: transparent; border: 0; }}
+    QScrollArea#settingsScroll, QScrollArea#mainScroll {{ background: transparent; border: 0; }}
+    QWidget#mainContent {{ background: transparent; }}
     QScrollBar:vertical {{ background: transparent; width: 10px; margin: 0; border: 0; }}
     QScrollBar::handle:vertical {{ background: {slider_bg}; border: 1px solid {card_hi}; border-radius: 5px; min-height: 32px; }}
     QScrollBar::handle:vertical:hover {{ background: {accent}; }}
     QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; background: transparent; border: 0; }}
     QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{ background: transparent; }}
-    QLabel:disabled {{ color: rgba(142, 142, 147, 140); }}
+    QLabel:disabled {{ color: {disabled_text}; }}
     """
 
 class WindowDragFilter(QObject):
@@ -822,12 +1137,35 @@ class WindowDragFilter(QObject):
         return False
 
     def _animate_to(self, target_rect, shrinking=False):
+        if shrinking:
+            # The maximized layout grows the library's fixed height. Reset it
+            # first so Qt/AppKit does not clamp the shrink part way and leave
+            # the spectrum card taller than it was at the original size.
+            try:
+                self.win._reset_library_height_for_shrink()
+            except Exception:
+                pass
         self.win._is_resizing = True
         def _finish():
             self.win._is_resizing = False
+            self.win._sync_main_content_height()
             self.win._last_cover_render_key = None
             self.win.update_cover_art_size()
         QTimer.singleShot(420, _finish)
+
+        def _settle_shrink():
+            # AppKit clamps the first shrink because the maximized layout has
+            # grown the fixed-height cards. Push the exact geometry through in
+            # the same event turn so the stretched intermediate size is never
+            # painted.
+            if not shrinking:
+                return
+            for _ in range(8):
+                self.win.setGeometry(target_rect)
+                QApplication.processEvents()
+                if self.win.geometry().size() == target_rect.size():
+                    break
+
         if sys.platform == "darwin":
             try:
                 objc = ctypes.CDLL("/usr/lib/libobjc.A.dylib")
@@ -841,10 +1179,12 @@ class WindowDragFilter(QObject):
                 rect = NSRect(float(target_rect.x()), float(scr_h - (target_rect.y() + target_rect.height())), float(target_rect.width()), float(target_rect.height()))
                 set_f = ctypes.cast(objc.objc_msgSend, ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_void_p, NSRect, ctypes.c_bool, ctypes.c_bool))
                 set_f(ns_win, objc.sel_registerName(b"setFrame:display:animate:"), rect, True, True)
+                _settle_shrink()
                 return
             except Exception:
                 pass
         self.win.setGeometry(target_rect)
+        _settle_shrink()
 
     def _toggle_zoom(self):
         self._click_count = 0
@@ -855,13 +1195,16 @@ class WindowDragFilter(QObject):
         default_small = QRect(avail.x() + (avail.width() - 1100) // 2, avail.y() + (avail.height() - 820) // 2, 1100, 820)
         fg = self.win.frameGeometry()
         if fg.width() >= avail.width() - 25 and fg.height() >= avail.height() - 45:
+            # _normal_geom is a Qt content geometry. AppKit's NSWindow frame
+            # matches it under the full-size-content style mask, so passing
+            # frameGeometry() here would restore 28pt too tall and get clamped.
             target = self._normal_geom or default_small
             self._normal_geom = None
             self._was_zoomed = False
             self._animate_to(target, shrinking=True)
         else:
             if fg.width() < avail.width() - 100:
-                self._normal_geom = QRect(fg)
+                self._normal_geom = QRect(self.win.geometry())
             self._was_zoomed = True
             self._animate_to(avail, shrinking=False)
 
@@ -912,6 +1255,35 @@ def sample_ambient_palette(pixmap):
     return [c1, c2, c3]
 
 
+# Lava runs at 30 FPS when idle and 15 FPS during playback. Both are smooth
+# for a slow drift, and the lower rate keeps Classic/Glass from stealing
+# frames from the 60 FPS spectrum timer.
+_LAVA_INTERVAL_IDLE_MS = 33
+_LAVA_INTERVAL_PLAYING_MS = 66
+
+
+def _make_lava_sprite(rgb, peak_alpha, size=96):
+    """Cache one Gaussian blob as a premultiplied RGBA image.
+
+    The old paintEvent recomputed three 320x200 exponential fields on every
+    frame. The blob shape only changes when the palette/glow/theme changes, so
+    it is generated once here and the paint loop just blits it.
+    """
+    import numpy as np
+
+    axis = np.linspace(-1.0, 1.0, size, dtype=np.float32)
+    u = axis[None, :]
+    v = axis[:, None]
+    alpha = np.clip(np.exp(-(u * u + v * v) * 3.0) * float(peak_alpha),
+                    0.0, 1.0)
+    rgba = np.empty((size, size, 4), dtype=np.uint8)
+    for ch in range(3):
+        rgba[:, :, ch] = np.clip(float(rgb[ch]) * alpha, 0.0, 255.0).astype(np.uint8)
+    rgba[:, :, 3] = (alpha * 255.0).astype(np.uint8)
+    return QImage(rgba.data, size, size, size * 4,
+                  QImage.Format_ARGB32_Premultiplied).copy()
+
+
 from PySide6.QtWidgets import QWidget
 from PySide6.QtCore import QTimer
 
@@ -923,13 +1295,18 @@ class LavaLampOverlay(QWidget):
         self.setAttribute(Qt.WA_NoSystemBackground, True)
         self._phase = 0.0
         self._palette = [(26, 86, 180), (96, 52, 175), (18, 128, 155)]
+        self._sprites = None
+        self._sprite_key = None
+        self._frame = None
+        self._dither_tile = None
         self._timer = QTimer(self)
-        self._timer.setInterval(50)  # Smooth 20 FPS slow drift
+        self._timer.setInterval(_LAVA_INTERVAL_IDLE_MS)
         self._timer.timeout.connect(self._tick)
 
     def set_palette(self, colors):
         if colors and len(colors) >= 3:
             self._palette = list(colors[:3])
+            self._sprite_key = None
             self.update()
 
     def sync_active(self):
@@ -938,25 +1315,56 @@ class LavaLampOverlay(QWidget):
         dyn = bool(getattr(self.mw, "dynamic_ambient", True))
         low_cpu = bool(getattr(getattr(self.mw, "engine", None), "low_end_mode", False))
         show = dyn and theme in ("classic", "light", "liquid_glass", "macos27_glass") and glow > 0.01
-        # macOS 27 should feel like a native static material, not a lava lamp.
+        # Glass 2.0 should feel like a native static material, not a lava lamp.
         active = show and not low_cpu and theme != "macos27_glass"
         self.setVisible(show)
-        if active and not self._timer.isActive():
-            self._timer.start()
-        elif not active and self._timer.isActive():
+        if active:
+            playing = bool(getattr(getattr(self.mw, "engine", None), "is_playing", False))
+            self._timer.setInterval(_LAVA_INTERVAL_PLAYING_MS if playing
+                                    else _LAVA_INTERVAL_IDLE_MS)
+            if not self._timer.isActive():
+                self._timer.start()
+        elif self._timer.isActive():
             self._timer.stop()
         self.update()
 
     def _tick(self):
         if not self.isVisible() or self.window().isMinimized():
             return
-        self._phase += 0.012
+        # Keep the drift alive during playback, but at 15 FPS instead of 30.
+        # The phase step compensates so the apparent speed stays the same.
+        playing = bool(getattr(getattr(self.mw, "engine", None), "is_playing", False))
+        interval = _LAVA_INTERVAL_PLAYING_MS if playing else _LAVA_INTERVAL_IDLE_MS
+        if self._timer.interval() != interval:
+            self._timer.setInterval(interval)
+        self._phase += 0.016 if playing else 0.008
         self.update()
 
+    def _peak_alpha(self, theme, glow):
+        if theme == "macos27_glass":
+            peak_scale = 0.09
+        elif theme == "liquid_glass":
+            peak_scale = 0.22
+        elif theme == "light":
+            peak_scale = 0.36
+        else:
+            peak_scale = 0.44
+        return peak_scale * glow
+
+    def _ensure_sprites(self, theme, glow):
+        key = (tuple(self._palette), round(float(glow), 3), theme)
+        if self._sprite_key != key:
+            peak = self._peak_alpha(theme, glow)
+            self._sprites = tuple(_make_lava_sprite(rgb, peak)
+                                  for rgb in self._palette)
+            self._sprite_key = key
+        return self._sprites
+
     def paintEvent(self, event):
-        from PySide6.QtGui import QPainter, QImage, QPixmap
-        from PySide6.QtCore import Qt
+        from PySide6.QtGui import QPainter, QPixmap
+        from PySide6.QtCore import QRectF
         import math, numpy as np
+
         theme = getattr(self.mw, "current_theme", "classic")
         if theme not in ("classic", "light", "liquid_glass", "macos27_glass"):
             return
@@ -964,60 +1372,48 @@ class LavaLampOverlay(QWidget):
         if glow <= 0.01 or self.width() < 16 or self.height() < 16:
             return
 
-        gw, gh = 320, 200
-        if not hasattr(self, "_grid_xy"):
-            xs = np.linspace(0.0, 1.0, gw, dtype=np.float32)[None, :]
-            ys = np.linspace(0.0, 1.0, gh, dtype=np.float32)[:, None]
-            # Large 512x512 non-repeating 1-LSB micro-grain tile (zero wallpaper pattern)
+        sprites = self._ensure_sprites(theme, glow)
+        gw, gh = 256, 160
+        if (self._frame is None or self._frame.width() != gw
+                or self._frame.height() != gh):
+            self._frame = QImage(gw, gh, QImage.Format_ARGB32_Premultiplied)
+        if self._dither_tile is None:
+            # 512x512 non-repeating 1-LSB grain, generated once instead of
+            # tiled across the full window on every frame.
             rng = np.random.default_rng(1337)
             tile_arr = np.zeros((512, 512, 4), dtype=np.uint8)
             n = rng.integers(-1, 2, size=(512, 512), dtype=np.int16)
             tile_arr[:, :, :3] = np.where(n[:, :, None] > 0, 2, 0)
             tile_arr[:, :, 3] = np.where(n != 0, 2, 0)
-            t_img = QImage(tile_arr.data, 512, 512, 512 * 4, QImage.Format_RGBA8888_Premultiplied).copy()
-            self._grid_xy = (xs, ys, QPixmap.fromImage(t_img))
-        xs, ys, dither_tile = self._grid_xy
+            t_img = QImage(tile_arr.data, 512, 512, 512 * 4,
+                           QImage.Format_ARGB32_Premultiplied).copy()
+            self._dither_tile = QPixmap.fromImage(t_img)
 
-        is_light = theme == "light"
-        if theme == "macos27_glass":
-            peak_scale = 0.09
-        elif theme == "liquid_glass":
-            peak_scale = 0.22
-        else:
-            peak_scale = 0.36 if is_light else 0.44
-        peak_a = peak_scale * glow
+        # Compose the three cached blobs into one small premultiplied frame.
+        frame = self._frame
+        frame.fill(Qt.transparent)
+        fp = QPainter(frame)
+        fp.setRenderHint(QPainter.SmoothPixmapTransform, True)
         t = self._phase
-        p0, p1, p2 = self._palette[0], self._palette[1], self._palette[2]
-        orbs = (
-            (0.28 + 0.22 * math.sin(t * 0.7), 0.30 + 0.20 * math.cos(t * 0.5), 0.24, p0),
-            (0.72 + 0.20 * math.cos(t * 0.6), 0.65 + 0.22 * math.sin(t * 0.8), 0.28, p1),
-            (0.50 + 0.25 * math.sin(t * 0.4 + 1.4), 0.48 + 0.24 * math.cos(t * 0.65 + 0.8), 0.22, p2),
+        blobs = (
+            (0.28 + 0.22 * math.sin(t * 0.7),
+             0.30 + 0.20 * math.cos(t * 0.5), 1.20),
+            (0.72 + 0.20 * math.cos(t * 0.6),
+             0.65 + 0.22 * math.sin(t * 0.8), 1.30),
+            (0.50 + 0.25 * math.sin(t * 0.4 + 1.4),
+             0.48 + 0.24 * math.cos(t * 0.65 + 0.8), 1.15),
         )
+        for (ox, oy, scale), sprite in zip(blobs, sprites):
+            cx, cy = ox * gw, oy * gh
+            rw, rh = gw * scale, gh * scale * 1.333
+            fp.drawImage(QRectF(cx - rw / 2.0, cy - rh / 2.0, rw, rh), sprite)
+        if theme != "macos27_glass":
+            fp.drawTiledPixmap(QRectF(0, 0, gw, gh), self._dither_tile)
+        fp.end()
 
-        # True premultiplied alpha blending so overlapping orbs never create moire/floral shapes
-        acc_rgb = np.zeros((gh, gw, 3), dtype=np.float32)
-        rem_a = np.ones((gh, gw), dtype=np.float32)
-        for ox, oy, inv_var, (cr, cg, cb) in orbs:
-            dx = xs - np.float32(ox)
-            dy = (ys - np.float32(oy)) * np.float32(0.75)
-            w_orb = np.exp(-(dx * dx + dy * dy) / np.float32(inv_var)) * np.float32(peak_a)
-            contrib = w_orb * rem_a
-            acc_rgb[:, :, 0] += contrib * np.float32(cr)
-            acc_rgb[:, :, 1] += contrib * np.float32(cg)
-            acc_rgb[:, :, 2] += contrib * np.float32(cb)
-            rem_a *= (np.float32(1.0) - w_orb)
-
-        total_a = np.clip(np.float32(1.0) - rem_a, 0.0, 1.0)
-        rgba = np.empty((gh, gw, 4), dtype=np.uint8)
-        rgba[:, :, :3] = np.clip(acc_rgb, 0.0, 255.0).astype(np.uint8)
-        rgba[:, :, 3] = np.clip(total_a * np.float32(255.0), 0.0, 255.0).astype(np.uint8)
-
-        img = QImage(rgba.data, gw, gh, gw * 4, QImage.Format_RGBA8888_Premultiplied)
+        # One smooth upscale of the small frame instead of a full-window
+        # exponential field plus a full-window dither tile.
         p = QPainter(self)
         p.setRenderHint(QPainter.SmoothPixmapTransform, True)
-        p.drawImage(self.rect(), img)
-        # Native macOS 27 glass is clean; micro-grain belongs to the other
-        # themes where it breaks up large gradients without muddying blur.
-        if theme != "macos27_glass":
-            p.drawTiledPixmap(self.rect(), dither_tile)
+        p.drawImage(self.rect(), frame)
         p.end()

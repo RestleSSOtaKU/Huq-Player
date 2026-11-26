@@ -39,7 +39,7 @@ class GlassLensOverlay(QWidget):
 
     def sync_active(self):
         # The lens is a WebGPU-style flourish for the original Glass theme.
-        # Glass macOS 27 is meant to look like native macOS Settings, which
+        # Glass 2.0 is meant to look like native macOS Settings, which
         # has no such pill, so keep it hidden there. Also hide when there is
         # no real cover to refract (never paint the accent-gradient fallback).
         theme = getattr(self.mw, "current_theme", "classic")
