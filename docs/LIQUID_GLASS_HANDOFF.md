@@ -27,7 +27,7 @@
 - `pyqt_liquidglass` creates `NSGlassEffectView` with its default **`Regular`** style (`NSGlassEffectViewStyleRegular = 0`), which is the dense/mushy material. macOS Settings/Control Center panels use **`Clear`** (`= 1`). The earlier light/white direction was also wrong: references are dark panels over a picture background.
 - Added `configure_macos_glass()` in `player_ui/liquid_glass.py`. Called from every place that applies native glass (main window, `SettingsDialog`, track-properties dialog, startup, and the Glass Material selector). It:
   - maps every `macos27_glass` preset to `NSGlassEffectViewStyleClear (1)` and varies native tint + QSS scrim density; original `Glass` keeps `Regular (0)` because Clear is required for the native look,
-  - sets the backdrop layer's downsample scale to `0.33–0.36` via guarded private KVC for soft, bokeh-like diffusion. Native Clear is `0.5` (bright text reads through) and Regular is `0.25` (smeared); an intermediate value breaks up terminal/wallpaper text without Regular's mush. Failures are ignored and the public Clear style remains,
+  - sets the backdrop layer's downsample scale to `0.33–0.36` via guarded private KVC for soft, bokeh-like diffusion. Native Clear is `0.5` (bright text reads through) and Regular is `0.25` (smeared); an intermediate value breaks up terminal/wallpaper text without Regular's mush. AppKit resets this value after the initial style change and on every window move/resize, so it is reapplied on a short timer series and from a Qt event filter. Failures are ignored and the public Clear style remains,
   - sets the `NSWindow` appearance to `DarkAqua` for `macos27_glass` (less bright/blue than `VibrantDark`) and `VibrantDark` for original `Glass`,
   - keeps `NSGlassEffectView.alphaValue = 1.0` — lowering it suppresses the material and makes the window flat; each mode varies native `tintColor` plus a dark QSS scrim instead,
   - sets a `14pt` corner radius and calls `setNeedsDisplay_` after style changes,
@@ -53,7 +53,7 @@
 - Offscreen tests pass: helper returns a macOS suggestion, `SettingsDialog` switches to Automatic from it, and the label double-click event emits the sync signal.
 
 ### Still unresolved
-- User is testing the bokeh-like diffusion retune now. The dark scrim fixed density on dark backgrounds, but bright terminal text still read through the old Clear backdrop (`scale 0.5`). The native comparison suppresses that text; the new `0.33–0.36` backdrop scale should soften it without returning to Regular (`0.25`). If text is still legible, lower `backdrop_scale` in small steps; if the panel gets mushy, raise it.
+- User retesting after the timing fix. The first bokeh pass still showed terminal text because AppKit reset the private backdrop `scale` from `0.33` back to Clear's `0.5` after the layer tree settled and again on every window move/resize. `set_macos_glass_backdrop_scale()` now reapplies on a short timer series and from a Qt move/resize event filter; an on-screen PySide probe held `0.33` through layer rebuild, move, and resize. If text is still legible, lower `backdrop_scale` in small steps; if the panel gets mushy, raise it.
 - More reference screenshots with picture backgrounds are welcome. Exact native mode detection remains unavailable through public AppKit APIs.
 
 ## Important constraints / gotchas

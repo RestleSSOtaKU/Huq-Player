@@ -312,19 +312,37 @@ def _backdrop_layers(layer):
     return found
 
 
-def set_macos_glass_backdrop_scale(window, scale):
-    """Best-effort bokeh-like diffusion via the native backdrop layer.
+class _MacosGlassScaleFilter(QObject):
+    """Reapply the backdrop scale after AppKit rebuilds it on move/resize."""
 
-    Public Clear captures the backdrop at 0.5 scale and Regular at 0.25.
-    An intermediate downsample softens bright text without Regular's smear.
-    This is a private KVC detail, not a public blur-radius API; failures are
-    ignored and the public Clear style remains in effect.
-    """
-    if sys.platform != "darwin":
-        return
+    def eventFilter(self, obj, event):
+        try:
+            if event.type() in (QEvent.Move, QEvent.Resize):
+                scale = getattr(obj, "_glass_backdrop_scale", None)
+                if scale is not None:
+                    def reapply(w=obj, s=scale):
+                        _apply_macos_glass_backdrop_scale(w, s)
+                    QTimer.singleShot(0, reapply)
+                    QTimer.singleShot(120, reapply)
+        except Exception:
+            pass
+        return False
+
+
+def _ensure_macos_glass_scale_filter(window):
+    if getattr(window, "_glass_scale_filter", None) is None:
+        filt = _MacosGlassScaleFilter()
+        window._glass_scale_filter = filt
+        try:
+            window.installEventFilter(filt)
+        except Exception:
+            pass
+
+
+def _apply_macos_glass_backdrop_scale(window, scale):
     glass_view = getattr(window, "_glass_view", None)
     if glass_view is None:
-        return
+        return False
     try:
         applied = False
         for layer in _backdrop_layers(glass_view.layer()):
@@ -333,15 +351,42 @@ def set_macos_glass_backdrop_scale(window, scale):
                 applied = True
             except Exception:
                 pass
-        if applied:
-            window._glass_scale_retries = 0
-        elif getattr(window, "_glass_scale_retries", 0) < 3:
-            window._glass_scale_retries = getattr(window, "_glass_scale_retries", 0) + 1
-            QTimer.singleShot(
-                80, lambda: set_macos_glass_backdrop_scale(window, scale)
-            )
+        return applied
     except Exception:
-        pass
+        return False
+
+
+def set_macos_glass_backdrop_scale(window, scale):
+    """Best-effort bokeh-like diffusion via the native backdrop layer.
+
+    Public Clear captures the backdrop at 0.5 scale and Regular at 0.25.
+    An intermediate downsample softens bright text without Regular's smear.
+    AppKit rebuilds the backdrop layer after the initial style change and on
+    move/resize, resetting ``scale`` to 0.5, so the value is reapplied both on
+    a short timer series and from a Qt event filter. This is a private KVC
+    detail, not a public blur-radius API; failures fall back to public Clear.
+    """
+    if sys.platform != "darwin":
+        return
+    try:
+        scale = float(scale)
+    except Exception:
+        return
+    token = int(getattr(window, "_glass_scale_token", 0)) + 1
+    window._glass_scale_token = token
+    window._glass_backdrop_scale = scale
+    _ensure_macos_glass_scale_filter(window)
+
+    def attempt():
+        # Ignore stale retries from an earlier theme/material selection.
+        if (getattr(window, "_glass_scale_token", None) != token
+                or getattr(window, "_glass_backdrop_scale", None) != scale):
+            return
+        _apply_macos_glass_backdrop_scale(window, scale)
+
+    attempt()
+    for delay in (250, 500, 900, 1400):
+        QTimer.singleShot(delay, attempt)
 
 
 def configure_macos_glass(window, theme="macos27_glass", enable=True, opacity=None,
@@ -354,7 +399,8 @@ def configure_macos_glass(window, theme="macos27_glass", enable=True, opacity=No
     reserved for the original ``Glass`` theme. macOS 27 also applies an
     intermediate native backdrop downsample (0.33..0.36) for soft,
     bokeh-like diffusion that breaks up bright text; it is best-effort
-    private KVC and falls back silently. ``opacity`` is only a fallback for
+    private KVC, reapplied after AppKit rebuilds the layer and on move/resize,
+    and falls back silently. ``opacity`` is only a fallback for
     old numeric sessions and Automatic's last system sync. The native view
     stays at full alpha so AppKit keeps rendering the material.
     """
@@ -399,11 +445,15 @@ def configure_macos_glass(window, theme="macos27_glass", enable=True, opacity=No
             # Match the rounded window corners so the native material does not
             # leave a square edge / cut-off line under the QSS panels.
             glass_view.setCornerRadius_(14.0 if enable else 0.0)
-        if enable and glass_view is not None:
+        if enable:
             # Clear alone (0.5) lets bright text read through; Regular (0.25)
             # is the smeared look. Intermediate scales diffuse it softly.
             scale = profile["backdrop_scale"] if is_m27 and profile is not None else 0.25
             set_macos_glass_backdrop_scale(window, scale)
+        else:
+            # Cancel pending retries and stop the move/resize filter.
+            window._glass_backdrop_scale = None
+            window._glass_scale_token = getattr(window, "_glass_scale_token", 0) + 1
         if glass_view is not None and hasattr(glass_view, "setTintColor_"):
             if enable and profile is not None:
                 tr, tg, tb = profile["tint_rgb"]
