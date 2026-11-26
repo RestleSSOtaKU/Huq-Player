@@ -189,15 +189,14 @@ def configure_macos_glass(window, theme="macos27_glass", enable=True, opacity=No
 
     ``macos27_glass`` uses the native Clear material with DarkAqua appearance:
     that is the gentle, neutral blur seen in macOS Settings/Control Center.
-    ``opacity`` only
-    drives the QSS veil; the native view stays at full alpha so AppKit keeps
-    rendering the material.
+    ``opacity`` drives the native material tint and a small QSS veil. The
+    native view stays at full alpha so AppKit keeps rendering the material.
     """
     if sys.platform != "darwin":
         return
     try:
         from AppKit import (NSAppearance, NSAppearanceNameDarkAqua,
-                            NSAppearanceNameVibrantDark)
+                            NSAppearanceNameVibrantDark, NSColor)
         try:
             from AppKit import NSGlassEffectViewStyleClear, NSGlassEffectViewStyleRegular
         except ImportError:
@@ -229,11 +228,26 @@ def configure_macos_glass(window, theme="macos27_glass", enable=True, opacity=No
             # Match the rounded window corners so the native material does not
             # leave a square edge / cut-off line under the QSS panels.
             glass_view.setCornerRadius_(14.0 if enable else 0.0)
+        if glass_view is not None and hasattr(glass_view, "setTintColor_"):
+            # NSGlassEffectView has no public blur-radius property. The native
+            # Clear material supplies the blur; tint alpha is the closest
+            # public equivalent to macOS' clear -> frosted range. Unlike
+            # alphaValue, tintColor does not suppress the material.
+            if enable and theme == "macos27_glass" and opacity is not None:
+                o = max(0.0, min(1.0, float(opacity)))
+                tint_alpha = 0.02 + 0.34 * o
+            else:
+                tint_alpha = 0.0
+            glass_view.setTintColor_(
+                NSColor.colorWithCalibratedRed_green_blue_alpha_(
+                    0.08, 0.08, 0.09, tint_alpha
+                )
+            )
         if glass_view is not None and hasattr(glass_view, "setNeedsDisplay_"):
             glass_view.setNeedsDisplay_(True)
         # Do NOT lower NSGlassEffectView.alphaValue: AppKit then stops showing
         # the material and the window looks flat. Keep the native view at full
-        # strength; the Glass Opacity slider varies the QSS veil instead.
+        # strength; opacity is expressed through tintColor + a small QSS veil.
         if glass_view is not None and hasattr(glass_view, "setAlphaValue_"):
             glass_view.setAlphaValue_(1.0)
     except Exception:
@@ -346,18 +360,19 @@ def build_liquid_qss(r=26, g=36, b=58, glass_pct=50, theme="classic", ambient_op
         # instead of being buried under an opaque dark gradient.
         if is_m27:
             # Dark native Clear material with a real clear -> frosted range.
-            # Glass Opacity (c_f) drives only the QSS veil; the native view
-            # stays at full alpha so AppKit keeps rendering the material.
+            # Glass Opacity (c_f) drives native tintColor (configure_macos_glass)
+            # plus this small QSS veil; the native view stays at full alpha.
             text_color = "#f5f5f7"
             secondary_text = "rgba(235, 235, 240, 190)"
-            # Keep the veil thin: the native Clear material supplies the blur.
-            card_a = int(12 + 220 * c_f)
+            # Keep the veil thin: native tintColor now carries most of the
+            # clear -> frosted range, so QSS must not just dim everything.
+            card_a = int(6 + 120 * c_f)
             rim_a = int(10 + 46 * r_f)
             btn_a = int(18 + 170 * r_f)
             card_bg = f"rgba(26, 26, 28, {card_a})"
             card_hi = f"rgba(255, 255, 255, {rim_a})"
             card_lo = card_hi
-            list_bg = f"rgba(20, 20, 22, {int(10 + 205 * c_f)})"
+            list_bg = f"rgba(20, 20, 22, {int(4 + 110 * c_f)})"
             input_bg = f"rgba(255, 255, 255, {int(18 + 160 * r_f)})"
             btn_bg = f"rgba(255, 255, 255, {btn_a})"
             slider_bg = "rgba(255, 255, 255, 46)"
