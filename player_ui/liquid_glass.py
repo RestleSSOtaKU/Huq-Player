@@ -46,7 +46,7 @@ GLASS_MATERIAL_LABELS = {
 # Two quick stages map to the existing Dark/Clear presets. The appearance
 # field is a native AppKit appearance, not an exact macOS material-mode read.
 GLASS_STAGES = ("dark", "light")
-GLASS_STAGE_LABELS = {"dark": "Dark", "light": "Clear / Light"}
+GLASS_STAGE_LABELS = {"dark": "Dark", "light": "Light"}
 GLASS_STAGE_MATERIAL = {"dark": "dark", "light": "clear"}
 
 _GLASS_OVERRIDE_RANGES = {
@@ -76,12 +76,6 @@ def normalize_glass_overrides(value):
         out["style"] = style
     return out
 
-
-def glass_override_for(material, overrides, key, default=None):
-    """Return one clamped override for the selected material, if present."""
-    material_key = canonical_glass_material(material)
-    per = normalize_glass_overrides((overrides or {}).get(material_key))
-    return per.get(key, default)
 
 # Native references are dark panels over a picture background. AppKit exposes
 # only Clear/Regular styles, and Regular reads as a smeared blur here, so macOS
@@ -185,11 +179,11 @@ def _sample_wallpaper_luminance():
 
 
 def read_system_glass_preferences():
-    """Best-effort mapping from OS appearance settings to Glass Material.
+    """Best-effort mapping from OS appearance settings to a Glass Stage.
 
-    macOS does not expose the exact Automatic/Default/Dark/Clear/Tinted choice
-    publicly, so we combine public signals: effective appearance, Reduce
-    Transparency, and wallpaper luminance. Windows uses registry values.
+    macOS does not expose exact native material modes publicly, so we combine
+    public signals: effective appearance, Reduce Transparency, and wallpaper
+    luminance. Windows uses registry values. The result is only Dark/Light.
     """
     info = {
         "available": False,
@@ -250,7 +244,7 @@ def read_system_glass_preferences():
             if luma is not None:
                 parts.append(f"wallpaper {int(luma * 100)}%")
             parts.append(
-                f"→ Glass Material {GLASS_MATERIAL_LABELS[material]} (approx, {opacity}%)"
+                f"→ Glass Stage {GLASS_STAGE_LABELS['dark' if dark else 'light']} (approx, {opacity}%)"
             )
             info.update({
                 "available": True,
@@ -262,7 +256,7 @@ def read_system_glass_preferences():
                 "summary": " · ".join(parts),
             })
         except Exception:
-            info["summary"] = "Could not read macOS appearance; kept current Glass Material."
+            info["summary"] = "Could not read macOS appearance; kept current Glass Stage."
     elif sys.platform == "win32":
         try:
             import winreg
@@ -284,7 +278,7 @@ def read_system_glass_preferences():
             parts = [
                 f"Windows {'Dark' if dark else 'Light'}",
                 f"Transparency {'On' if transparent else 'Off'}",
-                f"→ Glass Material {GLASS_MATERIAL_LABELS[material]} (approx, {opacity}%)",
+                f"→ Glass Stage {GLASS_STAGE_LABELS['dark' if dark else 'light']} (approx, {opacity}%)",
             ]
             info.update({
                 "available": True,
@@ -295,7 +289,7 @@ def read_system_glass_preferences():
                 "summary": " · ".join(parts),
             })
         except Exception:
-            info["summary"] = "Could not read Windows theme; kept current Glass Material."
+            info["summary"] = "Could not read Windows theme; kept current Glass Stage."
 
     return info
 
@@ -437,8 +431,8 @@ def configure_macos_glass(window, theme="macos27_glass", enable=True, opacity=No
     """Match the native glass material to the selected theme and mode.
 
     ``macos27_glass`` uses DarkAqua by default and the public Clear style for
-    every preset; ``Glass Stage`` switches DarkAqua/Aqua and ``Glass Material``
-    changes native tint + QSS scrim density. The Regular style reads as a
+    every preset; ``Glass Stage`` (Dark/Light only) switches DarkAqua/Aqua and
+    controls native tint + QSS scrim density. The Regular style reads as a
     smeared blur over picture backgrounds, so it stays opt-in. macOS 27 also applies an
     intermediate native backdrop downsample (0.33..0.36) for soft,
     bokeh-like diffusion that breaks up bright text; it is best-effort
@@ -461,10 +455,16 @@ def configure_macos_glass(window, theme="macos27_glass", enable=True, opacity=No
         from pyqt_liquidglass._bridge import get_nswindow_from_widget
 
         is_m27 = theme == "macos27_glass"
-        material_key = canonical_glass_material(material)
-        overrides = (getattr(window, "glass_overrides", {}) or {}).get(material_key)
-        profile = glass_material_profile(material_key, opacity, overrides) if is_m27 else None
         stage = getattr(window, "glass_appearance", "dark") if is_m27 else "dark"
+        if stage not in GLASS_STAGES:
+            stage = "dark"
+        # The UI exposes only Dark/Light stages; material profiles are an
+        # internal legacy detail and overrides are stored per stage.
+        material_key = (GLASS_STAGE_MATERIAL.get(stage, "dark") if is_m27
+                        else canonical_glass_material(material))
+        overrides = ((getattr(window, "glass_overrides", {}) or {}).get(stage)
+                     if is_m27 else None)
+        profile = glass_material_profile(material_key, opacity, overrides) if is_m27 else None
 
         ns_window = get_nswindow_from_widget(window)
         if ns_window is not None:
@@ -641,9 +641,9 @@ def build_liquid_qss(r=26, g=36, b=58, glass_pct=50, theme="classic", ambient_op
             # supplies the panel scrim. Dark follows the native dark panels;
             # Clear/Light uses a white scrim with dark text. These are tint
             # densities, not a fake blur-radius control.
-            key = canonical_glass_material(glass_material)
+            key = GLASS_STAGE_MATERIAL.get(stage, "dark")
             profile = glass_material_profile(
-                key, c_f, (glass_overrides or {}).get(key)
+                key, c_f, (glass_overrides or {}).get(stage)
             )
             card_a = int(profile["card_alpha"])
             list_a = int(profile["list_alpha"])
@@ -979,7 +979,13 @@ class LavaLampOverlay(QWidget):
         xs, ys, dither_tile = self._grid_xy
 
         is_light = theme == "light"
-        peak_a = (0.015 if theme == "macos27_glass" else (0.12 if theme == "liquid_glass" else (0.36 if is_light else 0.44))) * glow
+        if theme == "macos27_glass":
+            peak_scale = 0.09
+        elif theme == "liquid_glass":
+            peak_scale = 0.22
+        else:
+            peak_scale = 0.36 if is_light else 0.44
+        peak_a = peak_scale * glow
         t = self._phase
         p0, p1, p2 = self._palette[0], self._palette[1], self._palette[2]
         orbs = (
