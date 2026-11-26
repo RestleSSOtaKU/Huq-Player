@@ -135,6 +135,7 @@ THEME_LABELS = {
     "macos27_glass": "Glass 2.0",
 }
 
+_DEFAULT_WINDOW_WIDTH = 1160
 _DEFAULT_WINDOW_HEIGHT = 880
 _LIBRARY_BASE_HEIGHT = 760
 # Reserve one stable width for the longest peak/limiter readout. Letting the
@@ -2838,12 +2839,12 @@ class MainWindow(QMainWindow):
         self.setAttribute(Qt.WA_NoSystemBackground, True)
         self.setAttribute(Qt.WA_ContentsMarginsRespectsSafeArea, False)
 
-        self.setMinimumSize(1100, 820)
+        self.setMinimumSize(_DEFAULT_WINDOW_WIDTH, 820)
         # A little extra default height goes to the spectrum graph only;
         # left library and top controls keep their previous proportions.
         avail = QApplication.primaryScreen().availableGeometry() if QApplication.primaryScreen() else None
         default_h = min(880, max(820, avail.height() - 20)) if avail else 880
-        self.resize(1100, max(820, default_h))
+        self.resize(_DEFAULT_WINDOW_WIDTH, max(820, default_h))
         
         pg.setConfigOptions(antialias=False, useOpenGL=False, enableExperimental=False)
         
@@ -6026,7 +6027,7 @@ class MainWindow(QMainWindow):
         self.update_cover_art_size()
 
     def minimumSizeHint(self):
-        return QSize(1100, 820)
+        return QSize(_DEFAULT_WINDOW_WIDTH, 820)
 
     def update_cover_art_size(self):
         # Cover and top controls keep the stock 820px-window proportion; the
