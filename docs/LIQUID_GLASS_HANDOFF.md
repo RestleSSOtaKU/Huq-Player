@@ -26,10 +26,11 @@
 ### Native glass fix (latest, not yet verified by user)
 - Root cause found: `pyqt_liquidglass` creates `NSGlassEffectView` with its default **`Regular`** style (`NSGlassEffectViewStyleRegular = 0`), which is the dark/dense material. macOS Settings uses the **`Clear`** style (`= 1`) plus a vibrant light appearance.
 - Added `configure_macos_glass()` in `player_ui/liquid_glass.py`. Called from every place that applies native glass (main window, `SettingsDialog`, track-properties dialog, startup). It:
-  - sets `NSGlassEffectView.style = 1` (`Clear`),
-  - sets the `NSWindow` appearance to `VibrantLight` for `macos27_glass` (clean macOS Settings look) and `VibrantDark` for `liquid_glass`,
+  - sets `NSGlassEffectView.style = 1` (`Clear`) **only for `macos27_glass`**; `liquid_glass` keeps `Regular (0)` so it stays readable,
+  - sets the `NSWindow` appearance to `VibrantLight` for `macos27_glass` and `VibrantDark` for `liquid_glass`,
   - restores the default appearance/style when leaving glass themes.
-- Reworked `macos27_glass` QSS to be a **light native material**: dark text (`#1d1d1f` / `#6e6e73`), light translucent cards, thin dark rim, light combo popup, dark spectrum axis labels. `Glass` stays dark with white text but also gets the `Clear` native style.
+- Reworked `macos27_glass` QSS to be a **light native material**: dark text (`#1d1d1f` / `#6e6e73`), light translucent cards, thin dark rim, light combo popup, dark spectrum axis labels. After user feedback that it was too sheer, panel alphas were raised to readable levels (`card_a ≈ 186`, list `≈ 181`, background `≈ 151` at default `glass_clarity=45`).
+- `Glass` was restored to a dark, denser material (dark card fill `≈ 77`, background `≈ 94`) instead of the over-transparent white veil.
 - Offscreen tests pass: theme switching, settings combo, lens visibility, light QSS values.
 
 ### Still unresolved

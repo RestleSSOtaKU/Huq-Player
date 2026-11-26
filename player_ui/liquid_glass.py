@@ -77,13 +77,16 @@ def configure_macos_glass(window, theme="macos27_glass", enable=True):
                 ns_window.setAppearance_(None)
             elif theme == "macos27_glass":
                 ns_window.setAppearance_(NSAppearance.appearanceNamed_(NSAppearanceNameVibrantLight))
-            elif theme == "liquid_glass":
+            else:
+                # Original Glass stays a dark, readable material.
                 ns_window.setAppearance_(NSAppearance.appearanceNamed_(NSAppearanceNameVibrantDark))
 
         glass_view = getattr(window, "_glass_view", None)
         if glass_view is not None and hasattr(glass_view, "setStyle_"):
-            # NSGlassEffectViewStyleClear = 1, Regular (default, muddy) = 0.
-            glass_view.setStyle_(1 if enable else 0)
+            # NSGlassEffectViewStyleClear = 1, Regular = 0.
+            # Only macOS 27 uses the clear material; Glass keeps the denser
+            # regular material so its dark UI stays readable.
+            glass_view.setStyle_(1 if (enable and theme == "macos27_glass") else 0)
     except Exception:
         pass
 
@@ -193,41 +196,42 @@ def build_liquid_qss(r=26, g=36, b=58, glass_pct=50, theme="classic", ambient_op
         # QSS only adds a thin veil and rim so the backdrop stays visible
         # instead of being buried under an opaque dark gradient.
         if is_m27:
-            # Native macOS Settings look: light vibrant glass, dark text,
-            # thin gray rim. No dark opaque layer over the material.
+            # Native macOS Settings look: light material with enough density
+            # to keep dark text readable over any wallpaper.
             text_color = "#1d1d1f"
             secondary_text = "#6e6e73"
-            card_a = int(50 + 120 * c_f)
-            rim_a = int(12 + 46 * r_f)
-            btn_a = int(120 + 70 * r_f)
-            card_bg = f"rgba(255, 255, 255, {card_a})"
+            card_a = int(150 + 80 * c_f)
+            rim_a = int(22 + 42 * r_f)
+            btn_a = int(190 + 50 * r_f)
+            card_bg = f"rgba(252, 252, 254, {card_a})"
             card_hi = f"rgba(0, 0, 0, {rim_a})"
             card_lo = card_hi
-            list_bg = f"rgba(248, 248, 250, {int(70 + 90 * c_f)})"
-            input_bg = "rgba(255, 255, 255, 220)"
+            list_bg = f"rgba(248, 248, 250, {int(150 + 70 * c_f)})"
+            input_bg = "rgba(255, 255, 255, 240)"
             btn_bg = f"rgba(255, 255, 255, {btn_a})"
             slider_bg = "rgba(0, 0, 0, 42)"
             slider_handle = "#ffffff"
             tint_a = int(2 + 16 * ambient_opacity)
-            base_a = int(2 + 12 * c_f)
+            base_a = int(120 + 70 * c_f)
             mid_rgb, low_rgb = "236, 239, 244", "226, 230, 237"
             set_mid, set_low = "238, 240, 245", "229, 232, 238"
         else:
+            # Restore the original readable dark Glass material.
             text_color = "#ffffff"
             secondary_text = "rgba(255, 255, 255, 190)"
-            card_a = int(12 + 70 * c_f)
-            rim_a = int(24 + 70 * r_f)
-            btn_a = int(14 + 22 * r_f)
-            card_bg = f"rgba(255, 255, 255, {card_a})"
+            card_a = int(28 + 110 * c_f)
+            rim_a = int(24 + 76 * r_f)
+            btn_a = int(16 + 24 * r_f)
+            card_bg = f"rgba(24, 26, 34, {card_a})"
             card_hi = f"rgba(255, 255, 255, {rim_a})"
             card_lo = card_hi
-            list_bg = f"rgba(0, 0, 0, {int(12 + 52 * c_f)})"
-            input_bg = f"rgba(255, 255, 255, {int(12 + 18 * r_f)})"
+            list_bg = f"rgba(14, 16, 22, {int(18 + 90 * c_f)})"
+            input_bg = f"rgba(255, 255, 255, {int(14 + 20 * r_f)})"
             btn_bg = f"rgba(255, 255, 255, {btn_a})"
-            slider_bg = "rgba(255, 255, 255, 46)"
+            slider_bg = "rgba(255, 255, 255, 50)"
             slider_handle = "#ffffff"
-            tint_a = int(5 + 48 * ambient_opacity)
-            base_a = int(6 + 82 * c_f)
+            tint_a = int(8 + 75 * ambient_opacity)
+            base_a = int(20 + 165 * c_f)
             mid_rgb, low_rgb = "14, 16, 24", "8, 10, 16"
             set_mid, set_low = "16, 18, 26", "10, 12, 18"
 

@@ -57,7 +57,7 @@
 5. **Layout & Text Overflow Protection:**
    * Use `MarqueeLabel` (with `QSizePolicy.Ignored`) for dynamic track metadata so long titles never compress `lbl_cover` or push right-side controls.
    * Keep `combo_group` at `min-width >= 116px` (`view().setMinimumWidth(126)`) and `btn_sort_dir` at `50px` with `padding: 6px 4px;` so `"Custom"` and `"A-Z"`/`"Z-A"` never elide or clip.
- 6. **Native macOS Glass Style:** `pyqt_liquidglass` defaults `NSGlassEffectView` to `Regular` (dark/muddy). Always call `configure_macos_glass()` after `apply_glass_to_window()` so glass themes use `NSGlassEffectViewStyleClear (1)` with `VibrantLight` for `macos27_glass` (light, macOS-Settings-like) and `VibrantDark` for `liquid_glass`. Keep QSS veils thin; the native view is the real glass.
+ 6. **Native macOS Glass Style:** `pyqt_liquidglass` defaults `NSGlassEffectView` to `Regular`. Always call `configure_macos_glass()` after `apply_glass_to_window()`: `macos27_glass` uses `NSGlassEffectViewStyleClear (1)` + `VibrantLight` with a readable light QSS veil; `liquid_glass` keeps the denser `Regular (0)` + `VibrantDark` material so its dark UI stays readable. Do not make the QSS panels too sheer — native Settings has enough density to keep text readable.
 
 ## v0.5.2 Architecture & Build Notes
 - **Pre-baked HRTF Profile (`player_ui/default_sofa.npz`):** Bundled into PyInstaller releases so first startup skips importing `pyfar`/`sofar`/`netCDF4`/`h5py` (preventing Windows HDF5 thread deadlocks and enabling <0.5s cold starts).
