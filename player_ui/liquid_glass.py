@@ -87,6 +87,10 @@ def configure_macos_glass(window, theme="macos27_glass", enable=True):
             # Only macOS 27 uses the clear material; Glass keeps the denser
             # regular material so its dark UI stays readable.
             glass_view.setStyle_(1 if (enable and theme == "macos27_glass") else 0)
+        if glass_view is not None and hasattr(glass_view, "setCornerRadius_"):
+            # Match the rounded window corners so the native material does not
+            # leave a square edge / cut-off line under the QSS panels.
+            glass_view.setCornerRadius_(14.0 if enable else 0.0)
     except Exception:
         pass
 
@@ -203,18 +207,18 @@ def build_liquid_qss(r=26, g=36, b=58, glass_pct=50, theme="classic", ambient_op
             card_a = int(150 + 80 * c_f)
             rim_a = int(22 + 42 * r_f)
             btn_a = int(190 + 50 * r_f)
-            card_bg = f"rgba(252, 252, 254, {card_a})"
+            card_bg = f"rgba(238, 238, 243, {card_a})"
             card_hi = f"rgba(0, 0, 0, {rim_a})"
             card_lo = card_hi
-            list_bg = f"rgba(248, 248, 250, {int(150 + 70 * c_f)})"
+            list_bg = f"rgba(234, 234, 240, {int(150 + 70 * c_f)})"
             input_bg = "rgba(255, 255, 255, 240)"
             btn_bg = f"rgba(255, 255, 255, {btn_a})"
             slider_bg = "rgba(0, 0, 0, 42)"
             slider_handle = "#ffffff"
-            tint_a = int(2 + 16 * ambient_opacity)
-            base_a = int(120 + 70 * c_f)
-            mid_rgb, low_rgb = "236, 239, 244", "226, 230, 237"
-            set_mid, set_low = "238, 240, 245", "229, 232, 238"
+            tint_a = int(6 * ambient_opacity)
+            base_a = 0
+            mid_rgb, low_rgb = "228, 232, 239", "218, 223, 231"
+            set_mid, set_low = "230, 233, 240", "221, 225, 233"
         else:
             # Restore the original readable dark Glass material.
             text_color = "#ffffff"
@@ -235,8 +239,14 @@ def build_liquid_qss(r=26, g=36, b=58, glass_pct=50, theme="classic", ambient_op
             mid_rgb, low_rgb = "14, 16, 24", "8, 10, 16"
             set_mid, set_low = "16, 18, 26", "10, 12, 18"
 
-        bg_gradient = f"qradialgradient(cx:0.28, cy:0.18, radius:1.4, stop:0 rgba({r},{g},{b},{tint_a}), stop:0.55 rgba({mid_rgb},{base_a}), stop:1 rgba({low_rgb},{base_a}))"
-        settings_bg = f"qlineargradient(x1:1, y1:0.9, x2:0, y2:0, stop:0 rgba({r},{g},{b},{int(tint_a*0.85)}), stop:0.45 rgba({set_mid},{base_a}), stop:1 rgba({set_low},{base_a}))"
+        if is_m27:
+            # Do not paint a square gradient layer over the rounded native
+            # glass view; that square edge is what caused the cut-off corner.
+            bg_gradient = "transparent"
+            settings_bg = "transparent"
+        else:
+            bg_gradient = f"qradialgradient(cx:0.28, cy:0.18, radius:1.4, stop:0 rgba({r},{g},{b},{tint_a}), stop:0.55 rgba({mid_rgb},{base_a}), stop:1 rgba({low_rgb},{base_a}))"
+            settings_bg = f"qlineargradient(x1:1, y1:0.9, x2:0, y2:0, stop:0 rgba({r},{g},{b},{int(tint_a*0.85)}), stop:0.45 rgba({set_mid},{base_a}), stop:1 rgba({set_low},{base_a}))"
     
     elif theme == "light":
         import colorsys

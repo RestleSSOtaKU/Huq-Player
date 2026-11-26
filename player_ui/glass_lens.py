@@ -34,11 +34,18 @@ class GlassLensOverlay(QWidget):
     def set_source(self, pixmap):
         self._source = QPixmap(pixmap) if isinstance(pixmap, QPixmap) and not pixmap.isNull() else QPixmap()
         self._cache_key = None
+        self.sync_active()
         self.update()
 
     def sync_active(self):
-        self.setVisible(getattr(self.mw, "current_theme", "classic") in ("liquid_glass", "macos27_glass"))
-        if self.isVisible():
+        # The lens is a WebGPU-style flourish for the original Glass theme.
+        # Glass macOS 27 is meant to look like native macOS Settings, which
+        # has no such pill, so keep it hidden there. Also hide when there is
+        # no real cover to refract (never paint the accent-gradient fallback).
+        theme = getattr(self.mw, "current_theme", "classic")
+        visible = theme == "liquid_glass" and not self._source.isNull()
+        self.setVisible(visible)
+        if visible:
             self.sync_geometry()
 
     def sync_geometry(self):
@@ -148,18 +155,17 @@ class GlassLensOverlay(QWidget):
 
     def paintEvent(self, event):
         w, h = self.width(), self.height()
-        if w < 8 or h < 8:
+        if w < 8 or h < 8 or self._source.isNull():
+            # No real album cover: do not draw an accent-colored fake pill.
+            self._image = None
             return
-        use_source = not self._source.isNull()
-        key = (self._source.cacheKey() if use_source else 0, w, h, self._ox, self._oy)
+        key = (self._source.cacheKey(), w, h, self._ox, self._oy)
         if key != self._cache_key:
             self._cache_key = key
-            if use_source:
-                image = self._source.toImage().convertToFormat(QImage.Format_RGBA8888)
-                self._image = self._render(image, w, h, self._ox, self._oy)
-            else:
-                image = self._fallback_source(w, h)
-                self._image = self._render(image, w, h, w, h)
+            image = self._source.toImage().convertToFormat(QImage.Format_RGBA8888)
+            self._image = self._render(image, w, h, self._ox, self._oy)
+        if self._image is None:
+            return
         painter = QPainter(self)
         painter.drawImage(0, 0, self._image)
         painter.end()

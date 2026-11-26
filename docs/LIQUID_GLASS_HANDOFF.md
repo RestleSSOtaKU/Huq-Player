@@ -14,7 +14,7 @@
 - No push has been made.
 
 ### Completed so far
-- Added `player_ui/glass_lens.py`: static cached lens pill over the album cover, ported from MIT-licensed WebGPU shader math (SDF + dispersion + Fresnel/rim), drawn with NumPy + QPainter (no browser/WebGPU runtime).
+- Added `player_ui/glass_lens.py`: static cached lens pill over the album cover, ported from MIT-licensed WebGPU shader math (SDF + dispersion + Fresnel/rim), drawn with NumPy + QPainter (no browser/WebGPU runtime). Per user feedback it only appears in the original `Glass` theme **and only when a real cover is loaded**; the accent-gradient fallback was removed because it painted a bright cyan pill when no cover existed. `macos27_glass` hides it to match native macOS Settings.
 - Added `Glass macOS 27` as a fourth theme:
   - ID `macos27_glass`, label `Glass macOS 27`.
   - Settings → Appearance → Theme, toolbar theme cycle, persistence in `session.json`, dialog/menu/graph styling all recognize it.
@@ -29,8 +29,10 @@
   - sets `NSGlassEffectView.style = 1` (`Clear`) **only for `macos27_glass`**; `liquid_glass` keeps `Regular (0)` so it stays readable,
   - sets the `NSWindow` appearance to `VibrantLight` for `macos27_glass` and `VibrantDark` for `liquid_glass`,
   - restores the default appearance/style when leaving glass themes.
-- Reworked `macos27_glass` QSS to be a **light native material**: dark text (`#1d1d1f` / `#6e6e73`), light translucent cards, thin dark rim, light combo popup, dark spectrum axis labels. After user feedback that it was too sheer, panel alphas were raised to readable levels (`card_a ≈ 186`, list `≈ 181`, background `≈ 151` at default `glass_clarity=45`).
+- Reworked `macos27_glass` QSS to be a **light native material**: dark text (`#1d1d1f` / `#6e6e73`), gray translucent cards (`rgba(238,238,243,186)`), thin dark rim, light combo popup, dark spectrum axis labels. After user feedback that it was too sheer and then too white, panels are now mid-gray (not pure white) and the main window/settings root are fully transparent so no square gradient layer cuts across the rounded native glass corners.
 - `Glass` was restored to a dark, denser material (dark card fill `≈ 77`, background `≈ 94`) instead of the over-transparent white veil.
+- Accent handling: `macos27_glass` uses the muted/light accent branch; at `Ambient Glow = 0` it falls back to neutral gray, and `_on_ambient_color_changed()` now re-derives the accent whenever the slider moves.
+- Native glass view corner radius is set to `14` so the material matches the window corners instead of leaving a square cutoff line.
 - Offscreen tests pass: theme switching, settings combo, lens visibility, light QSS values.
 
 ### Still unresolved

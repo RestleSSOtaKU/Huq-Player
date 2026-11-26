@@ -2448,13 +2448,20 @@ class MainWindow(QMainWindow):
 
     def _get_accent_color(self, r, g, b):
         h, l, s = colorsys.rgb_to_hls(r/255.0, g/255.0, b/255.0)
-        if s < 0.04:
-            return ("#6e6e73", "#98989d") if getattr(self, "current_theme", "classic") == "light" else ("#8e8e93", "#c7c7cc")
+        theme = getattr(self, "current_theme", "classic")
+        is_m27 = theme == "macos27_glass"
+        is_light = theme in ("light", "macos27_glass")
+        # With Ambient Glow at minimum, macOS 27 should stay neutral instead
+        # of amplifying the sampled album-art hue.
+        if s < 0.04 or (is_m27 and getattr(self, "ambient_opacity", 0.3) <= 0.02):
+            return ("#6e6e73", "#98989d") if is_light else ("#8e8e93", "#c7c7cc")
 
-        is_light = getattr(self, "current_theme", "classic") == "light"
         # Greens/yellows (h ~ 0.14..0.46) have high perceptual brightness, so tame saturation & luminance
         is_bright_hue = 0.13 <= h <= 0.46
-        if is_light:
+        if is_m27:
+            s = min(0.50 if is_bright_hue else 0.58, max(0.24, s * 0.70))
+            l = min(0.32 if is_bright_hue else 0.38, max(0.24, l))
+        elif is_light:
             s = min(0.72 if is_bright_hue else 0.82, max(0.48, s * 1.1))
             l = min(0.36 if is_bright_hue else 0.44, max(0.28, l))
         else:
@@ -2524,6 +2531,11 @@ class MainWindow(QMainWindow):
         self.save_session_state()
 
     def _on_ambient_color_changed(self, color):
+        # Re-derive the accent from the current Ambient Glow value. Otherwise
+        # lowering the slider leaves the previously amplified color in QSS.
+        self.current_accent, self.current_accent_end = self._get_accent_color(
+            color.red(), color.green(), color.blue()
+        )
         self.setStyleSheet(build_liquid_qss(color.red(), color.green(), color.blue(), theme=self.current_theme, ambient_opacity=self.ambient_opacity, accent=self.current_accent, accent_end=self.current_accent_end, glass_clarity=self.glass_clarity, glass_rim=self.glass_rim))
         if getattr(self, "_settings_dlg", None) and self._settings_dlg.isVisible():
             self._settings_dlg.setStyleSheet(self.styleSheet())
