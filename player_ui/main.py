@@ -140,7 +140,7 @@ _LIBRARY_BASE_HEIGHT = 760
 # Reserve one stable width for the longest peak/limiter readout. Letting the
 # label grow with its text raised the spectrum card's minimum width and could
 # widen the whole window on hot tracks when auto-trim engaged.
-_PEAK_LABEL_WIDTH = 200
+_PEAK_LABEL_WIDTH = 180
 
 # Panel Scrim starts at 50% (fully transparent) and ends at 100% (full scrim).
 # The lower half of the old 0-255 slider is cut off so the whole track is useful.
