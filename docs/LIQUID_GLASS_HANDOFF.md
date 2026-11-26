@@ -24,20 +24,26 @@
 - Verified with `py_compile` and offscreen Qt smoke tests (theme switching, settings combo, lens visibility, session persistence).
 
 ### Native glass fix (latest, not yet verified by user)
-- Root cause found: `pyqt_liquidglass` creates `NSGlassEffectView` with its default **`Regular`** style (`NSGlassEffectViewStyleRegular = 0`), which is the dark/dense material. macOS Settings uses the **`Clear`** style (`= 1`) plus a vibrant light appearance.
-- Added `configure_macos_glass()` in `player_ui/liquid_glass.py`. Called from every place that applies native glass (main window, `SettingsDialog`, track-properties dialog, startup). It:
-  - sets `NSGlassEffectView.style = 1` (`Clear`) **only for `macos27_glass`**; `liquid_glass` keeps `Regular (0)` so it stays readable,
-  - sets the `NSWindow` appearance to `VibrantLight` for `macos27_glass` and `VibrantDark` for `liquid_glass`,
-  - restores the default appearance/style when leaving glass themes.
-- Reworked `macos27_glass` QSS to be a **light native material**: dark text (`#1d1d1f` / `#6e6e73`), gray translucent cards (`rgba(238,238,243,186)`), thin dark rim, light combo popup, dark spectrum axis labels. After user feedback that it was too sheer and then too white, panels are now mid-gray (not pure white) and the main window/settings root are fully transparent so no square gradient layer cuts across the rounded native glass corners.
-- `Glass` was restored to a dark, denser material (dark card fill `≈ 77`, background `≈ 94`) instead of the over-transparent white veil.
-- Accent handling: `macos27_glass` uses the muted/light accent branch; at `Ambient Glow = 0` it falls back to neutral gray, and `_on_ambient_color_changed()` now re-derives the accent whenever the slider moves.
-- Native glass view corner radius is set to `14` so the material matches the window corners instead of leaving a square cutoff line.
-- Offscreen tests pass: theme switching, settings combo, lens visibility, light QSS values.
+- Root cause found: `pyqt_liquidglass` creates `NSGlassEffectView` with its default **`Regular`** style (`NSGlassEffectViewStyleRegular = 0`). The user’s latest references are **dark-mode** macOS panels over a picture background, not light panels, so the earlier light/white direction was wrong.
+- Added `configure_macos_glass()` in `player_ui/liquid_glass.py`. Called from every place that applies native glass (main window, `SettingsDialog`, track-properties dialog, startup, and both Glass Opacity sliders). It:
+  - keeps `NSGlassEffectView.style = 0` (`Regular`) for a native dark look,
+  - sets the `NSWindow` appearance to `VibrantDark` for both glass themes,
+  - sets `NSGlassEffectView.alphaValue = 0.50 + 0.50 * opacity` for `macos27_glass`, so the slider drives a real clear → frosted range,
+  - sets a `14pt` corner radius to avoid square cut-off lines,
+  - restores the default appearance/alpha/style when leaving glass themes.
+- `macos27_glass` QSS is now a **dark native material** with a wide range driven by `glass_clarity` (`Glass Opacity` 0–100):
+  - card fill `rgba(26,26,28,40→240)`,
+  - list fill `rgba(20,20,22,30→220)`,
+  - white text (`#f5f5f7`), thin white rim, dark combo popup, white spectrum axis labels,
+  - main window/settings root are fully transparent so no square gradient layer cuts across the rounded native glass corners.
+- `Glass` stays a dark, denser material (dark card fill `≈ 77`, background `≈ 94`).
+- Accent handling: `macos27_glass` uses a muted dark accent branch; at `Ambient Glow = 0` it falls back to neutral gray `#8e8e93`, and `_on_ambient_color_changed()` re-derives the accent whenever the slider moves.
+- Cover lens pill is hidden in `macos27_glass` and never renders the accent-gradient fallback.
+- Offscreen tests pass: theme switching, settings combo, dark QSS values, neutral accent at zero glow, lens visibility rules.
 
 ### Still unresolved
-- User has not yet re-tested the latest native-style fix. If it is still muddy, next suspects are: Qt root `NSView` painting opaque layer above the glass view, DWM/Windows path differences, or `NSGlassEffectView` needing `setTintColor_`/custom `contentStyle`. Capture a fresh screenshot and compare pixel means again.
-- Reference screenshots provided by user show clean macOS Settings panels. Previous REXA screenshot mean RGB ≈ `[64, 67, 88]`, much darker than the reference.
+- User is testing the dark clear→frosted range now. If it is still not matching the references, next suspects are: `NSGlassEffectView` needing `setTintColor_` / custom `contentStyle`, or the native view alpha not being honored on this macOS build. More reference screenshots with picture backgrounds are welcome.
+- Earlier REXA screenshot was whiteish (`mean ≈ [159,160,163]`); reference panels are dark (`mean ≈ [26–41]`).
 
 ## Important constraints / gotchas
 - `pyqt_liquidglass` is installed in `.venv` and reports `HAS_GLASS_EFFECT True`, `MACOS_VERSION (27, 2, 1)`.

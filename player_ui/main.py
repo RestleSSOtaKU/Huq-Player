@@ -2001,7 +2001,7 @@ class SettingsDialog(QDialog):
         g.addWidget(self.lbl_trans, 4, 0)
         self.s_trans = ResetSlider(45, Qt.Horizontal)
         self.s_trans.setRange(0, 100)
-        self.s_trans.setToolTip("Lower = cleaner native glass. Higher = stronger custom tint.")
+        self.s_trans.setToolTip("macOS 27: lower = clear glass, higher = frosted/opaque. Original Glass: lower = native blur, higher = stronger tint.")
         self.s_trans.valueChanged.connect(self._on_glass)
         g.addWidget(self.s_trans, 4, 1)
 
@@ -2241,7 +2241,7 @@ class SettingsDialog(QDialog):
                 if glass and self._glass_id is None:
                     self._glass_id = glass.apply_glass_to_window(self)
                 if glass:
-                    configure_macos_glass(self, self.mw.current_theme, True)
+                    configure_macos_glass(self, self.mw.current_theme, True, getattr(self.mw, "glass_clarity", 45) / 100.0)
                 apply_windows_glass(self, True, False)
                 apply_seamless_titlebar(self)
             else:
@@ -2269,6 +2269,9 @@ class SettingsDialog(QDialog):
     def _on_glass(self, _=None):
         self.mw.glass_clarity = self.s_trans.value()
         self.mw.glass_rim = self.s_rim.value()
+        if glass and is_glass_theme(self.mw.current_theme):
+            configure_macos_glass(self.mw, self.mw.current_theme, True, self.mw.glass_clarity / 100.0)
+            configure_macos_glass(self, self.mw.current_theme, True, self.mw.glass_clarity / 100.0)
         self.mw._on_ambient_color_changed(self.mw._current_ambient_color)
         self.mw.save_session_state()
 
@@ -2367,6 +2370,8 @@ class MainWindow(QMainWindow):
     def _on_glass_tuned(self, _=None):
         self.glass_clarity = self.slider_glass_clarity.value()
         self.glass_rim = self.slider_glass_rim.value()
+        if glass and is_glass_theme(self.current_theme):
+            configure_macos_glass(self, self.current_theme, True, self.glass_clarity / 100.0)
         if hasattr(self, 'lava_overlay'): self.lava_overlay.sync_active()
         self._on_ambient_color_changed(self._current_ambient_color)
         self.save_session_state()
@@ -2393,10 +2398,9 @@ class MainWindow(QMainWindow):
 
     def _update_graph_theme(self):
         is_light = getattr(self, "current_theme", "classic") == "light"
-        is_m27 = getattr(self, "current_theme", "classic") == "macos27_glass"
         is_glass = is_glass_theme(getattr(self, "current_theme", "classic"))
-        axis_color = '#1c1c1e' if (is_light or is_m27) else '#eef2f8'
-        if is_glass and not is_m27: axis_color = '#ffffff'
+        axis_color = '#1c1c1e' if is_light else '#eef2f8'
+        if is_glass: axis_color = '#ffffff'
         
         pg.setConfigOption('foreground', axis_color)
 
@@ -2450,17 +2454,17 @@ class MainWindow(QMainWindow):
         h, l, s = colorsys.rgb_to_hls(r/255.0, g/255.0, b/255.0)
         theme = getattr(self, "current_theme", "classic")
         is_m27 = theme == "macos27_glass"
-        is_light = theme in ("light", "macos27_glass")
+        is_light = theme == "light"
         # With Ambient Glow at minimum, macOS 27 should stay neutral instead
         # of amplifying the sampled album-art hue.
         if s < 0.04 or (is_m27 and getattr(self, "ambient_opacity", 0.3) <= 0.02):
-            return ("#6e6e73", "#98989d") if is_light else ("#8e8e93", "#c7c7cc")
+            return ("#8e8e93", "#c7c7cc")
 
         # Greens/yellows (h ~ 0.14..0.46) have high perceptual brightness, so tame saturation & luminance
         is_bright_hue = 0.13 <= h <= 0.46
         if is_m27:
-            s = min(0.50 if is_bright_hue else 0.58, max(0.24, s * 0.70))
-            l = min(0.32 if is_bright_hue else 0.38, max(0.24, l))
+            s = min(0.58 if is_bright_hue else 0.68, max(0.28, s * 0.80))
+            l = min(0.44 if is_bright_hue else 0.50, max(0.32, l))
         elif is_light:
             s = min(0.72 if is_bright_hue else 0.82, max(0.48, s * 1.1))
             l = min(0.36 if is_bright_hue else 0.44, max(0.28, l))
@@ -2491,7 +2495,7 @@ class MainWindow(QMainWindow):
             if glass and getattr(self, "glass_effect_id", None) is None:
                 self.glass_effect_id = glass.apply_glass_to_window(self)
             if glass:
-                configure_macos_glass(self, self.current_theme, True)
+                configure_macos_glass(self, self.current_theme, True, getattr(self, "glass_clarity", 45) / 100.0)
             apply_windows_glass(self, True, False)
             apply_seamless_titlebar(self)
         else:
@@ -4803,7 +4807,7 @@ class MainWindow(QMainWindow):
         dlg.setStyleSheet(self.styleSheet())
         if is_glass_theme(self.current_theme) and glass:
             glass.apply_glass_to_window(dlg)
-            configure_macos_glass(dlg, self.current_theme, True)
+            configure_macos_glass(dlg, self.current_theme, True, getattr(self, "glass_clarity", 45) / 100.0)
         apply_windows_glass(dlg, is_glass_theme(self.current_theme), self.current_theme == "light")
         apply_seamless_titlebar(dlg)
         if getattr(self, "_props_dlg", None) is not None:
@@ -5241,7 +5245,7 @@ if __name__ == "__main__":
         if glass and getattr(window, "glass_effect_id", None) is None:
             window.glass_effect_id = glass.apply_glass_to_window(window)
         if glass:
-            configure_macos_glass(window, window.current_theme, True)
+            configure_macos_glass(window, window.current_theme, True, getattr(window, "glass_clarity", 45) / 100.0)
         apply_windows_glass(window, True, False)
         c = window._current_ambient_color
         window.setStyleSheet(build_liquid_qss(
