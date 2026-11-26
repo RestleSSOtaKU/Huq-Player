@@ -187,15 +187,17 @@ def apply_windows_glass(window, enable=True, light_titlebar=False):
 def configure_macos_glass(window, theme="macos27_glass", enable=True, opacity=None):
     """Match the native glass material to the selected theme and opacity.
 
-    ``macos27_glass`` uses the native Clear material with dark vibrancy: that
-    is the gentle blur seen in macOS Settings/Control Center. ``opacity`` only
+    ``macos27_glass`` uses the native Clear material with DarkAqua appearance:
+    that is the gentle, neutral blur seen in macOS Settings/Control Center.
+    ``opacity`` only
     drives the QSS veil; the native view stays at full alpha so AppKit keeps
     rendering the material.
     """
     if sys.platform != "darwin":
         return
     try:
-        from AppKit import NSAppearance, NSAppearanceNameVibrantDark
+        from AppKit import (NSAppearance, NSAppearanceNameDarkAqua,
+                            NSAppearanceNameVibrantDark)
         try:
             from AppKit import NSGlassEffectViewStyleClear, NSGlassEffectViewStyleRegular
         except ImportError:
@@ -207,9 +209,12 @@ def configure_macos_glass(window, theme="macos27_glass", enable=True, opacity=No
         if ns_window is not None:
             if not enable:
                 ns_window.setAppearance_(None)
+            elif theme == "macos27_glass":
+                # DarkAqua is the less-vibrant dark used by macOS Settings.
+                # VibrantDark made REXA read brighter/bluer than the panels
+                # in the user's references.
+                ns_window.setAppearance_(NSAppearance.appearanceNamed_(NSAppearanceNameDarkAqua))
             else:
-                # Both glass themes are dark native material; the references
-                # are dark-mode macOS panels over a picture background.
                 ns_window.setAppearance_(NSAppearance.appearanceNamed_(NSAppearanceNameVibrantDark))
 
         glass_view = getattr(window, "_glass_view", None)
