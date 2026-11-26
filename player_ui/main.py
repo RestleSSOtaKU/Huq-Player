@@ -111,7 +111,9 @@ from liquid_glass import (make_glass_card, sample_ambient_rgb, sample_ambient_pa
                           apply_windows_glass, configure_macos_glass,
                           windows_transparency_enabled, read_system_glass_preferences,
                           WindowDragFilter, GLASS_MATERIALS, GLASS_MATERIAL_LABELS,
+                          GLASS_STAGES, GLASS_STAGE_LABELS, GLASS_STAGE_MATERIAL,
                           canonical_glass_material, glass_material_clarity,
+                          glass_material_profile, normalize_glass_overrides,
                           material_from_opacity)
 from glass_lens import GlassLensOverlay
 
@@ -2048,6 +2050,54 @@ class SettingsDialog(QDialog):
         self.s_rim.setRange(0, 100)
         self.s_rim.valueChanged.connect(self._on_glass)
         g.addWidget(self.s_rim, 5, 1)
+
+        g.addWidget(QLabel("Glass Stage:"), 6, 0)
+        self.combo_glass_stage = QComboBox()
+        self.combo_glass_stage.addItems([GLASS_STAGE_LABELS[s] for s in GLASS_STAGES])
+        for i, stage in enumerate(GLASS_STAGES):
+            self.combo_glass_stage.setItemData(i, stage)
+        self.combo_glass_stage.setToolTip(
+            "Dark = DarkAqua + Dark preset; Clear / Light = Aqua + Clear preset."
+        )
+        self.combo_glass_stage.currentIndexChanged.connect(self._on_glass_stage)
+        g.addWidget(self.combo_glass_stage, 6, 1)
+
+        g.addWidget(QLabel("Backdrop Downsample:"), 7, 0)
+        self.s_glass_backdrop = ResetSlider(35, Qt.Horizontal)
+        self.s_glass_backdrop.setRange(20, 50)
+        self.s_glass_backdrop.setToolTip(
+            "Experimental backdrop downsample, 20 (softest) .. 50 (sharpest). "
+            "macOS has no public blur-radius API."
+        )
+        self.s_glass_backdrop.valueChanged.connect(self._on_glass_tuning)
+        g.addWidget(self.s_glass_backdrop, 7, 1)
+
+        g.addWidget(QLabel("Native Tint:"), 8, 0)
+        self.s_glass_tint = ResetSlider(34, Qt.Horizontal)
+        self.s_glass_tint.setRange(0, 100)
+        self.s_glass_tint.valueChanged.connect(self._on_glass_tuning)
+        g.addWidget(self.s_glass_tint, 8, 1)
+
+        g.addWidget(QLabel("Panel Scrim:"), 9, 0)
+        self.s_glass_scrim = ResetSlider(174, Qt.Horizontal)
+        self.s_glass_scrim.setRange(0, 255)
+        self.s_glass_scrim.valueChanged.connect(self._on_glass_tuning)
+        g.addWidget(self.s_glass_scrim, 9, 1)
+
+        g.addWidget(QLabel("Native Style:"), 10, 0)
+        self.combo_glass_style = QComboBox()
+        self.combo_glass_style.addItems(["Clear", "Regular"])
+        self.combo_glass_style.setItemData(0, "clear")
+        self.combo_glass_style.setItemData(1, "regular")
+        self.combo_glass_style.setToolTip(
+            "Public NSGlassEffectView style. Regular is softer but can smear."
+        )
+        self.combo_glass_style.currentIndexChanged.connect(self._on_glass_tuning)
+        g.addWidget(self.combo_glass_style, 10, 1)
+
+        self.btn_reset_glass = QPushButton("Reset Stage Tuning")
+        self.btn_reset_glass.clicked.connect(self._reset_glass_tuning)
+        g.addWidget(self.btn_reset_glass, 11, 1)
         lay.addWidget(app_card)
 
         perf_card = make_glass_card()
@@ -2253,6 +2303,46 @@ class SettingsDialog(QDialog):
         self.combo_glass_material.blockSignals(True)
         self.combo_glass_material.setCurrentIndex(max(0, material_idx))
         self.combo_glass_material.blockSignals(False)
+
+        # Stage + advanced tuning values are per material and persisted.
+        self.glass_appearance = getattr(self.mw, "glass_appearance", "dark")
+        self.glass_overrides = getattr(self.mw, "glass_overrides", {})
+        stage = self.glass_appearance if self.glass_appearance in GLASS_STAGES else "dark"
+        self.combo_glass_stage.blockSignals(True)
+        self.combo_glass_stage.setCurrentIndex(GLASS_STAGES.index(stage))
+        self.combo_glass_stage.blockSignals(False)
+        material_key = canonical_glass_material(getattr(self.mw, "glass_material", "automatic"))
+        per = normalize_glass_overrides((self.glass_overrides or {}).get(material_key))
+        profile = glass_material_profile(
+            material_key, getattr(self.mw, "glass_clarity", 45) / 100.0, per
+        )
+        defaults = glass_material_profile(
+            material_key, getattr(self.mw, "glass_clarity", 45) / 100.0
+        )
+        tuning = {
+            self.s_glass_backdrop: int(round(profile["backdrop_scale"] * 100)),
+            self.s_glass_tint: int(round(profile["tint_alpha"] * 100)),
+            self.s_glass_scrim: int(profile["card_alpha"]),
+        }
+        default_tuning = {
+            self.s_glass_backdrop: int(round(defaults["backdrop_scale"] * 100)),
+            self.s_glass_tint: int(round(defaults["tint_alpha"] * 100)),
+            self.s_glass_scrim: int(defaults["card_alpha"]),
+        }
+        for slider, val in tuning.items():
+            slider.default_value = default_tuning[slider]
+            slider.blockSignals(True); slider.setValue(val); slider.blockSignals(False)
+        style_idx = 1 if profile.get("style") == "regular" else 0
+        self.combo_glass_style.blockSignals(True)
+        self.combo_glass_style.setCurrentIndex(style_idx)
+        self.combo_glass_style.blockSignals(False)
+        tuning_enabled = (is_glass_theme(self.mw.current_theme)
+                          and self.mw.current_theme == "macos27_glass")
+        for widget in (self.combo_glass_stage, self.s_glass_backdrop,
+                       self.s_glass_tint, self.s_glass_scrim,
+                       self.combo_glass_style, self.btn_reset_glass):
+            widget.setEnabled(tuning_enabled)
+
         self.chk_low_cpu.blockSignals(True)
         self.chk_low_cpu.setChecked(self.mw.engine.low_end_mode)
         self.chk_low_cpu.blockSignals(False)
@@ -2312,10 +2402,19 @@ class SettingsDialog(QDialog):
 
     def _on_glass(self, _=None):
         self.mw.glass_material = canonical_glass_material(self.combo_glass_material.currentData())
+        if self.mw.glass_material in GLASS_STAGE_MATERIAL.values():
+            stage = "dark" if self.mw.glass_material == "dark" else "light"
+            self.mw.glass_appearance = stage
+            self.combo_glass_stage.blockSignals(True)
+            self.combo_glass_stage.setCurrentIndex(max(0, GLASS_STAGES.index(stage)))
+            self.combo_glass_stage.blockSignals(False)
         self.mw.glass_clarity = glass_material_clarity(
             self.mw.glass_material, getattr(self.mw, "glass_clarity", 45)
         )
         self.mw.glass_rim = self.s_rim.value()
+        # configure_macos_glass() reads these from the widget it is given.
+        self.glass_appearance = getattr(self.mw, "glass_appearance", "dark")
+        self.glass_overrides = getattr(self.mw, "glass_overrides", {})
         if glass and is_glass_theme(self.mw.current_theme):
             configure_macos_glass(self.mw, self.mw.current_theme, True,
                                   self.mw.glass_clarity / 100.0,
@@ -2325,6 +2424,39 @@ class SettingsDialog(QDialog):
                                   material=self.mw.glass_material)
         self.mw._on_ambient_color_changed(self.mw._current_ambient_color)
         self.mw.save_session_state()
+        self.setStyleSheet(self.mw.styleSheet())
+
+    def _on_glass_stage(self, _=None):
+        stage = self.combo_glass_stage.currentData() or "dark"
+        self.mw.glass_appearance = stage
+        self.mw.glass_material = GLASS_STAGE_MATERIAL.get(stage, "dark")
+        self.combo_glass_material.blockSignals(True)
+        idx = self.combo_glass_material.findData(self.mw.glass_material)
+        self.combo_glass_material.setCurrentIndex(max(0, idx))
+        self.combo_glass_material.blockSignals(False)
+        self._on_glass()
+        self.sync_from_main()
+
+    def _on_glass_tuning(self, *_):
+        material = canonical_glass_material(getattr(self.mw, "glass_material", "automatic"))
+        overrides = dict(getattr(self.mw, "glass_overrides", {}) or {})
+        per = dict(overrides.get(material, {}) or {})
+        per["backdrop_scale"] = self.s_glass_backdrop.value() / 100.0
+        per["tint_alpha"] = self.s_glass_tint.value() / 100.0
+        per["card_alpha"] = self.s_glass_scrim.value()
+        per["list_alpha"] = max(0, self.s_glass_scrim.value() - 8)
+        per["style"] = self.combo_glass_style.currentData() or "clear"
+        overrides[material] = normalize_glass_overrides(per)
+        self.mw.glass_overrides = overrides
+        self._on_glass()
+
+    def _reset_glass_tuning(self):
+        material = canonical_glass_material(getattr(self.mw, "glass_material", "automatic"))
+        overrides = dict(getattr(self.mw, "glass_overrides", {}) or {})
+        overrides.pop(material, None)
+        self.mw.glass_overrides = overrides
+        self._on_glass()
+        self.sync_from_main()
 
     def _sync_glass_from_system(self):
         info = read_system_glass_preferences()
@@ -2417,6 +2549,8 @@ class MainWindow(QMainWindow):
         self.theme_glow = {"classic": 0.20, "light": 0.30, "liquid_glass": 1.00, "macos27_glass": 1.00}
         self.ambient_opacity = self.theme_glow["liquid_glass"]
         self.glass_material = "automatic"
+        self.glass_appearance = "dark"
+        self.glass_overrides = {}
         self.glass_clarity = 45
         self.glass_rim = 20
         self.spectrum_fill_enabled = True
@@ -2597,7 +2731,9 @@ class MainWindow(QMainWindow):
             accent_end=getattr(self, 'current_accent_end', '#64d2ff'),
             glass_clarity=self.glass_clarity,
             glass_rim=self.glass_rim,
-            glass_material=getattr(self, "glass_material", None)
+            glass_material=getattr(self, "glass_material", None),
+            glass_overrides=getattr(self, "glass_overrides", None),
+            glass_appearance=getattr(self, "glass_appearance", "dark")
         ))
         
         # Force layout recalculation and repaint
@@ -2616,7 +2752,7 @@ class MainWindow(QMainWindow):
         self.current_accent, self.current_accent_end = self._get_accent_color(
             color.red(), color.green(), color.blue()
         )
-        self.setStyleSheet(build_liquid_qss(color.red(), color.green(), color.blue(), theme=self.current_theme, ambient_opacity=self.ambient_opacity, accent=self.current_accent, accent_end=self.current_accent_end, glass_clarity=self.glass_clarity, glass_rim=self.glass_rim, glass_material=getattr(self, "glass_material", None)))
+        self.setStyleSheet(build_liquid_qss(color.red(), color.green(), color.blue(), theme=self.current_theme, ambient_opacity=self.ambient_opacity, accent=self.current_accent, accent_end=self.current_accent_end, glass_clarity=self.glass_clarity, glass_rim=self.glass_rim, glass_material=getattr(self, "glass_material", None), glass_overrides=getattr(self, "glass_overrides", None), glass_appearance=getattr(self, "glass_appearance", "dark")))
         if getattr(self, "_settings_dlg", None) and self._settings_dlg.isVisible():
             self._settings_dlg.setStyleSheet(self.styleSheet())
 
@@ -5048,6 +5184,8 @@ class MainWindow(QMainWindow):
                 "ambient_opacity": getattr(self, "ambient_opacity", 0.30),
                 "theme_glow": getattr(self, "theme_glow", {"classic": 0.20, "light": 0.30, "liquid_glass": 1.00, "macos27_glass": 1.00}),
                 "glass_material": getattr(self, "glass_material", "automatic"),
+                "glass_appearance": getattr(self, "glass_appearance", "dark"),
+                "glass_overrides": getattr(self, "glass_overrides", {}),
                 "glass_clarity": getattr(self, "glass_clarity", 45),
                 "glass_rim": getattr(self, "glass_rim", 20),
                 "low_end_mode": self.engine.low_end_mode,
@@ -5103,6 +5241,15 @@ class MainWindow(QMainWindow):
                 # Old sessions only have the numeric slider; infer the closest
                 # preset but keep their original numeric look.
                 self.glass_material = material_from_opacity(legacy_clarity / 100.0)
+            appearance = state.get("glass_appearance", "dark")
+            self.glass_appearance = appearance if appearance in GLASS_STAGES else "dark"
+            self.glass_overrides = {}
+            saved_overrides = state.get("glass_overrides")
+            if isinstance(saved_overrides, dict):
+                for key, value in saved_overrides.items():
+                    per = normalize_glass_overrides(value)
+                    if per:
+                        self.glass_overrides[canonical_glass_material(key)] = per
             self.glass_rim = int(state.get("glass_rim", 20))
             if hasattr(self, "slider_glass_clarity"):
                 self.slider_glass_clarity.blockSignals(True); self.slider_glass_clarity.setValue(self.glass_clarity); self.slider_glass_clarity.blockSignals(False)
@@ -5250,7 +5397,9 @@ class MainWindow(QMainWindow):
                     theme=self.current_theme, ambient_opacity=self.ambient_opacity,
                     accent=self.current_accent, accent_end=self.current_accent_end,
                     glass_clarity=self.glass_clarity, glass_rim=self.glass_rim,
-                    glass_material=getattr(self, "glass_material", None)
+                    glass_material=getattr(self, "glass_material", None),
+                    glass_overrides=getattr(self, "glass_overrides", None),
+                    glass_appearance=getattr(self, "glass_appearance", "dark")
                 ))
                 
                 self.ambient_anim.start()
@@ -5345,7 +5494,9 @@ if __name__ == "__main__":
             accent_end=window.current_accent_end,
             glass_clarity=window.glass_clarity,
             glass_rim=window.glass_rim,
-            glass_material=getattr(window, "glass_material", None)
+            glass_material=getattr(window, "glass_material", None),
+            glass_overrides=getattr(window, "glass_overrides", None),
+            glass_appearance=getattr(window, "glass_appearance", "dark")
         ))
     apply_seamless_titlebar(window)
     window.raise_()

@@ -52,6 +52,12 @@
 - macOS does **not** publicly expose the exact `Automatic / Default / Dark / Clear / Tinted` choice. The double-click sync is an explicit approximation and shows the detected signals in a tooltip. Android is paused/experimental; it uses the in-app selector only until desktop parity work resumes.
 - Offscreen tests pass: helper returns a macOS suggestion, `SettingsDialog` switches to Automatic from it, and the label double-click event emits the sync signal.
 
+### Glass Stage + tuner (latest)
+- Added `Glass Stage`: `Dark` maps to DarkAqua + dark native tint + dark QSS scrim, `Clear / Light` maps to Aqua + white native tint + white QSS scrim. Appearance is a public AppKit choice, not exact native material detection.
+- Settings now exposes advanced per-material overrides: `Backdrop Downsample` (0.20..0.50), `Native Tint` (0..1), `Panel Scrim` (card alpha, list follows at -8), and public `Native Style` (Clear/Regular). `Reset Stage Tuning` clears overrides for the active material. Values are clamped in `normalize_glass_overrides()` and persisted in `session.json` under `glass_overrides`; stage is persisted under `glass_appearance`.
+- `configure_macos_glass()` and `build_liquid_qss()` read those overrides, so native tint/style/downsample and QSS scrim move together. On-screen probe confirmed a `clear` override of scale `0.30`, tint `0.12`, and Regular style applies.
+- Sliders are explicitly labeled experimental; macOS still has no public numeric blur-radius API.
+
 ### Still unresolved
 - User retesting after the timing fix. The first bokeh pass still showed terminal text because AppKit reset the private backdrop `scale` from `0.33` back to Clear's `0.5` after the layer tree settled and again on every window move/resize. `set_macos_glass_backdrop_scale()` now reapplies on a short timer series and from a Qt move/resize event filter; an on-screen PySide probe held `0.33` through layer rebuild, move, and resize. If text is still legible, lower `backdrop_scale` in small steps; if the panel gets mushy, raise it.
 - More reference screenshots with picture backgrounds are welcome. Exact native mode detection remains unavailable through public AppKit APIs.

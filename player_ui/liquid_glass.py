@@ -43,9 +43,49 @@ GLASS_MATERIAL_LABELS = {
     "tinted": "Tinted",
 }
 
+# Two quick stages map to the existing Dark/Clear presets. The appearance
+# field is a native AppKit appearance, not an exact macOS material-mode read.
+GLASS_STAGES = ("dark", "light")
+GLASS_STAGE_LABELS = {"dark": "Dark", "light": "Clear / Light"}
+GLASS_STAGE_MATERIAL = {"dark": "dark", "light": "clear"}
+
+_GLASS_OVERRIDE_RANGES = {
+    "backdrop_scale": (0.20, 0.50),
+    "tint_alpha": (0.0, 1.0),
+    "card_alpha": (0, 255),
+    "list_alpha": (0, 255),
+}
+
+
+def normalize_glass_overrides(value):
+    """Clamp user tuning values to safe ranges; ignore unknown keys."""
+    out = {}
+    if not isinstance(value, dict):
+        return out
+    for key, (lo, hi) in _GLASS_OVERRIDE_RANGES.items():
+        if key not in value:
+            continue
+        try:
+            number = float(value[key])
+        except (TypeError, ValueError):
+            continue
+        number = max(lo, min(hi, number))
+        out[key] = int(round(number)) if key in ("card_alpha", "list_alpha") else number
+    style = str(value.get("style", "")).strip().lower()
+    if style in ("clear", "regular"):
+        out["style"] = style
+    return out
+
+
+def glass_override_for(material, overrides, key, default=None):
+    """Return one clamped override for the selected material, if present."""
+    material_key = canonical_glass_material(material)
+    per = normalize_glass_overrides((overrides or {}).get(material_key))
+    return per.get(key, default)
+
 # Native references are dark panels over a picture background. AppKit exposes
-# only Clear/Regular styles, and Regular reads as a smeared blur here, so every
-# macOS 27 preset uses Clear and varies native tint + QSS scrim instead.
+# only Clear/Regular styles, and Regular reads as a smeared blur here, so macOS
+# 27 presets default to Clear and vary native tint + QSS scrim instead.
 _GLASS_MATERIAL_PROFILES = {
     "automatic": {"opacity": 0.58, "style": "clear", "tint_alpha": 0.32,
                   "tint_rgb": (0.05, 0.055, 0.065), "card_alpha": 174,
@@ -70,17 +110,18 @@ def canonical_glass_material(material):
     return key if key in GLASS_MATERIALS else "automatic"
 
 
-def glass_material_profile(material, opacity=None):
-    """Return dark native-glass preset for a discrete Glass Material mode.
+def glass_material_profile(material, opacity=None, overrides=None):
+    """Return the native-glass preset for a discrete material mode.
 
-    Every macOS 27 mode uses the public Clear style; Regular is reserved for
-    the original Glass theme. ``automatic`` follows the last system-synced
-    clarity. Values are tint/scrim strengths, not numeric blur control.
+    Every macOS 27 mode uses the public Clear style by default; Regular is an
+    advanced opt-in override. ``automatic`` follows the last system-synced
+    clarity. User overrides are clamped experimental values, not a public
+    numeric blur control.
     """
     key = canonical_glass_material(material)
     if key == "automatic":
         o = max(0.0, min(1.0, float(opacity if opacity is not None else 0.58)))
-        return {
+        profile = {
             "material": key, "opacity": o, "style": "clear",
             "tint_alpha": 0.24 + 0.26 * o,
             "tint_rgb": (0.05, 0.055, 0.065),
@@ -88,8 +129,10 @@ def glass_material_profile(material, opacity=None):
             "list_alpha": int(round(132 + 50 * o)),
             "backdrop_scale": 0.36 - 0.03 * o,
         }
-    profile = dict(_GLASS_MATERIAL_PROFILES[key])
-    profile["material"] = key
+    else:
+        profile = dict(_GLASS_MATERIAL_PROFILES[key])
+        profile["material"] = key
+    profile.update(normalize_glass_overrides(overrides))
     return profile
 
 
@@ -393,10 +436,10 @@ def configure_macos_glass(window, theme="macos27_glass", enable=True, opacity=No
                           material=None):
     """Match the native glass material to the selected theme and mode.
 
-    ``macos27_glass`` uses DarkAqua and the public Clear style for every
-    preset; ``Glass Material`` changes native tint + QSS scrim density. The
-    Regular style reads as a smeared blur over picture backgrounds, so it is
-    reserved for the original ``Glass`` theme. macOS 27 also applies an
+    ``macos27_glass`` uses DarkAqua by default and the public Clear style for
+    every preset; ``Glass Stage`` switches DarkAqua/Aqua and ``Glass Material``
+    changes native tint + QSS scrim density. The Regular style reads as a
+    smeared blur over picture backgrounds, so it stays opt-in. macOS 27 also applies an
     intermediate native backdrop downsample (0.33..0.36) for soft,
     bokeh-like diffusion that breaks up bright text; it is best-effort
     private KVC, reapplied after AppKit rebuilds the layer and on move/resize,
@@ -407,7 +450,8 @@ def configure_macos_glass(window, theme="macos27_glass", enable=True, opacity=No
     if sys.platform != "darwin":
         return
     try:
-        from AppKit import (NSAppearance, NSAppearanceNameDarkAqua,
+        from AppKit import (NSAppearance, NSAppearanceNameAqua,
+                            NSAppearanceNameDarkAqua,
                             NSAppearanceNameVibrantDark, NSColor)
         try:
             from AppKit import NSGlassEffectViewStyleClear, NSGlassEffectViewStyleRegular
@@ -417,26 +461,32 @@ def configure_macos_glass(window, theme="macos27_glass", enable=True, opacity=No
         from pyqt_liquidglass._bridge import get_nswindow_from_widget
 
         is_m27 = theme == "macos27_glass"
-        profile = glass_material_profile(material, opacity) if is_m27 else None
+        material_key = canonical_glass_material(material)
+        overrides = (getattr(window, "glass_overrides", {}) or {}).get(material_key)
+        profile = glass_material_profile(material_key, opacity, overrides) if is_m27 else None
+        stage = getattr(window, "glass_appearance", "dark") if is_m27 else "dark"
 
         ns_window = get_nswindow_from_widget(window)
         if ns_window is not None:
             if not enable:
                 ns_window.setAppearance_(None)
             elif is_m27:
-                # DarkAqua is the less-vibrant dark used by macOS Settings.
-                # VibrantDark made REXA read brighter/bluer than the panels
-                # in the user's references.
-                ns_window.setAppearance_(NSAppearance.appearanceNamed_(NSAppearanceNameDarkAqua))
+                # DarkAqua is the less-vibrant dark used by macOS Settings;
+                # Aqua is the Clear/Light stage. This is a public appearance
+                # choice, not detection of an exact macOS glass material mode.
+                name = NSAppearanceNameAqua if stage == "light" else NSAppearanceNameDarkAqua
+                ns_window.setAppearance_(NSAppearance.appearanceNamed_(name))
             else:
                 ns_window.setAppearance_(NSAppearance.appearanceNamed_(NSAppearanceNameVibrantDark))
 
         glass_view = getattr(window, "_glass_view", None)
         if glass_view is not None and hasattr(glass_view, "setStyle_"):
-            # Regular is the dense/smeared material and does not match the
-            # native dark panels in the references. macOS 27 always uses the
-            # public Clear style; modes vary tint + scrim density instead.
-            use_clear = bool(enable and is_m27)
+            # Clear is the native-looking default; Regular is available as an
+            # explicit advanced override for users matching other stages.
+            use_clear = bool(
+                enable and is_m27 and profile is not None
+                and profile.get("style", "clear") == "clear"
+            )
             glass_view.setStyle_(
                 NSGlassEffectViewStyleClear if use_clear
                 else NSGlassEffectViewStyleRegular
@@ -456,7 +506,10 @@ def configure_macos_glass(window, theme="macos27_glass", enable=True, opacity=No
             window._glass_scale_token = getattr(window, "_glass_scale_token", 0) + 1
         if glass_view is not None and hasattr(glass_view, "setTintColor_"):
             if enable and profile is not None:
-                tr, tg, tb = profile["tint_rgb"]
+                # Clear / Light uses a white native tint so the panel reads as
+                # a bright surface; Dark keeps the measured dark presets.
+                tr, tg, tb = ((1.0, 1.0, 1.0) if stage == "light"
+                              else profile["tint_rgb"])
                 tint_alpha = profile["tint_alpha"]
             else:
                 tr = tg = tb = 0.08
@@ -562,7 +615,9 @@ def sample_ambient_rgb(pixmap):
             
     return (best_rgb[0], best_rgb[1], best_rgb[2])
 
-def build_liquid_qss(r=26, g=36, b=58, glass_pct=50, theme="classic", ambient_opacity=0.3, accent="#0a84ff", accent_end="#64d2ff", glass_clarity=45, glass_rim=20, glass_material=None):
+def build_liquid_qss(r=26, g=36, b=58, glass_pct=50, theme="classic", ambient_opacity=0.3, accent="#0a84ff", accent_end="#64d2ff", glass_clarity=45, glass_rim=20, glass_material=None, glass_overrides=None, glass_appearance="dark"):
+    stage = glass_appearance if glass_appearance in GLASS_STAGES else "dark"
+
     def hex_to_rgb(h):
         h = h.lstrip('#')
         return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
@@ -583,27 +638,45 @@ def build_liquid_qss(r=26, g=36, b=58, glass_pct=50, theme="classic", ambient_op
         # instead of being buried under an opaque dark gradient.
         if is_m27:
             # Native material/tint comes from configure_macos_glass(); QSS
-            # supplies the dark panel scrim measured from the native refs.
-            # This is tint density, not a fake blur-radius control.
-            profile = glass_material_profile(glass_material, c_f)
-            text_color = "#f5f5f7"
-            secondary_text = "rgba(235, 235, 240, 190)"
+            # supplies the panel scrim. Dark follows the native dark panels;
+            # Clear/Light uses a white scrim with dark text. These are tint
+            # densities, not a fake blur-radius control.
+            key = canonical_glass_material(glass_material)
+            profile = glass_material_profile(
+                key, c_f, (glass_overrides or {}).get(key)
+            )
             card_a = int(profile["card_alpha"])
             list_a = int(profile["list_alpha"])
             rim_a = int(10 + 46 * r_f)
             btn_a = int(18 + 170 * r_f)
-            card_bg = f"rgba(10, 11, 13, {card_a})"
-            card_hi = f"rgba(255, 255, 255, {rim_a})"
-            card_lo = card_hi
-            list_bg = f"rgba(8, 9, 11, {list_a})"
-            input_bg = f"rgba(255, 255, 255, {int(18 + 160 * r_f)})"
-            btn_bg = f"rgba(255, 255, 255, {btn_a})"
-            slider_bg = "rgba(255, 255, 255, 46)"
-            slider_handle = "#ffffff"
+            if stage == "light":
+                text_color = "#1d1d1f"
+                secondary_text = "rgba(60, 60, 67, 210)"
+                card_bg = f"rgba(255, 255, 255, {card_a})"
+                card_hi = f"rgba(0, 0, 0, {max(8, rim_a // 2)})"
+                card_lo = card_hi
+                list_bg = f"rgba(245, 247, 251, {list_a})"
+                input_bg = f"rgba(255, 255, 255, {int(160 + 80 * r_f)})"
+                btn_bg = f"rgba(255, 255, 255, {int(120 + 120 * r_f)})"
+                slider_bg = "rgba(0, 0, 0, 36)"
+                slider_handle = "#1d1d1f"
+                mid_rgb, low_rgb = "236, 236, 240", "226, 226, 230"
+                set_mid, set_low = "240, 240, 244", "230, 230, 234"
+            else:
+                text_color = "#f5f5f7"
+                secondary_text = "rgba(235, 235, 240, 190)"
+                card_bg = f"rgba(10, 11, 13, {card_a})"
+                card_hi = f"rgba(255, 255, 255, {rim_a})"
+                card_lo = card_hi
+                list_bg = f"rgba(8, 9, 11, {list_a})"
+                input_bg = f"rgba(255, 255, 255, {int(18 + 160 * r_f)})"
+                btn_bg = f"rgba(255, 255, 255, {btn_a})"
+                slider_bg = "rgba(255, 255, 255, 46)"
+                slider_handle = "#ffffff"
+                mid_rgb, low_rgb = "22, 22, 24", "16, 16, 18"
+                set_mid, set_low = "24, 24, 26", "18, 18, 20"
             tint_a = int(8 * ambient_opacity)
             base_a = 0
-            mid_rgb, low_rgb = "22, 22, 24", "16, 16, 18"
-            set_mid, set_low = "24, 24, 26", "18, 18, 20"
         else:
             # Restore the original readable dark Glass material.
             text_color = "#ffffff"
@@ -673,6 +746,13 @@ def build_liquid_qss(r=26, g=36, b=58, glass_pct=50, theme="classic", ambient_op
         bg_gradient = f"qradialgradient(cx:0.28, cy:0.18, radius:1.25, stop:0 rgba({cr},{cg},{cb},255), stop:0.65 rgba(13,16,23,255), stop:1 rgba(8,10,15,255))"
         settings_bg = f"qlineargradient(x1:1, y1:0.9, x2:0, y2:0, stop:0 rgba({cr},{cg},{cb},255), stop:0.42 rgba(17,20,28,255), stop:1 rgba(11,13,19,255))"
 
+    light_surface = theme == "light" or (theme == "macos27_glass" and stage == "light")
+    popup_bg = "#ffffff" if light_surface else (
+        "rgba(26, 26, 28, 236)" if theme == "macos27_glass" else (
+            "rgba(22, 25, 34, 236)" if theme == "liquid_glass" else "#1d212b"
+        )
+    )
+
     return f"""
     QMainWindow, QWidget#centralWidget {{ 
         background: {bg_gradient}; 
@@ -690,13 +770,13 @@ def build_liquid_qss(r=26, g=36, b=58, glass_pct=50, theme="classic", ambient_op
     QLineEdit, QComboBox, QSpinBox {{ background-color: {input_bg}; color: {text_color}; border: 1px solid {card_lo}; border-radius: 9px; padding: 5px 10px; }}
     QComboBox {{ combobox-popup: 0; }}
     QComboBox QAbstractItemView {{
-        background-color: {'#ffffff' if theme=='light' else ('rgba(26, 26, 28, 236)' if theme=='macos27_glass' else ('rgba(22, 25, 34, 236)' if theme=='liquid_glass' else '#1d212b'))}; color: {text_color}; border: 1px solid {card_hi}; border-radius: 10px; padding: 4px; outline: none;
+        background-color: {popup_bg}; color: {text_color}; border: 1px solid {card_hi}; border-radius: 10px; padding: 4px; outline: none;
     }}
     QComboBox QAbstractItemView::item {{ padding: 3px 8px; border-radius: 5px; margin: 1px 2px; min-height: 14px; font-size: 12px; }}
     QComboBox QAbstractItemView::item:selected {{ background-color: {accent}; color: {btn_text}; }}
     QComboBox::drop-down {{ border: none; width: 20px; }}
     QPushButton {{ background: {btn_bg}; color: {text_color}; border: 1px solid {card_hi}; border-radius: 10px; padding: 8px 14px; font-weight: 500; }}
-    QPushButton:hover {{ background-color: {'rgba(235,239,246,255)' if theme=='light' else 'rgba(255,255,255,38)'}; }}
+    QPushButton:hover {{ background-color: {'rgba(235,239,246,255)' if light_surface else 'rgba(255,255,255,38)'}; }}
     QPushButton:focus {{ border: 1px solid {accent}; }}
     QLineEdit:focus, QComboBox:focus, QSpinBox:focus {{ border: 1px solid {accent}; }}
     QPushButton:checked {{ background-color: {accent}; border-top: 1px solid rgba(255,255,255,100); color: {btn_text}; }}

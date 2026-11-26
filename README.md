@@ -36,10 +36,10 @@ For prebuilt Windows (`REXA-Windows.zip`) and macOS Apple Silicon (`REXA-macOS-A
   * **Classic (Dark):** Deep slate radial ambient wash (`20%` default Ambient Glow) with subtle translucent cards.
   * **Light:** Clean daylight surface (`30%` default Ambient Glow) with perceptual HLS-balanced album accents and high-contrast spectrum curves.
   * **Glass (Liquid Glass):** Native macOS 26 `NSGlassEffectView` / `NSVisualEffectView` refraction via `pyqt_liquidglass` (`100%` default Ambient Glow, `20%` Glass Border Rim) with a Windows 10/11 DWM Acrylic fallback (`apply_windows_glass`).
-  * **Glass macOS 27:** Dark native `DarkAqua` Clear-style glass with a discrete **Glass Material** selector (`Automatic` / `Default` / `Dark` / `Clear` / `Tinted`), soft bokeh-like backdrop diffusion, and dark tint/scrim presets instead of a fake blur slider.
+  * **Glass macOS 27:** Native glass with **Dark** (`DarkAqua`) and **Clear / Light** (`Aqua`) stages, a `Glass Material` selector (`Automatic` / `Default` / `Dark` / `Clear` / `Tinted`), soft bokeh-like backdrop diffusion, and experimental per-stage tuning. macOS has no public blur-radius API; the tuning sliders are best-effort native/backdrop values.
 * **Dedicated Settings Window (`SettingsDialog` via `⚙`):**
-  * Houses **Theme** (`Classic` / `Light` / `Glass` / `Glass macOS 27`), per-theme **Ambient Glow**, **Glass Material**, **Glass Border Rim** (automatically disabled outside `Glass` modes), and **Low-End CPU Mode**.
-  * Sliders are `ResetSlider` instances—double-click any slider to snap back to that theme's stock default. Double-click **Glass Material:** to sync `Automatic` from macOS/Windows public appearance signals.
+  * Houses **Theme** (`Classic` / `Light` / `Glass` / `Glass macOS 27`), per-theme **Ambient Glow**, **Glass Material**, **Glass Stage**, **Glass Border Rim**, advanced **Backdrop Downsample / Native Tint / Panel Scrim / Native Style** controls, and **Low-End CPU Mode**. Glass-only controls are disabled outside glass themes.
+  * Sliders are `ResetSlider` instances—double-click any slider to snap back to that preset's stock default. Double-click **Glass Material:** to sync `Automatic` from macOS/Windows public appearance signals. Stage appearance and per-material tuning overrides persist in `~/.hrtf_audio_player/session.json`.
   * Styled with a diagonal bottom-right (`10%` up) to top-left ambient gradient (`QFrame#settingsRoot`) and persisted to `~/.hrtf_audio_player/session.json`.
 * **Adaptive Cover Art & Marquee Typography:**
   * Dynamically samples dominant album-art colors (`sample_ambient_rgb`) with smooth `600 ms` `QVariantAnimation` transitions.
