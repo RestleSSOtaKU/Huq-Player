@@ -106,7 +106,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
 from PySide6.QtCore import Qt, QTimer, Signal, QObject, QThread, QSize, QEvent, QVariantAnimation, QEasingCurve, QPointF
 from PySide6.QtGui import QPixmap, QIcon, QColor, QPainter, QPalette
 from dsp_bridge import RustDspBridge
-from liquid_glass import make_glass_card, sample_ambient_rgb, sample_ambient_palette, LavaLampOverlay, build_liquid_qss, apply_seamless_titlebar, apply_windows_glass, windows_transparency_enabled, WindowDragFilter
+from liquid_glass import make_glass_card, sample_ambient_rgb, sample_ambient_palette, LavaLampOverlay, build_liquid_qss, apply_seamless_titlebar, apply_windows_glass, configure_macos_glass, windows_transparency_enabled, WindowDragFilter
 from glass_lens import GlassLensOverlay
 
 GLASS_THEMES = ("liquid_glass", "macos27_glass")
@@ -2240,6 +2240,8 @@ class SettingsDialog(QDialog):
             if is_g:
                 if glass and self._glass_id is None:
                     self._glass_id = glass.apply_glass_to_window(self)
+                if glass:
+                    configure_macos_glass(self, self.mw.current_theme, True)
                 apply_windows_glass(self, True, False)
                 apply_seamless_titlebar(self)
             else:
@@ -2249,6 +2251,8 @@ class SettingsDialog(QDialog):
                     except Exception:
                         pass
                     self._glass_id = None
+                if glass:
+                    configure_macos_glass(self, self.mw.current_theme, False)
                 reset_macos_window_opaque(self)
                 apply_windows_glass(self, False, self.mw.current_theme == 'light')
                 apply_seamless_titlebar(self)
@@ -2389,9 +2393,10 @@ class MainWindow(QMainWindow):
 
     def _update_graph_theme(self):
         is_light = getattr(self, "current_theme", "classic") == "light"
+        is_m27 = getattr(self, "current_theme", "classic") == "macos27_glass"
         is_glass = is_glass_theme(getattr(self, "current_theme", "classic"))
-        axis_color = '#1c1c1e' if is_light else '#eef2f8'
-        if is_glass: axis_color = '#ffffff'
+        axis_color = '#1c1c1e' if (is_light or is_m27) else '#eef2f8'
+        if is_glass and not is_m27: axis_color = '#ffffff'
         
         pg.setConfigOption('foreground', axis_color)
 
@@ -2478,6 +2483,8 @@ class MainWindow(QMainWindow):
         if is_glass_theme(self.current_theme):
             if glass and getattr(self, "glass_effect_id", None) is None:
                 self.glass_effect_id = glass.apply_glass_to_window(self)
+            if glass:
+                configure_macos_glass(self, self.current_theme, True)
             apply_windows_glass(self, True, False)
             apply_seamless_titlebar(self)
         else:
@@ -2487,6 +2494,8 @@ class MainWindow(QMainWindow):
                 except Exception:
                     pass
                 self.glass_effect_id = None
+            if glass:
+                configure_macos_glass(self, self.current_theme, False)
             reset_macos_window_opaque(self)
             apply_windows_glass(self, False, self.current_theme == 'light')
             apply_seamless_titlebar(self)
@@ -4782,6 +4791,7 @@ class MainWindow(QMainWindow):
         dlg.setStyleSheet(self.styleSheet())
         if is_glass_theme(self.current_theme) and glass:
             glass.apply_glass_to_window(dlg)
+            configure_macos_glass(dlg, self.current_theme, True)
         apply_windows_glass(dlg, is_glass_theme(self.current_theme), self.current_theme == "light")
         apply_seamless_titlebar(dlg)
         if getattr(self, "_props_dlg", None) is not None:
@@ -5218,6 +5228,8 @@ if __name__ == "__main__":
     if is_glass_theme(window.current_theme):
         if glass and getattr(window, "glass_effect_id", None) is None:
             window.glass_effect_id = glass.apply_glass_to_window(window)
+        if glass:
+            configure_macos_glass(window, window.current_theme, True)
         apply_windows_glass(window, True, False)
         c = window._current_ambient_color
         window.setStyleSheet(build_liquid_qss(

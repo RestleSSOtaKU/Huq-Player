@@ -57,6 +57,37 @@ def apply_windows_glass(window, enable=True, light_titlebar=False):
     except Exception:
         pass
 
+def configure_macos_glass(window, theme="macos27_glass", enable=True):
+    """Make the native glass view clean instead of the default muddy regular style.
+
+    pyqt-liquidglass creates NSGlassEffectView with its default ``Regular``
+    style, which renders a dark, dense material. macOS Settings uses the
+    ``Clear`` style plus a light/dark vibrant appearance. We can only set
+    those after ``apply_glass_to_window`` has created the native view.
+    """
+    if sys.platform != "darwin":
+        return
+    try:
+        from AppKit import NSAppearance, NSAppearanceNameVibrantDark, NSAppearanceNameVibrantLight
+        from pyqt_liquidglass._bridge import get_nswindow_from_widget
+
+        ns_window = get_nswindow_from_widget(window)
+        if ns_window is not None:
+            if not enable:
+                ns_window.setAppearance_(None)
+            elif theme == "macos27_glass":
+                ns_window.setAppearance_(NSAppearance.appearanceNamed_(NSAppearanceNameVibrantLight))
+            elif theme == "liquid_glass":
+                ns_window.setAppearance_(NSAppearance.appearanceNamed_(NSAppearanceNameVibrantDark))
+
+        glass_view = getattr(window, "_glass_view", None)
+        if glass_view is not None and hasattr(glass_view, "setStyle_"):
+            # NSGlassEffectViewStyleClear = 1, Regular (default, muddy) = 0.
+            glass_view.setStyle_(1 if enable else 0)
+    except Exception:
+        pass
+
+
 def apply_seamless_titlebar(window):
     if sys.platform != "darwin":
         return
@@ -155,8 +186,6 @@ def build_liquid_qss(r=26, g=36, b=58, glass_pct=50, theme="classic", ambient_op
     
     if theme in ("liquid_glass", "macos27_glass"):
         is_m27 = theme == "macos27_glass"
-        text_color = "#ffffff"
-        secondary_text = "rgba(255, 255, 255, 220)" if is_m27 else "rgba(255, 255, 255, 190)"
         c_f = max(0.0, min(1.0, glass_clarity / 100.0))
         r_f = max(0.0, min(1.0, glass_rim / 100.0))
 
@@ -164,33 +193,44 @@ def build_liquid_qss(r=26, g=36, b=58, glass_pct=50, theme="classic", ambient_op
         # QSS only adds a thin veil and rim so the backdrop stays visible
         # instead of being buried under an opaque dark gradient.
         if is_m27:
-            card_a = int(10 + 26 * c_f)
-            rim_a = int(28 + 58 * r_f)
-            btn_a = int(8 + 16 * r_f)
+            # Native macOS Settings look: light vibrant glass, dark text,
+            # thin gray rim. No dark opaque layer over the material.
+            text_color = "#1d1d1f"
+            secondary_text = "#6e6e73"
+            card_a = int(50 + 120 * c_f)
+            rim_a = int(12 + 46 * r_f)
+            btn_a = int(120 + 70 * r_f)
             card_bg = f"rgba(255, 255, 255, {card_a})"
-            list_bg = f"rgba(0, 0, 0, {int(8 + 24 * c_f)})"
-            input_bg = f"rgba(255, 255, 255, {int(8 + 14 * r_f)})"
-            tint_a = int(2 + 18 * ambient_opacity)
-            base_a = int(2 + 16 * c_f)
-            mid_rgb, low_rgb = "16, 19, 28", "8, 10, 16"
-            set_mid, set_low = "18, 21, 30", "10, 12, 18"
+            card_hi = f"rgba(0, 0, 0, {rim_a})"
+            card_lo = card_hi
+            list_bg = f"rgba(248, 248, 250, {int(70 + 90 * c_f)})"
+            input_bg = "rgba(255, 255, 255, 220)"
+            btn_bg = f"rgba(255, 255, 255, {btn_a})"
+            slider_bg = "rgba(0, 0, 0, 42)"
+            slider_handle = "#ffffff"
+            tint_a = int(2 + 16 * ambient_opacity)
+            base_a = int(2 + 12 * c_f)
+            mid_rgb, low_rgb = "236, 239, 244", "226, 230, 237"
+            set_mid, set_low = "238, 240, 245", "229, 232, 238"
         else:
+            text_color = "#ffffff"
+            secondary_text = "rgba(255, 255, 255, 190)"
             card_a = int(12 + 70 * c_f)
             rim_a = int(24 + 70 * r_f)
             btn_a = int(14 + 22 * r_f)
             card_bg = f"rgba(255, 255, 255, {card_a})"
+            card_hi = f"rgba(255, 255, 255, {rim_a})"
+            card_lo = card_hi
             list_bg = f"rgba(0, 0, 0, {int(12 + 52 * c_f)})"
             input_bg = f"rgba(255, 255, 255, {int(12 + 18 * r_f)})"
+            btn_bg = f"rgba(255, 255, 255, {btn_a})"
+            slider_bg = "rgba(255, 255, 255, 46)"
+            slider_handle = "#ffffff"
             tint_a = int(5 + 48 * ambient_opacity)
             base_a = int(6 + 82 * c_f)
             mid_rgb, low_rgb = "14, 16, 24", "8, 10, 16"
             set_mid, set_low = "16, 18, 26", "10, 12, 18"
 
-        card_hi = f"rgba(255, 255, 255, {rim_a})"
-        card_lo = card_hi
-        btn_bg = f"rgba(255, 255, 255, {btn_a})"
-        slider_bg = "rgba(255, 255, 255, 46)"
-        slider_handle = "#ffffff"
         bg_gradient = f"qradialgradient(cx:0.28, cy:0.18, radius:1.4, stop:0 rgba({r},{g},{b},{tint_a}), stop:0.55 rgba({mid_rgb},{base_a}), stop:1 rgba({low_rgb},{base_a}))"
         settings_bg = f"qlineargradient(x1:1, y1:0.9, x2:0, y2:0, stop:0 rgba({r},{g},{b},{int(tint_a*0.85)}), stop:0.45 rgba({set_mid},{base_a}), stop:1 rgba({set_low},{base_a}))"
     
@@ -251,13 +291,13 @@ def build_liquid_qss(r=26, g=36, b=58, glass_pct=50, theme="classic", ambient_op
     QLineEdit, QComboBox, QSpinBox {{ background-color: {input_bg}; color: {text_color}; border: 1px solid {card_lo}; border-radius: 9px; padding: 5px 10px; }}
     QComboBox {{ combobox-popup: 0; }}
     QComboBox QAbstractItemView {{
-        background-color: {'#ffffff' if theme=='light' else ('rgba(22, 25, 34, 236)' if theme in ('liquid_glass', 'macos27_glass') else '#1d212b')}; color: {text_color}; border: 1px solid {card_hi}; border-radius: 10px; padding: 4px; outline: none;
+        background-color: {'#ffffff' if theme=='light' else ('rgba(248, 248, 250, 245)' if theme=='macos27_glass' else ('rgba(22, 25, 34, 236)' if theme=='liquid_glass' else '#1d212b'))}; color: {text_color}; border: 1px solid {card_hi}; border-radius: 10px; padding: 4px; outline: none;
     }}
     QComboBox QAbstractItemView::item {{ padding: 3px 8px; border-radius: 5px; margin: 1px 2px; min-height: 14px; font-size: 12px; }}
     QComboBox QAbstractItemView::item:selected {{ background-color: {accent}; color: {btn_text}; }}
     QComboBox::drop-down {{ border: none; width: 20px; }}
     QPushButton {{ background: {btn_bg}; color: {text_color}; border: 1px solid {card_hi}; border-radius: 10px; padding: 8px 14px; font-weight: 500; }}
-    QPushButton:hover {{ background-color: {'rgba(235,239,246,255)' if theme=='light' else 'rgba(255,255,255,38)'}; }}
+    QPushButton:hover {{ background-color: {'rgba(235,239,246,255)' if theme=='light' else ('rgba(255,255,255,175)' if theme=='macos27_glass' else 'rgba(255,255,255,38)')}; }}
     QPushButton:focus {{ border: 1px solid {accent}; }}
     QLineEdit:focus, QComboBox:focus, QSpinBox:focus {{ border: 1px solid {accent}; }}
     QPushButton:checked {{ background-color: {accent}; border-top: 1px solid rgba(255,255,255,100); color: {btn_text}; }}

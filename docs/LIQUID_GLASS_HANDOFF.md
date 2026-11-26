@@ -23,10 +23,18 @@
 - Reworked `build_liquid_qss()` twice in `player_ui/liquid_glass.py` to reduce QSS alpha (thin white veil instead of dark opaque fill), weaken lava/ambient tint, and add tooltips explaining `Glass Opacity` (lower = cleaner native glass).
 - Verified with `py_compile` and offscreen Qt smoke tests (theme switching, settings combo, lens visibility, session persistence).
 
+### Native glass fix (latest, not yet verified by user)
+- Root cause found: `pyqt_liquidglass` creates `NSGlassEffectView` with its default **`Regular`** style (`NSGlassEffectViewStyleRegular = 0`), which is the dark/dense material. macOS Settings uses the **`Clear`** style (`= 1`) plus a vibrant light appearance.
+- Added `configure_macos_glass()` in `player_ui/liquid_glass.py`. Called from every place that applies native glass (main window, `SettingsDialog`, track-properties dialog, startup). It:
+  - sets `NSGlassEffectView.style = 1` (`Clear`),
+  - sets the `NSWindow` appearance to `VibrantLight` for `macos27_glass` (clean macOS Settings look) and `VibrantDark` for `liquid_glass`,
+  - restores the default appearance/style when leaving glass themes.
+- Reworked `macos27_glass` QSS to be a **light native material**: dark text (`#1d1d1f` / `#6e6e73`), light translucent cards, thin dark rim, light combo popup, dark spectrum axis labels. `Glass` stays dark with white text but also gets the `Clear` native style.
+- Offscreen tests pass: theme switching, settings combo, lens visibility, light QSS values.
+
 ### Still unresolved
-- User reports it is **still muddy** compared with native macOS Settings.
-- Likely cause: native `NSGlassEffectView` may be applied only to the top-level window while Qt child widgets (`centralWidget`, `settingsRoot`, `QFrame#glassCard`, lists, scroll areas) still paint their own backgrounds, or the material/options used are too dark. Need to inspect actual native glass application code and material options, not just QSS colors.
-- Reference screenshots provided by user show clean macOS Settings panels. Latest REXA screenshot mean RGB ≈ `[64, 67, 88]`, much darker than the reference.
+- User has not yet re-tested the latest native-style fix. If it is still muddy, next suspects are: Qt root `NSView` painting opaque layer above the glass view, DWM/Windows path differences, or `NSGlassEffectView` needing `setTintColor_`/custom `contentStyle`. Capture a fresh screenshot and compare pixel means again.
+- Reference screenshots provided by user show clean macOS Settings panels. Previous REXA screenshot mean RGB ≈ `[64, 67, 88]`, much darker than the reference.
 
 ## Important constraints / gotchas
 - `pyqt_liquidglass` is installed in `.venv` and reports `HAS_GLASS_EFFECT True`, `MACOS_VERSION (27, 2, 1)`.
