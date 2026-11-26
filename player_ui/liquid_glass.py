@@ -187,13 +187,20 @@ def apply_windows_glass(window, enable=True, light_titlebar=False):
 def configure_macos_glass(window, theme="macos27_glass", enable=True, opacity=None):
     """Match the native glass material to the selected theme and opacity.
 
-    ``opacity`` is the 0..1 Glass Opacity slider value. The native view stays
-    at full alpha; the clear -> frosted range comes from the QSS panel alphas.
+    ``macos27_glass`` uses the native Clear material with dark vibrancy: that
+    is the gentle blur seen in macOS Settings/Control Center. ``opacity`` only
+    drives the QSS veil; the native view stays at full alpha so AppKit keeps
+    rendering the material.
     """
     if sys.platform != "darwin":
         return
     try:
         from AppKit import NSAppearance, NSAppearanceNameVibrantDark
+        try:
+            from AppKit import NSGlassEffectViewStyleClear, NSGlassEffectViewStyleRegular
+        except ImportError:
+            # Older AppKit metadata may not expose the constants.
+            NSGlassEffectViewStyleClear, NSGlassEffectViewStyleRegular = 1, 0
         from pyqt_liquidglass._bridge import get_nswindow_from_widget
 
         ns_window = get_nswindow_from_widget(window)
@@ -207,12 +214,18 @@ def configure_macos_glass(window, theme="macos27_glass", enable=True, opacity=No
 
         glass_view = getattr(window, "_glass_view", None)
         if glass_view is not None and hasattr(glass_view, "setStyle_"):
-            # Keep the denser Regular material (0) for a native dark look.
-            glass_view.setStyle_(0)
+            # Regular is the dense/mushy material. macOS Settings panels use
+            # Clear; keep Original Glass on Regular so its UI stays readable.
+            glass_view.setStyle_(
+                NSGlassEffectViewStyleClear if (enable and theme == "macos27_glass")
+                else NSGlassEffectViewStyleRegular
+            )
         if glass_view is not None and hasattr(glass_view, "setCornerRadius_"):
             # Match the rounded window corners so the native material does not
             # leave a square edge / cut-off line under the QSS panels.
             glass_view.setCornerRadius_(14.0 if enable else 0.0)
+        if glass_view is not None and hasattr(glass_view, "setNeedsDisplay_"):
+            glass_view.setNeedsDisplay_(True)
         # Do NOT lower NSGlassEffectView.alphaValue: AppKit then stops showing
         # the material and the window looks flat. Keep the native view at full
         # strength; the Glass Opacity slider varies the QSS veil instead.
@@ -327,19 +340,20 @@ def build_liquid_qss(r=26, g=36, b=58, glass_pct=50, theme="classic", ambient_op
         # QSS only adds a thin veil and rim so the backdrop stays visible
         # instead of being buried under an opaque dark gradient.
         if is_m27:
-            # Dark native macOS material with a real clear -> frosted range.
-            # Glass Opacity (c_f) drives panel density; the native view alpha
-            # is driven from the same value in configure_macos_glass().
+            # Dark native Clear material with a real clear -> frosted range.
+            # Glass Opacity (c_f) drives only the QSS veil; the native view
+            # stays at full alpha so AppKit keeps rendering the material.
             text_color = "#f5f5f7"
             secondary_text = "rgba(235, 235, 240, 190)"
-            card_a = int(40 + 200 * c_f)
-            rim_a = int(12 + 48 * r_f)
-            btn_a = int(40 + 180 * r_f)
+            # Keep the veil thin: the native Clear material supplies the blur.
+            card_a = int(12 + 220 * c_f)
+            rim_a = int(10 + 46 * r_f)
+            btn_a = int(18 + 170 * r_f)
             card_bg = f"rgba(26, 26, 28, {card_a})"
             card_hi = f"rgba(255, 255, 255, {rim_a})"
             card_lo = card_hi
-            list_bg = f"rgba(20, 20, 22, {int(30 + 190 * c_f)})"
-            input_bg = f"rgba(255, 255, 255, {int(40 + 180 * r_f)})"
+            list_bg = f"rgba(20, 20, 22, {int(10 + 205 * c_f)})"
+            input_bg = f"rgba(255, 255, 255, {int(18 + 160 * r_f)})"
             btn_bg = f"rgba(255, 255, 255, {btn_a})"
             slider_bg = "rgba(255, 255, 255, 46)"
             slider_handle = "#ffffff"
@@ -595,7 +609,8 @@ class LavaLampOverlay(QWidget):
         dyn = bool(getattr(self.mw, "dynamic_ambient", True))
         low_cpu = bool(getattr(getattr(self.mw, "engine", None), "low_end_mode", False))
         show = dyn and theme in ("classic", "light", "liquid_glass", "macos27_glass") and glow > 0.01
-        active = show and not low_cpu
+        # macOS 27 should feel like a native static material, not a lava lamp.
+        active = show and not low_cpu and theme != "macos27_glass"
         self.setVisible(show)
         if active and not self._timer.isActive():
             self._timer.start()
@@ -635,7 +650,7 @@ class LavaLampOverlay(QWidget):
         xs, ys, dither_tile = self._grid_xy
 
         is_light = theme == "light"
-        peak_a = (0.05 if theme == "macos27_glass" else (0.12 if theme == "liquid_glass" else (0.36 if is_light else 0.44))) * glow
+        peak_a = (0.015 if theme == "macos27_glass" else (0.12 if theme == "liquid_glass" else (0.36 if is_light else 0.44))) * glow
         t = self._phase
         p0, p1, p2 = self._palette[0], self._palette[1], self._palette[2]
         orbs = (
@@ -666,5 +681,8 @@ class LavaLampOverlay(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.SmoothPixmapTransform, True)
         p.drawImage(self.rect(), img)
-        p.drawTiledPixmap(self.rect(), dither_tile)
+        # Native macOS 27 glass is clean; micro-grain belongs to the other
+        # themes where it breaks up large gradients without muddying blur.
+        if theme != "macos27_glass":
+            p.drawTiledPixmap(self.rect(), dither_tile)
         p.end()

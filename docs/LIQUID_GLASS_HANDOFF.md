@@ -24,18 +24,19 @@
 - Verified with `py_compile` and offscreen Qt smoke tests (theme switching, settings combo, lens visibility, session persistence).
 
 ### Native glass fix (latest, not yet verified by user)
-- Root cause found: `pyqt_liquidglass` creates `NSGlassEffectView` with its default **`Regular`** style (`NSGlassEffectViewStyleRegular = 0`). The user’s latest references are **dark-mode** macOS panels over a picture background, not light panels, so the earlier light/white direction was wrong.
+- `pyqt_liquidglass` creates `NSGlassEffectView` with its default **`Regular`** style (`NSGlassEffectViewStyleRegular = 0`), which is the dense/mushy material. macOS Settings/Control Center panels use **`Clear`** (`= 1`). The earlier light/white direction was also wrong: references are dark panels over a picture background.
 - Added `configure_macos_glass()` in `player_ui/liquid_glass.py`. Called from every place that applies native glass (main window, `SettingsDialog`, track-properties dialog, startup, and both Glass Opacity sliders). It:
-  - keeps `NSGlassEffectView.style = 0` (`Regular`) for a native dark look,
+  - sets `NSGlassEffectView.style = 1` (`Clear`) for `macos27_glass`; original `Glass` keeps `Regular (0)`,
   - sets the `NSWindow` appearance to `VibrantDark` for both glass themes,
   - keeps `NSGlassEffectView.alphaValue = 1.0` — lowering it suppresses the material and makes the window flat; the slider varies the QSS veil instead,
-  - sets a `14pt` corner radius to avoid square cut-off lines,
+  - sets a `14pt` corner radius and calls `setNeedsDisplay_` after style changes,
   - restores the default appearance/alpha/style when leaving glass themes.
-- `macos27_glass` QSS is now a **dark native material** with a wide range driven by `glass_clarity` (`Glass Opacity` 0–100). The native material stays fully active underneath:
-  - card fill `rgba(26,26,28,40→240)`,
-  - list fill `rgba(20,20,22,30→220)`,
+- `macos27_glass` QSS is now a **thin dark veil** over the native Clear material, with a wide range driven by `glass_clarity` (`Glass Opacity` 0–100):
+  - card fill `rgba(26,26,28,12→232)`,
+  - list fill `rgba(20,20,22,10→215)`,
   - white text (`#f5f5f7`), thin white rim, dark combo popup, white spectrum axis labels,
-  - main window/settings root are fully transparent so no square gradient layer cuts across the rounded native glass corners.
+  - main window/settings root are fully transparent so no square gradient layer cuts across the rounded native glass corners,
+  - ambient/lava overlay is static (no timer) and much fainter in `macos27_glass` (`peak alpha 0.015 * glow`, no dither tile) so it does not muddy the native blur.
 - `Glass` stays a dark, denser material (dark card fill `≈ 77`, background `≈ 94`).
 - Accent handling: `macos27_glass` uses a muted dark accent branch; at `Ambient Glow = 0` it falls back to neutral gray `#8e8e93`, and `_on_ambient_color_changed()` re-derives the accent whenever the slider moves.
 - Cover lens pill is hidden in `macos27_glass` and never renders the accent-gradient fallback.
@@ -49,7 +50,7 @@
 - Offscreen tests pass: helper returns a macOS suggestion, `SettingsDialog` slider updates from it, and both label/slider double-click events emit the sync signal.
 
 ### Still unresolved
-- User is testing the dark clear→frosted range now. If it is still not matching the references, next suspects are: `NSGlassEffectView` needing `setTintColor_` / custom `contentStyle`, or material tint not following the system’s exact Clear/Tinted choice. More reference screenshots with picture backgrounds are welcome.
+- User is testing the native Clear material now. If it is too transparent or still mushy, next suspects are: `NSGlassEffectView` needing `setTintColor_` / custom `contentStyle`, the QSS veil ramp, or material tint not following the system’s exact Clear/Tinted choice. More reference screenshots with picture backgrounds are welcome.
 - Earlier REXA screenshot was whiteish (`mean ≈ [159,160,163]`); reference panels are dark (`mean ≈ [26–41]`).
 
 ## Important constraints / gotchas
