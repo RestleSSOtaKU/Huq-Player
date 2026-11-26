@@ -6034,13 +6034,16 @@ class MainWindow(QMainWindow):
             # Background, accent, and lava all switch to the new cover together.
             # The old fade left the previous hue visible while the other colors
             # had already changed, which read as a wrong-track background.
+            previous_color = self._current_ambient_color
             target_color = QColor(r, g, b)
             self.current_accent, self.current_accent_end = self._get_accent_color(r, g, b)
             self._current_ambient_color = target_color
             self._apply_theme_style(target_color)
-            # Glass 2.0's native tint is not driven by QSS; re-push it so the
-            # window wash uses the same cover color as the accent and lava.
-            if is_glass_theme(self.current_theme):
+            # Glass 2.0's native tint is not driven by QSS. Only re-push native
+            # glass when the cover color actually changed; this branch also runs
+            # on resize (stepped_size in the render key), and rebuilding panel
+            # views there left stale panel-shaped glass at the window borders.
+            if target_color != previous_color and is_glass_theme(self.current_theme):
                 self._reapply_native_glass()
 
             if raw is not None and not raw.isNull():
