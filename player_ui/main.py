@@ -6038,7 +6038,11 @@ class MainWindow(QMainWindow):
             self.current_accent, self.current_accent_end = self._get_accent_color(r, g, b)
             self._current_ambient_color = target_color
             self._apply_theme_style(target_color)
-                
+            # Glass 2.0's native tint is not driven by QSS; re-push it so the
+            # window wash uses the same cover color as the accent and lava.
+            if is_glass_theme(self.current_theme):
+                self._reapply_native_glass()
+
             if raw is not None and not raw.isNull():
                 self.lbl_cover.setPixmap(
                     raw.scaled(stepped_size, stepped_size, Qt.KeepAspectRatioByExpanding, Qt.FastTransformation if getattr(self, '_is_resizing', False) else Qt.SmoothTransformation)

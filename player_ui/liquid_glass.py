@@ -759,6 +759,7 @@ def configure_macos_glass(window, theme="macos27_glass", enable=True, opacity=No
                      if is_m27 else None)
         profile = (glass_material_profile(material_key, opacity, overrides, stage)
                    if is_m27 else None)
+        owner = getattr(window, "mw", None) or window
 
         ns_window = get_nswindow_from_widget(window)
         if ns_window is not None:
@@ -795,7 +796,6 @@ def configure_macos_glass(window, theme="macos27_glass", enable=True, opacity=No
             # Full quality stays at Clear's native 0.5; Low-End drops to ~1/3
             # for cheaper diffusion. Original Glass keeps its 0.25 look.
             if is_m27:
-                owner = getattr(window, "mw", None) or window
                 low_end = bool(getattr(getattr(owner, "engine", None),
                                        "low_end_mode", False))
                 scale = (GLASS_BACKDROP_SCALE_LOW_END if low_end
@@ -811,9 +811,40 @@ def configure_macos_glass(window, theme="macos27_glass", enable=True, opacity=No
             if enable and profile is not None:
                 # Clear / Light uses a white native tint so the panel reads as
                 # a bright surface; Dark keeps the measured dark presets.
-                tr, tg, tb = ((1.0, 1.0, 1.0) if stage == "light"
-                              else profile["tint_rgb"])
+                base = ((1.0, 1.0, 1.0) if stage == "light"
+                        else profile["tint_rgb"])
                 tint_alpha = profile["tint_alpha"]
+                cover = getattr(owner, "_current_ambient_color", None)
+                glow = max(0.0, min(1.0,
+                                    float(getattr(owner, "ambient_opacity", 1.0))))
+                if cover is not None and glow > 0.02:
+                    try:
+                        if hasattr(cover, "red"):
+                            cr, cg, cb = (cover.red() / 255.0,
+                                          cover.green() / 255.0,
+                                          cover.blue() / 255.0)
+                        else:
+                            cr, cg, cb = (float(cover[0]) / 255.0,
+                                          float(cover[1]) / 255.0,
+                                          float(cover[2]) / 255.0)
+                        peak = max(cr, cg, cb) or 1.0
+                        mix = 0.45 * glow
+                        if stage == "light":
+                            cover_rgb = tuple(
+                                0.72 + 0.28 * (c / peak) for c in (cr, cg, cb)
+                            )
+                        else:
+                            cover_rgb = tuple(
+                                0.16 * (c / peak) for c in (cr, cg, cb)
+                            )
+                        tr, tg, tb = tuple(
+                            (1.0 - mix) * b + mix * c
+                            for b, c in zip(base, cover_rgb)
+                        )
+                    except Exception:
+                        tr, tg, tb = base
+                else:
+                    tr, tg, tb = base
             else:
                 tr = tg = tb = 0.08
                 tint_alpha = 0.0

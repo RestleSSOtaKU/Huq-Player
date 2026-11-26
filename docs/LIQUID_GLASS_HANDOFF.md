@@ -107,7 +107,7 @@
 ### Release metadata (v0.5.3)
 - `player_ui/main.py` `APP_VERSION` is now `0.5.3`; `README.md` and `AGENTS.md` carry matching `v0.5.3` notes.
 - The workflow still derives release titles and artifact names from the pushed tag, so no hardcoded workflow version was changed. A local `v0.5.3` tag is enough to publish `REXA v0.5.3` once explicitly approved.
-- Same-version bugfix: track changes now apply background, accent, and lava together from the current cover. The old 600 ms ambient fade was removed because it left the previous hue visible in the wash while the accent/lava had already switched; static themes hid the mismatch, but the dynamic lava made it obvious.
+- Same-version bugfix: track changes now apply background, accent, and lava together from the current cover. The old 600 ms ambient fade was removed because it left the previous hue visible in the wash while the accent/lava had already switched; static themes hid the mismatch, but the dynamic lava made it obvious. Glass 2.0 now also blends the sampled cover color into the native window tint (Dark keeps near-black luminance, Light keeps white, blend scales with Ambient Glow) and reapplies it on cover changes; QSS stays transparent to avoid the square cut-off edge.
 
 ### Verification
 - `python3 -m py_compile player_ui/main.py player_ui/liquid_glass.py player_ui/glass_lens.py` passes.

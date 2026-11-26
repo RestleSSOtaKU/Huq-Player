@@ -58,7 +58,7 @@ For prebuilt Windows (`REXA-Windows.zip`) and macOS Apple Silicon (`REXA-macOS-A
 - **Sustainable Graph Readout:** Full Quality now targets 60 FPS by default with a live achieved/target FPS badge in Settings and the spectrum card; 120 FPS stays opt-in, and the lava overlay keeps moving at 30 FPS idle / 15 FPS during playback.
 - **Cleaner Glass 2.0 UI:** The visible theme label is `Glass 2.0` (internal key unchanged), the cover lens pill stays exclusive to the original `Glass` theme, white-stage text stays readable, and Glass 2.0-only controls are greyed out where they do not apply.
 - **Smoother Library Scrolling:** Lazy cover thumbnails are cached and decoded at thumbnail size, with cancelled work for rows that scroll away, so large libraries fill evenly without rescanning tags.
-- **Ambient Colors Follow the Current Track:** Background wash, buttons/glow accent, and lava palette switch together to the new cover; no previous-track hue lingers during a fade.
+- **Ambient Colors Follow the Current Track:** Background wash, buttons/glow accent, and lava palette switch together to the new cover; no previous-track hue lingers during a fade. In Glass 2.0 the current cover hue is blended into the native window tint (scaled by Ambient Glow) instead of painting a square QSS gradient over the glass.
 
 ## What's New in v0.5.2
 - **One-Click Last.fm Browser Scrobbling:** Passwordless browser OAuth flow with Pano-style dual-threshold delay sliders (*Min Track Length*, *Percentage*, and *Minutes*) and a live scrobble progress bar.
