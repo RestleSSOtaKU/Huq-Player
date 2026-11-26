@@ -60,9 +60,8 @@ def apply_windows_glass(window, enable=True, light_titlebar=False):
 def configure_macos_glass(window, theme="macos27_glass", enable=True, opacity=None):
     """Match the native glass material to the selected theme and opacity.
 
-    ``opacity`` is the 0..1 Glass Opacity slider value. For macOS 27 it drives
-    the native view alpha as well as the QSS panel alphas, producing a real
-    clear -> frosted range like the macOS references.
+    ``opacity`` is the 0..1 Glass Opacity slider value. The native view stays
+    at full alpha; the clear -> frosted range comes from the QSS panel alphas.
     """
     if sys.platform != "darwin":
         return
@@ -87,12 +86,11 @@ def configure_macos_glass(window, theme="macos27_glass", enable=True, opacity=No
             # Match the rounded window corners so the native material does not
             # leave a square edge / cut-off line under the QSS panels.
             glass_view.setCornerRadius_(14.0 if enable else 0.0)
+        # Do NOT lower NSGlassEffectView.alphaValue: AppKit then stops showing
+        # the material and the window looks flat. Keep the native view at full
+        # strength; the Glass Opacity slider varies the QSS veil instead.
         if glass_view is not None and hasattr(glass_view, "setAlphaValue_"):
-            if enable and theme == "macos27_glass" and opacity is not None:
-                o = max(0.0, min(1.0, float(opacity)))
-                glass_view.setAlphaValue_(0.50 + 0.50 * o)
-            else:
-                glass_view.setAlphaValue_(1.0)
+            glass_view.setAlphaValue_(1.0)
     except Exception:
         pass
 

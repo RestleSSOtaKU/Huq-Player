@@ -28,10 +28,10 @@
 - Added `configure_macos_glass()` in `player_ui/liquid_glass.py`. Called from every place that applies native glass (main window, `SettingsDialog`, track-properties dialog, startup, and both Glass Opacity sliders). It:
   - keeps `NSGlassEffectView.style = 0` (`Regular`) for a native dark look,
   - sets the `NSWindow` appearance to `VibrantDark` for both glass themes,
-  - sets `NSGlassEffectView.alphaValue = 0.50 + 0.50 * opacity` for `macos27_glass`, so the slider drives a real clear → frosted range,
+  - keeps `NSGlassEffectView.alphaValue = 1.0` — lowering it suppresses the material and makes the window flat; the slider varies the QSS veil instead,
   - sets a `14pt` corner radius to avoid square cut-off lines,
   - restores the default appearance/alpha/style when leaving glass themes.
-- `macos27_glass` QSS is now a **dark native material** with a wide range driven by `glass_clarity` (`Glass Opacity` 0–100):
+- `macos27_glass` QSS is now a **dark native material** with a wide range driven by `glass_clarity` (`Glass Opacity` 0–100). The native material stays fully active underneath:
   - card fill `rgba(26,26,28,40→240)`,
   - list fill `rgba(20,20,22,30→220)`,
   - white text (`#f5f5f7`), thin white rim, dark combo popup, white spectrum axis labels,
