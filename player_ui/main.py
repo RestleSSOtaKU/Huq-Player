@@ -2033,9 +2033,9 @@ class SettingsDialog(QDialog):
         for i, mode in enumerate(GLASS_MATERIALS):
             self.combo_glass_material.setItemData(i, mode)
         self._glass_material_tip = (
-            "macOS 27: presets use native Clear-style glass with different dark "
-            "tint/scrim density; Automatic follows system sync. macOS has no "
-            "public numeric blur-radius API."
+            "macOS 27: presets use native Clear-style glass with soft "
+            "bokeh-like diffusion and dark tint/scrim; Automatic follows "
+            "system sync. macOS has no public numeric blur-radius API."
         )
         self.combo_glass_material.setToolTip(self._glass_material_tip)
         self.combo_glass_material.currentIndexChanged.connect(self._on_glass)

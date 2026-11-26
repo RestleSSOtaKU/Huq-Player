@@ -49,19 +49,19 @@ GLASS_MATERIAL_LABELS = {
 _GLASS_MATERIAL_PROFILES = {
     "automatic": {"opacity": 0.58, "style": "clear", "tint_alpha": 0.32,
                   "tint_rgb": (0.05, 0.055, 0.065), "card_alpha": 174,
-                  "list_alpha": 166},
+                  "list_alpha": 166, "backdrop_scale": 0.345},
     "default": {"opacity": 0.62, "style": "clear", "tint_alpha": 0.34,
                 "tint_rgb": (0.05, 0.055, 0.065), "card_alpha": 174,
-                "list_alpha": 166},
+                "list_alpha": 166, "backdrop_scale": 0.35},
     "dark": {"opacity": 0.82, "style": "clear", "tint_alpha": 0.46,
              "tint_rgb": (0.035, 0.038, 0.045), "card_alpha": 194,
-             "list_alpha": 186},
+             "list_alpha": 186, "backdrop_scale": 0.33},
     "clear": {"opacity": 0.48, "style": "clear", "tint_alpha": 0.27,
               "tint_rgb": (0.05, 0.055, 0.065), "card_alpha": 162,
-              "list_alpha": 154},
+              "list_alpha": 154, "backdrop_scale": 0.36},
     "tinted": {"opacity": 0.58, "style": "clear", "tint_alpha": 0.36,
                "tint_rgb": (0.07, 0.065, 0.09), "card_alpha": 184,
-               "list_alpha": 176},
+               "list_alpha": 176, "backdrop_scale": 0.34},
 }
 
 
@@ -86,6 +86,7 @@ def glass_material_profile(material, opacity=None):
             "tint_rgb": (0.05, 0.055, 0.065),
             "card_alpha": int(round(140 + 50 * o)),
             "list_alpha": int(round(132 + 50 * o)),
+            "backdrop_scale": 0.36 - 0.03 * o,
         }
     profile = dict(_GLASS_MATERIAL_PROFILES[key])
     profile["material"] = key
@@ -292,6 +293,57 @@ def apply_windows_glass(window, enable=True, light_titlebar=False):
     except Exception:
         pass
 
+def _backdrop_layers(layer):
+    found = []
+    if layer is None:
+        return found
+    try:
+        cls = layer.className()
+    except Exception:
+        cls = ""
+    if "Backdrop" in cls:
+        found.append(layer)
+    try:
+        sublayers = layer.sublayers() or []
+    except Exception:
+        sublayers = []
+    for sub in sublayers:
+        found.extend(_backdrop_layers(sub))
+    return found
+
+
+def set_macos_glass_backdrop_scale(window, scale):
+    """Best-effort bokeh-like diffusion via the native backdrop layer.
+
+    Public Clear captures the backdrop at 0.5 scale and Regular at 0.25.
+    An intermediate downsample softens bright text without Regular's smear.
+    This is a private KVC detail, not a public blur-radius API; failures are
+    ignored and the public Clear style remains in effect.
+    """
+    if sys.platform != "darwin":
+        return
+    glass_view = getattr(window, "_glass_view", None)
+    if glass_view is None:
+        return
+    try:
+        applied = False
+        for layer in _backdrop_layers(glass_view.layer()):
+            try:
+                layer.setValue_forKey_(float(scale), "scale")
+                applied = True
+            except Exception:
+                pass
+        if applied:
+            window._glass_scale_retries = 0
+        elif getattr(window, "_glass_scale_retries", 0) < 3:
+            window._glass_scale_retries = getattr(window, "_glass_scale_retries", 0) + 1
+            QTimer.singleShot(
+                80, lambda: set_macos_glass_backdrop_scale(window, scale)
+            )
+    except Exception:
+        pass
+
+
 def configure_macos_glass(window, theme="macos27_glass", enable=True, opacity=None,
                           material=None):
     """Match the native glass material to the selected theme and mode.
@@ -299,9 +351,12 @@ def configure_macos_glass(window, theme="macos27_glass", enable=True, opacity=No
     ``macos27_glass`` uses DarkAqua and the public Clear style for every
     preset; ``Glass Material`` changes native tint + QSS scrim density. The
     Regular style reads as a smeared blur over picture backgrounds, so it is
-    reserved for the original ``Glass`` theme. ``opacity`` is only a fallback
-    for old numeric sessions and Automatic's last system sync. The native
-    view stays at full alpha so AppKit keeps rendering the material.
+    reserved for the original ``Glass`` theme. macOS 27 also applies an
+    intermediate native backdrop downsample (0.33..0.36) for soft,
+    bokeh-like diffusion that breaks up bright text; it is best-effort
+    private KVC and falls back silently. ``opacity`` is only a fallback for
+    old numeric sessions and Automatic's last system sync. The native view
+    stays at full alpha so AppKit keeps rendering the material.
     """
     if sys.platform != "darwin":
         return
@@ -344,6 +399,11 @@ def configure_macos_glass(window, theme="macos27_glass", enable=True, opacity=No
             # Match the rounded window corners so the native material does not
             # leave a square edge / cut-off line under the QSS panels.
             glass_view.setCornerRadius_(14.0 if enable else 0.0)
+        if enable and glass_view is not None:
+            # Clear alone (0.5) lets bright text read through; Regular (0.25)
+            # is the smeared look. Intermediate scales diffuse it softly.
+            scale = profile["backdrop_scale"] if is_m27 and profile is not None else 0.25
+            set_macos_glass_backdrop_scale(window, scale)
         if glass_view is not None and hasattr(glass_view, "setTintColor_"):
             if enable and profile is not None:
                 tr, tg, tb = profile["tint_rgb"]

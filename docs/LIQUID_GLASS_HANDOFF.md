@@ -27,11 +27,12 @@
 - `pyqt_liquidglass` creates `NSGlassEffectView` with its default **`Regular`** style (`NSGlassEffectViewStyleRegular = 0`), which is the dense/mushy material. macOS Settings/Control Center panels use **`Clear`** (`= 1`). The earlier light/white direction was also wrong: references are dark panels over a picture background.
 - Added `configure_macos_glass()` in `player_ui/liquid_glass.py`. Called from every place that applies native glass (main window, `SettingsDialog`, track-properties dialog, startup, and the Glass Material selector). It:
   - maps every `macos27_glass` preset to `NSGlassEffectViewStyleClear (1)` and varies native tint + QSS scrim density; original `Glass` keeps `Regular (0)` because Clear is required for the native look,
+  - sets the backdrop layer's downsample scale to `0.33–0.36` via guarded private KVC for soft, bokeh-like diffusion. Native Clear is `0.5` (bright text reads through) and Regular is `0.25` (smeared); an intermediate value breaks up terminal/wallpaper text without Regular's mush. Failures are ignored and the public Clear style remains,
   - sets the `NSWindow` appearance to `DarkAqua` for `macos27_glass` (less bright/blue than `VibrantDark`) and `VibrantDark` for original `Glass`,
   - keeps `NSGlassEffectView.alphaValue = 1.0` — lowering it suppresses the material and makes the window flat; each mode varies native `tintColor` plus a dark QSS scrim instead,
   - sets a `14pt` corner radius and calls `setNeedsDisplay_` after style changes,
   - restores the default appearance/alpha/style when leaving glass themes.
-- `Glass Opacity` was replaced by `Glass Material`: `Automatic / Default / Dark / Clear / Tinted`. macOS has no public blur-radius API and no public read for the exact native mode, so these are dark tint/scrim presets, not private API reads or exact mode detection. Legacy numeric `glass_clarity` is kept in `session.json` as the Automatic/system-sync fallback.
+- `Glass Opacity` was replaced by `Glass Material`: `Automatic / Default / Dark / Clear / Tinted`. macOS has no public blur-radius API and no public read for the exact native mode; these are dark tint/scrim presets, not private mode reads or exact mode detection. The only private detail is the best-effort backdrop-scale KVC above. Legacy numeric `glass_clarity` is kept in `session.json` as the Automatic/system-sync fallback.
 - `macos27_glass` QSS now uses a **dark scrim** matched to the selected mode:
   - native `tintColor` alpha `0.27` Clear, `0.34` Default, `0.36` Tinted, `0.46` Dark; Automatic scales `0.24..0.50` from system clarity,
   - card fill `rgba(10,11,13,~162)` for Clear, `~174` for Default, `~184` for Tinted, `~194` for Dark; Automatic scales `140..190`,
@@ -47,12 +48,12 @@
 ### Manual system-glass sync (new)
 - Double-click **Glass Material:** in Settings to call `read_system_glass_preferences()` in `player_ui/liquid_glass.py`, select `Automatic`, and set the legacy `glass_clarity` fallback from OS signals.
 - macOS mapping (public APIs only): effective `NSApp.effectiveAppearance`, `AppleInterfaceStyle` + `AppleInterfaceStyleSwitchesAutomatically`, `NSWorkspace.accessibilityDisplayShouldReduceTransparency()`, and main wallpaper luminance (QImage can read macOS HEIC wallpapers in this environment). Reduce Transparency On → Dark + `100`; otherwise a best-effort mode (`automatic`/`dark`/`clear`/`tinted`/`default`) plus `12..94`.
-- Windows mapping: registry `AppsUseLightTheme` + `EnableTransparency`. Transparency Off → Dark + `100`; On → Dark + `68` or Default + `48`. The existing DWM acrylic path already gives a native glass layer on Windows 11; the QSS veil supplies the mode look on every platform.
+- Windows mapping: registry `AppsUseLightTheme` + `EnableTransparency`. Transparency Off → Dark + `100`; On → Dark + `68` or Default + `48`. The existing DWM acrylic path already gives a native glass layer on Windows 11; the QSS dark scrim supplies the mode look on every platform.
 - macOS does **not** publicly expose the exact `Automatic / Default / Dark / Clear / Tinted` choice. The double-click sync is an explicit approximation and shows the detected signals in a tooltip. Android is paused/experimental; it uses the in-app selector only until desktop parity work resumes.
 - Offscreen tests pass: helper returns a macOS suggestion, `SettingsDialog` switches to Automatic from it, and the label double-click event emits the sync signal.
 
 ### Still unresolved
-- User is testing the dark tint/scrim retune now. The previous REXA `Tinted` screenshot measured a settings card around `[140,136,136]` while native panels were roughly `[23–54]`, so the new presets raise `tintColor` alpha and QSS scrim together to land in that darker range. If a preset still misses, tune `tint_alpha` + `card_alpha` together rather than reintroducing `Regular`.
+- User is testing the bokeh-like diffusion retune now. The dark scrim fixed density on dark backgrounds, but bright terminal text still read through the old Clear backdrop (`scale 0.5`). The native comparison suppresses that text; the new `0.33–0.36` backdrop scale should soften it without returning to Regular (`0.25`). If text is still legible, lower `backdrop_scale` in small steps; if the panel gets mushy, raise it.
 - More reference screenshots with picture backgrounds are welcome. Exact native mode detection remains unavailable through public AppKit APIs.
 
 ## Important constraints / gotchas
