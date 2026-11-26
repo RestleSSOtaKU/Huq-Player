@@ -110,7 +110,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                                QHBoxLayout, QPushButton, QSlider, QLabel, 
                                QFileDialog, QCheckBox, QSpinBox, QMessageBox,
                                QComboBox, QListWidget, QListWidgetItem, QSplitter, QLineEdit, QStyledItemDelegate, QStyle, QStyleOptionViewItem, QAbstractItemView, QToolTip, QScrollArea, QSizePolicy)
-from PySide6.QtCore import Qt, QTimer, Signal, QObject, QThread, QSize, QRect, QEvent, QVariantAnimation, QEasingCurve, QPointF, QPoint
+from PySide6.QtCore import Qt, QTimer, Signal, QObject, QThread, QSize, QRect, QEvent, QPointF, QPoint
 from PySide6.QtGui import QPixmap, QIcon, QColor, QPainter, QPalette
 from dsp_bridge import RustDspBridge
 from liquid_glass import (make_glass_card, sample_ambient_rgb, sample_ambient_palette,
@@ -2856,13 +2856,10 @@ class MainWindow(QMainWindow):
         self.current_track_index = -1
         self.shuffle_enabled = False
         self._raw_cover_pixmap = None
-        
-        # Ambient background animation
+
+        # Ambient colors follow the selected cover immediately. A separate
+        # fade used to leave the old hue behind while the accent/lava switched.
         self._current_ambient_color = QColor(26, 36, 58)
-        self.ambient_anim = QVariantAnimation(self)
-        self.ambient_anim.setDuration(600)
-        self.ambient_anim.setEasingCurve(QEasingCurve.InOutQuad)
-        self.ambient_anim.valueChanged.connect(self._on_ambient_anim_value)
 
         self.engine = AudioEngine()
         self.engine.playback_stopped.connect(self.on_playback_stopped)
@@ -3100,24 +3097,20 @@ class MainWindow(QMainWindow):
             self._settings_dlg.sync_from_main()
         self.save_session_state()
 
-    def _apply_theme_style(self, color=None, accent=None, accent_end=None):
+    def _apply_theme_style(self, color=None):
         """Rebuild QSS from the current theme/overrides.
 
         Theme changes, session restore, and ambient-color changes all go through
         here so a saved Panel Scrim is never skipped when the saved theme already
-        matches the in-memory default. Callers animating only the background can
-        pass the accent explicitly so it stays tied to the current cover.
+        matches the in-memory default.
         """
         if color is None:
             color = self._current_ambient_color
-        if accent is None or accent_end is None:
-            # Re-derive the accent from the current Ambient Glow value. Otherwise
-            # lowering the slider leaves the previously amplified color in QSS.
-            self.current_accent, self.current_accent_end = self._get_accent_color(
-                color.red(), color.green(), color.blue()
-            )
-        else:
-            self.current_accent, self.current_accent_end = accent, accent_end
+        # Re-derive the accent from the current Ambient Glow value. Otherwise
+        # lowering the slider leaves the previously amplified color in QSS.
+        self.current_accent, self.current_accent_end = self._get_accent_color(
+            color.red(), color.green(), color.blue()
+        )
         self.setStyleSheet(build_liquid_qss(
             color.red(), color.green(), color.blue(),
             theme=self.current_theme,
@@ -3136,15 +3129,6 @@ class MainWindow(QMainWindow):
 
     def _on_ambient_color_changed(self, color):
         self._apply_theme_style(color)
-
-    def _on_ambient_anim_value(self, color):
-        # The fade only animates the background wash. Keep the accent from the
-        # new cover instead of re-deriving it from each interpolated frame.
-        self._apply_theme_style(
-            color,
-            accent=getattr(self, "current_accent", None),
-            accent_end=getattr(self, "current_accent_end", None),
-        )
 
     def _get_macos_default_output_name(self):
         try:
@@ -6047,36 +6031,13 @@ class MainWindow(QMainWindow):
             if hasattr(self, "lava_overlay"):
                 self.lava_overlay.set_palette(sample_ambient_palette(raw))
             
+            # Background, accent, and lava all switch to the new cover together.
+            # The old fade left the previous hue visible while the other colors
+            # had already changed, which read as a wrong-track background.
             target_color = QColor(r, g, b)
             self.current_accent, self.current_accent_end = self._get_accent_color(r, g, b)
-            
-            # Get the current actual color (if animation is running, use its current value)
-            if hasattr(self, 'ambient_anim') and self.ambient_anim.state() == QVariantAnimation.Running:
-                current_color = self.ambient_anim.currentValue()
-            else:
-                current_color = self._current_ambient_color
-
-            if target_color != self._current_ambient_color:
-                self.ambient_anim.stop()
-                self.ambient_anim.setStartValue(current_color)
-                self.ambient_anim.setEndValue(target_color)
-                self._current_ambient_color = target_color
-                
-                # Instantly apply QSS with the new accent color but keep the OLD background color
-                # This makes the buttons change instantly, while the background smoothly fades.
-                self.setStyleSheet(build_liquid_qss(
-                    current_color.red(), current_color.green(), current_color.blue(),
-                    theme=self.current_theme, ambient_opacity=self.ambient_opacity,
-                    accent=self.current_accent, accent_end=self.current_accent_end,
-                    glass_clarity=self.glass_clarity, glass_rim=self.glass_rim,
-                    glass_material=getattr(self, "glass_material", None),
-                    glass_overrides=getattr(self, "glass_overrides", None),
-                    glass_appearance=getattr(self, "glass_appearance", "dark")
-                ))
-                
-                self.ambient_anim.start()
-            else:
-                self._on_ambient_color_changed(self._current_ambient_color)
+            self._current_ambient_color = target_color
+            self._apply_theme_style(target_color)
                 
             if raw is not None and not raw.isNull():
                 self.lbl_cover.setPixmap(
