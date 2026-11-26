@@ -26,15 +26,16 @@
 ### Native glass fix (latest, not yet verified by user)
 - `pyqt_liquidglass` creates `NSGlassEffectView` with its default **`Regular`** style (`NSGlassEffectViewStyleRegular = 0`), which is the dense/mushy material. macOS Settings/Control Center panels use **`Clear`** (`= 1`). The earlier light/white direction was also wrong: references are dark panels over a picture background.
 - Added `configure_macos_glass()` in `player_ui/liquid_glass.py`. Called from every place that applies native glass (main window, `SettingsDialog`, track-properties dialog, startup, and the Glass Material selector). It:
-  - maps `Clear`/`Tinted` to `NSGlassEffectViewStyleClear (1)` and `Default`/`Dark` to `Regular (0)`; original `Glass` always keeps `Regular (0)`,
+  - maps every `macos27_glass` preset to `NSGlassEffectViewStyleClear (1)` and varies native tint + QSS scrim density; original `Glass` keeps `Regular (0)` because Clear is required for the native look,
   - sets the `NSWindow` appearance to `DarkAqua` for `macos27_glass` (less bright/blue than `VibrantDark`) and `VibrantDark` for original `Glass`,
-  - keeps `NSGlassEffectView.alphaValue = 1.0` — lowering it suppresses the material and makes the window flat; each mode varies native `tintColor` plus a thin QSS veil instead,
+  - keeps `NSGlassEffectView.alphaValue = 1.0` — lowering it suppresses the material and makes the window flat; each mode varies native `tintColor` plus a dark QSS scrim instead,
   - sets a `14pt` corner radius and calls `setNeedsDisplay_` after style changes,
   - restores the default appearance/alpha/style when leaving glass themes.
-- `Glass Opacity` was replaced by `Glass Material`: `Automatic / Default / Dark / Clear / Tinted`. macOS has no public blur-radius API and no public read for the exact native mode, so these are closest public AppKit mappings, not private API reads. Legacy numeric `glass_clarity` is kept in `session.json` as the Automatic/system-sync fallback.
-- `macos27_glass` QSS is now a **thin dark veil** matched to the selected mode:
-  - card fill `rgba(26,26,28,~11)` for Clear, `~19` for Tinted, `~54` for Default, `~115` for Dark,
-  - list fill follows the same Clear/Regular split,
+- `Glass Opacity` was replaced by `Glass Material`: `Automatic / Default / Dark / Clear / Tinted`. macOS has no public blur-radius API and no public read for the exact native mode, so these are dark tint/scrim presets, not private API reads or exact mode detection. Legacy numeric `glass_clarity` is kept in `session.json` as the Automatic/system-sync fallback.
+- `macos27_glass` QSS now uses a **dark scrim** matched to the selected mode:
+  - native `tintColor` alpha `0.27` Clear, `0.34` Default, `0.36` Tinted, `0.46` Dark; Automatic scales `0.24..0.50` from system clarity,
+  - card fill `rgba(10,11,13,~162)` for Clear, `~174` for Default, `~184` for Tinted, `~194` for Dark; Automatic scales `140..190`,
+  - list fill follows the same density ramp,
   - white text (`#f5f5f7`), thin white rim, dark combo popup, white spectrum axis labels,
   - main window/settings root are fully transparent so no square gradient layer cuts across the rounded native glass corners,
   - ambient/lava overlay is static (no timer) and much fainter in `macos27_glass` (`peak alpha 0.015 * glow`, no dither tile) so it does not muddy the native blur.
@@ -51,8 +52,8 @@
 - Offscreen tests pass: helper returns a macOS suggestion, `SettingsDialog` switches to Automatic from it, and the label double-click event emits the sync signal.
 
 ### Still unresolved
-- User is testing the discrete `Glass Material` presets now. If a preset is too transparent or still mushy, next suspects are: per-mode `tintColor`, the QSS veil ramp, or the lack of a public exact native mode API. More reference screenshots with picture backgrounds are welcome.
-- Earlier REXA screenshot was whiteish (`mean ≈ [159,160,163]`); reference panels are dark (`mean ≈ [26–41]`).
+- User is testing the dark tint/scrim retune now. The previous REXA `Tinted` screenshot measured a settings card around `[140,136,136]` while native panels were roughly `[23–54]`, so the new presets raise `tintColor` alpha and QSS scrim together to land in that darker range. If a preset still misses, tune `tint_alpha` + `card_alpha` together rather than reintroducing `Regular`.
+- More reference screenshots with picture backgrounds are welcome. Exact native mode detection remains unavailable through public AppKit APIs.
 
 ## Important constraints / gotchas
 - `pyqt_liquidglass` is installed in `.venv` and reports `HAS_GLASS_EFFECT True`, `MACOS_VERSION (27, 2, 1)`.

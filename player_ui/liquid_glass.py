@@ -22,10 +22,11 @@ def windows_transparency_enabled():
 
 
 def glass_opacity_state(opacity):
-    """Split 0..1 opacity into native Clear/Regular state + local progress.
+    """Split legacy 0..1 clarity into a bucket for fallback/auto sync.
 
-    macOS only exposes Clear and Regular materials publicly; there is no
-    numeric blur-radius API. Kept for legacy numeric sessions and Windows.
+    ``macos27_glass`` no longer maps this to Regular glass: every mode uses
+    the public Clear style and differs by tint/scrim density. This helper
+    remains for old numeric sessions and Automatic system sync.
     """
     o = max(0.0, min(1.0, float(opacity if opacity is not None else 0.0)))
     if o < 0.5:
@@ -42,19 +43,25 @@ GLASS_MATERIAL_LABELS = {
     "tinted": "Tinted",
 }
 
-# AppKit only exposes Clear/Regular materials. These are the closest public
-# mappings for the native-looking mode names; they are not private API reads.
+# Native references are dark panels over a picture background. AppKit exposes
+# only Clear/Regular styles, and Regular reads as a smeared blur here, so every
+# macOS 27 preset uses Clear and varies native tint + QSS scrim instead.
 _GLASS_MATERIAL_PROFILES = {
-    "automatic": {"opacity": 0.45, "style": "clear", "tint_alpha": 0.035,
-                  "tint_rgb": (0.08, 0.08, 0.09)},
-    "default": {"opacity": 0.58, "style": "regular", "tint_alpha": 0.07,
-                "tint_rgb": (0.08, 0.08, 0.09)},
-    "dark": {"opacity": 0.86, "style": "regular", "tint_alpha": 0.20,
-             "tint_rgb": (0.06, 0.06, 0.07)},
-    "clear": {"opacity": 0.08, "style": "clear", "tint_alpha": 0.02,
-              "tint_rgb": (0.08, 0.08, 0.09)},
-    "tinted": {"opacity": 0.22, "style": "clear", "tint_alpha": 0.09,
-               "tint_rgb": (0.12, 0.11, 0.15)},
+    "automatic": {"opacity": 0.58, "style": "clear", "tint_alpha": 0.32,
+                  "tint_rgb": (0.05, 0.055, 0.065), "card_alpha": 174,
+                  "list_alpha": 166},
+    "default": {"opacity": 0.62, "style": "clear", "tint_alpha": 0.34,
+                "tint_rgb": (0.05, 0.055, 0.065), "card_alpha": 174,
+                "list_alpha": 166},
+    "dark": {"opacity": 0.82, "style": "clear", "tint_alpha": 0.46,
+             "tint_rgb": (0.035, 0.038, 0.045), "card_alpha": 194,
+             "list_alpha": 186},
+    "clear": {"opacity": 0.48, "style": "clear", "tint_alpha": 0.27,
+              "tint_rgb": (0.05, 0.055, 0.065), "card_alpha": 162,
+              "list_alpha": 154},
+    "tinted": {"opacity": 0.58, "style": "clear", "tint_alpha": 0.36,
+               "tint_rgb": (0.07, 0.065, 0.09), "card_alpha": 184,
+               "list_alpha": 176},
 }
 
 
@@ -64,22 +71,21 @@ def canonical_glass_material(material):
 
 
 def glass_material_profile(material, opacity=None):
-    """Return the public native mapping for a discrete Glass Material mode.
+    """Return dark native-glass preset for a discrete Glass Material mode.
 
-    ``automatic`` follows the last system-synced opacity; explicit modes use
-    fixed material/tint profiles so the selector behaves like native presets.
+    Every macOS 27 mode uses the public Clear style; Regular is reserved for
+    the original Glass theme. ``automatic`` follows the last system-synced
+    clarity. Values are tint/scrim strengths, not numeric blur control.
     """
     key = canonical_glass_material(material)
     if key == "automatic":
-        o = max(0.0, min(1.0, float(opacity if opacity is not None else 0.45)))
-        state, local = glass_opacity_state(o)
-        if state == "clear":
-            tint_alpha = 0.02 + 0.05 * local
-        else:
-            tint_alpha = 0.07 + 0.23 * local
+        o = max(0.0, min(1.0, float(opacity if opacity is not None else 0.58)))
         return {
-            "material": key, "opacity": o, "style": "clear" if state == "clear" else "regular",
-            "tint_alpha": tint_alpha, "tint_rgb": (0.08, 0.08, 0.09),
+            "material": key, "opacity": o, "style": "clear",
+            "tint_alpha": 0.24 + 0.26 * o,
+            "tint_rgb": (0.05, 0.055, 0.065),
+            "card_alpha": int(round(140 + 50 * o)),
+            "list_alpha": int(round(132 + 50 * o)),
         }
     profile = dict(_GLASS_MATERIAL_PROFILES[key])
     profile["material"] = key
@@ -290,10 +296,11 @@ def configure_macos_glass(window, theme="macos27_glass", enable=True, opacity=No
                           material=None):
     """Match the native glass material to the selected theme and mode.
 
-    ``macos27_glass`` uses DarkAqua appearance and the public Clear/Regular
-    material selected by ``Glass Material``. Original ``Glass`` keeps the
-    denser Regular + VibrantDark look. ``opacity`` is only a fallback for old
-    numeric sessions and for Automatic mode's last system sync. The native
+    ``macos27_glass`` uses DarkAqua and the public Clear style for every
+    preset; ``Glass Material`` changes native tint + QSS scrim density. The
+    Regular style reads as a smeared blur over picture backgrounds, so it is
+    reserved for the original ``Glass`` theme. ``opacity`` is only a fallback
+    for old numeric sessions and Automatic's last system sync. The native
     view stays at full alpha so AppKit keeps rendering the material.
     """
     if sys.platform != "darwin":
@@ -325,9 +332,10 @@ def configure_macos_glass(window, theme="macos27_glass", enable=True, opacity=No
 
         glass_view = getattr(window, "_glass_view", None)
         if glass_view is not None and hasattr(glass_view, "setStyle_"):
-            # Clear is the gentle material; Regular is denser/frosted. These
-            # are the only public blur/frost states NSGlassEffectView offers.
-            use_clear = enable and profile is not None and profile["style"] == "clear"
+            # Regular is the dense/smeared material and does not match the
+            # native dark panels in the references. macOS 27 always uses the
+            # public Clear style; modes vary tint + scrim density instead.
+            use_clear = bool(enable and is_m27)
             glass_view.setStyle_(
                 NSGlassEffectViewStyleClear if use_clear
                 else NSGlassEffectViewStyleRegular
@@ -465,24 +473,19 @@ def build_liquid_qss(r=26, g=36, b=58, glass_pct=50, theme="classic", ambient_op
         # instead of being buried under an opaque dark gradient.
         if is_m27:
             # Native material/tint comes from configure_macos_glass(); QSS
-            # adds only a small veil matching the discrete Glass Material.
+            # supplies the dark panel scrim measured from the native refs.
+            # This is tint density, not a fake blur-radius control.
             profile = glass_material_profile(glass_material, c_f)
-            c_f = profile["opacity"]
-            state, local = glass_opacity_state(c_f)
             text_color = "#f5f5f7"
             secondary_text = "rgba(235, 235, 240, 190)"
-            if state == "clear":
-                card_a = int(6 + 30 * local)
-                list_a = int(4 + 26 * local)
-            else:
-                card_a = int(36 + 110 * local)
-                list_a = int(30 + 100 * local)
+            card_a = int(profile["card_alpha"])
+            list_a = int(profile["list_alpha"])
             rim_a = int(10 + 46 * r_f)
             btn_a = int(18 + 170 * r_f)
-            card_bg = f"rgba(26, 26, 28, {card_a})"
+            card_bg = f"rgba(10, 11, 13, {card_a})"
             card_hi = f"rgba(255, 255, 255, {rim_a})"
             card_lo = card_hi
-            list_bg = f"rgba(20, 20, 22, {list_a})"
+            list_bg = f"rgba(8, 9, 11, {list_a})"
             input_bg = f"rgba(255, 255, 255, {int(18 + 160 * r_f)})"
             btn_bg = f"rgba(255, 255, 255, {btn_a})"
             slider_bg = "rgba(255, 255, 255, 46)"
