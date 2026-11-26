@@ -107,6 +107,7 @@
 ### Release metadata (v0.5.3)
 - `player_ui/main.py` `APP_VERSION` is now `0.5.3`; `README.md` and `AGENTS.md` carry matching `v0.5.3` notes.
 - The workflow still derives release titles and artifact names from the pushed tag, so no hardcoded workflow version was changed. A local `v0.5.3` tag is enough to publish `REXA v0.5.3` once explicitly approved.
+- Same-version bugfix: the ambient animation slot now preserves the accent sampled from the newly selected cover. Only the background wash interpolates; buttons/glow no longer show the previous track's hue during the 600 ms fade.
 
 ### Verification
 - `python3 -m py_compile player_ui/main.py player_ui/liquid_glass.py player_ui/glass_lens.py` passes.

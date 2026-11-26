@@ -2862,7 +2862,7 @@ class MainWindow(QMainWindow):
         self.ambient_anim = QVariantAnimation(self)
         self.ambient_anim.setDuration(600)
         self.ambient_anim.setEasingCurve(QEasingCurve.InOutQuad)
-        self.ambient_anim.valueChanged.connect(self._on_ambient_color_changed)
+        self.ambient_anim.valueChanged.connect(self._on_ambient_anim_value)
 
         self.engine = AudioEngine()
         self.engine.playback_stopped.connect(self.on_playback_stopped)
@@ -3100,20 +3100,24 @@ class MainWindow(QMainWindow):
             self._settings_dlg.sync_from_main()
         self.save_session_state()
 
-    def _apply_theme_style(self, color=None):
+    def _apply_theme_style(self, color=None, accent=None, accent_end=None):
         """Rebuild QSS from the current theme/overrides.
 
         Theme changes, session restore, and ambient-color changes all go through
         here so a saved Panel Scrim is never skipped when the saved theme already
-        matches the in-memory default.
+        matches the in-memory default. Callers animating only the background can
+        pass the accent explicitly so it stays tied to the current cover.
         """
         if color is None:
             color = self._current_ambient_color
-        # Re-derive the accent from the current Ambient Glow value. Otherwise
-        # lowering the slider leaves the previously amplified color in QSS.
-        self.current_accent, self.current_accent_end = self._get_accent_color(
-            color.red(), color.green(), color.blue()
-        )
+        if accent is None or accent_end is None:
+            # Re-derive the accent from the current Ambient Glow value. Otherwise
+            # lowering the slider leaves the previously amplified color in QSS.
+            self.current_accent, self.current_accent_end = self._get_accent_color(
+                color.red(), color.green(), color.blue()
+            )
+        else:
+            self.current_accent, self.current_accent_end = accent, accent_end
         self.setStyleSheet(build_liquid_qss(
             color.red(), color.green(), color.blue(),
             theme=self.current_theme,
@@ -3132,6 +3136,15 @@ class MainWindow(QMainWindow):
 
     def _on_ambient_color_changed(self, color):
         self._apply_theme_style(color)
+
+    def _on_ambient_anim_value(self, color):
+        # The fade only animates the background wash. Keep the accent from the
+        # new cover instead of re-deriving it from each interpolated frame.
+        self._apply_theme_style(
+            color,
+            accent=getattr(self, "current_accent", None),
+            accent_end=getattr(self, "current_accent_end", None),
+        )
 
     def _get_macos_default_output_name(self):
         try:
