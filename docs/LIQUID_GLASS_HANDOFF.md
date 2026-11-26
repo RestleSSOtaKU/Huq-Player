@@ -58,6 +58,9 @@
 - `configure_macos_glass()` and `build_liquid_qss()` read those overrides, so native tint/style/downsample and QSS scrim move together. On-screen probe confirmed a `clear` override of scale `0.30`, tint `0.12`, and Regular style applies.
 - Sliders are explicitly labeled experimental; macOS still has no public numeric blur-radius API.
 
+### Settings scrolling (latest)
+- `SettingsDialog` now places `QFrame#settingsRoot` inside a frameless `QScrollArea`. The dialog minimum height dropped to `420`, `_fit_to_screen()` caps it to the available screen (max width `700`, height `avail.height() - 80`), and Qt shows a themed vertical scrollbar whenever the cards exceed the viewport. Offscreen smoke test verifies the scroll range and size cap.
+
 ### Still unresolved
 - User retesting after the timing fix. The first bokeh pass still showed terminal text because AppKit reset the private backdrop `scale` from `0.33` back to Clear's `0.5` after the layer tree settled and again on every window move/resize. `set_macos_glass_backdrop_scale()` now reapplies on a short timer series and from a Qt move/resize event filter; an on-screen PySide probe held `0.33` through layer rebuild, move, and resize. If text is still legible, lower `backdrop_scale` in small steps; if the panel gets mushy, raise it.
 - More reference screenshots with picture backgrounds are welcome. Exact native mode detection remains unavailable through public AppKit APIs.

@@ -787,6 +787,12 @@ def build_liquid_qss(r=26, g=36, b=58, glass_pct=50, theme="classic", ambient_op
     QSlider::handle:horizontal {{ background: {slider_handle}; width: 14px; height: 14px; margin: -5px 0; border-radius: 7px; }}
     QSlider::sub-page:horizontal:disabled {{ background: {slider_bg}; }}
     QSlider::handle:horizontal:disabled {{ background: rgba(150, 150, 155, 130); }}
+    QScrollArea#settingsScroll {{ background: transparent; border: 0; }}
+    QScrollBar:vertical {{ background: transparent; width: 10px; margin: 0; border: 0; }}
+    QScrollBar::handle:vertical {{ background: {slider_bg}; border: 1px solid {card_hi}; border-radius: 5px; min-height: 32px; }}
+    QScrollBar::handle:vertical:hover {{ background: {accent}; }}
+    QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; background: transparent; border: 0; }}
+    QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{ background: transparent; }}
     QLabel:disabled {{ color: rgba(142, 142, 147, 140); }}
     """
 

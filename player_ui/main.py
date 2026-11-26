@@ -102,7 +102,7 @@ def _fast_sosfilt(sos, x):
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                                QHBoxLayout, QPushButton, QSlider, QLabel, 
                                QFileDialog, QCheckBox, QSpinBox, QMessageBox,
-                               QComboBox, QListWidget, QListWidgetItem, QSplitter, QLineEdit, QStyledItemDelegate, QStyle, QStyleOptionViewItem, QAbstractItemView, QToolTip)
+                               QComboBox, QListWidget, QListWidgetItem, QSplitter, QLineEdit, QStyledItemDelegate, QStyle, QStyleOptionViewItem, QAbstractItemView, QToolTip, QScrollArea, QSizePolicy)
 from PySide6.QtCore import Qt, QTimer, Signal, QObject, QThread, QSize, QEvent, QVariantAnimation, QEasingCurve, QPointF, QPoint
 from PySide6.QtGui import QPixmap, QIcon, QColor, QPainter, QPalette
 from dsp_bridge import RustDspBridge
@@ -1982,13 +1982,28 @@ class SettingsDialog(QDialog):
         self.setAttribute(Qt.WA_TranslucentBackground, windows_transparency_enabled())
         self.setAttribute(Qt.WA_NoSystemBackground, True)
         self.setAttribute(Qt.WA_ContentsMarginsRespectsSafeArea, False)
-        self.setMinimumSize(540, 735)
+        self.setMinimumSize(540, 420)
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
-        root = QFrame(self)
+
+        # Keep the dialog capped to the screen and scroll its contents instead
+        # of clipping the lower cards on short displays.
+        self.settings_scroll = QScrollArea(self)
+        self.settings_scroll.setObjectName("settingsScroll")
+        self.settings_scroll.setFrameShape(QScrollArea.NoFrame)
+        self.settings_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.settings_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.settings_scroll.setWidgetResizable(True)
+        self.settings_scroll.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.settings_scroll.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.settings_scroll.viewport().setAttribute(Qt.WA_TranslucentBackground, True)
+        self.settings_scroll.viewport().setAttribute(Qt.WA_NoSystemBackground, True)
+        outer.addWidget(self.settings_scroll)
+
+        root = QFrame(self.settings_scroll)
         root.setObjectName("settingsRoot")
-        outer.addWidget(root)
+        self.settings_scroll.setWidget(root)
 
         lay = QVBoxLayout(root)
         lay.setContentsMargins(18, 40 if sys.platform == "darwin" else 18, 18, 18)
@@ -2208,6 +2223,23 @@ class SettingsDialog(QDialog):
     def showEvent(self, event):
         super().showEvent(event)
         self.sync_from_main()
+        self._fit_to_screen()
+
+    def _fit_to_screen(self):
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is None:
+            return
+        avail = screen.availableGeometry()
+        max_w = max(self.minimumWidth(), min(700, avail.width() - 40))
+        max_h = max(self.minimumHeight(), avail.height() - 80)
+        self.setMaximumSize(max_w, max_h)
+        if not getattr(self, "_initial_size_applied", False):
+            hint = self.sizeHint()
+            self.resize(max(self.minimumWidth(), min(hint.width(), max_w)),
+                        max(self.minimumHeight(), min(hint.height(), max_h)))
+            self._initial_size_applied = True
+        else:
+            self.resize(min(self.width(), max_w), min(self.height(), max_h))
 
     def _on_check_updates(self):
         self.btn_check_upd.setEnabled(False)

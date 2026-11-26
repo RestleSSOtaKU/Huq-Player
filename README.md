@@ -40,7 +40,7 @@ For prebuilt Windows (`REXA-Windows.zip`) and macOS Apple Silicon (`REXA-macOS-A
 * **Dedicated Settings Window (`SettingsDialog` via `⚙`):**
   * Houses **Theme** (`Classic` / `Light` / `Glass` / `Glass macOS 27`), per-theme **Ambient Glow**, **Glass Material**, **Glass Stage**, **Glass Border Rim**, advanced **Backdrop Downsample / Native Tint / Panel Scrim / Native Style** controls, and **Low-End CPU Mode**. Glass-only controls are disabled outside glass themes.
   * Sliders are `ResetSlider` instances—double-click any slider to snap back to that preset's stock default. Double-click **Glass Material:** to sync `Automatic` from macOS/Windows public appearance signals. Stage appearance and per-material tuning overrides persist in `~/.hrtf_audio_player/session.json`.
-  * Styled with a diagonal bottom-right (`10%` up) to top-left ambient gradient (`QFrame#settingsRoot`) and persisted to `~/.hrtf_audio_player/session.json`.
+  * Styled with a diagonal bottom-right (`10%` up) to top-left ambient gradient (`QFrame#settingsRoot`) and persisted to `~/.hrtf_audio_player/session.json`. The dialog is capped to the available screen height and scrolls its contents on short displays.
 * **Adaptive Cover Art & Marquee Typography:**
   * Dynamically samples dominant album-art colors (`sample_ambient_rgb`) with smooth `600 ms` `QVariantAnimation` transitions.
   * Long track titles and artist names use `MarqueeLabel` (`QSizePolicy.Ignored`) so cover art never shrinks, scrolling smoothly at 60 FPS on hover.
