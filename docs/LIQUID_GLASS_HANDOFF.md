@@ -5,7 +5,7 @@
 > Local commits are allowed and encouraged so progress survives model switches. Never create/push a `v*` tag without explicit approval too.
 
 ## Goal
-- Make REXA’s `Glass macOS 27` theme look like the clean native macOS Settings material (bright, low-contrast veil, thin rim, visible desktop blur) instead of the current muddy/dark look.
+- Make REXA’s `Glass macOS 27` theme look like the clean native macOS dark glass panels (visible desktop blur, thin rim, neutral tint) instead of a fake dimming layer.
 - Keep the new theme applied through the **whole app** (main window, settings, dialogs, menus, cards, spectrum, cover lens), not just one widget.
 
 ## Current state (local, uncommitted work at time of writing)
@@ -20,21 +20,21 @@
   - Settings → Appearance → Theme, toolbar theme cycle, persistence in `session.json`, dialog/menu/graph styling all recognize it.
   - Cycle order: `Classic → Light → Glass → Glass macOS 27`.
 - Added `player_ui/LICENSES/liquid-glass-webgpu.LICENSE` and bundled it into Windows/macOS release artifacts in `.github/workflows/build-release.yml`.
-- Reworked `build_liquid_qss()` twice in `player_ui/liquid_glass.py` to reduce QSS alpha (thin white veil instead of dark opaque fill), weaken lava/ambient tint, and add tooltips explaining `Glass Opacity` (lower = cleaner native glass).
+- Reworked `build_liquid_qss()` in `player_ui/liquid_glass.py` to use a thin dark veil over the native material. The old `Glass Opacity` slider was replaced by a discrete `Glass Material` selector because tint/QSS dimming could not produce a true native blur change.
 - Verified with `py_compile` and offscreen Qt smoke tests (theme switching, settings combo, lens visibility, session persistence).
 
 ### Native glass fix (latest, not yet verified by user)
 - `pyqt_liquidglass` creates `NSGlassEffectView` with its default **`Regular`** style (`NSGlassEffectViewStyleRegular = 0`), which is the dense/mushy material. macOS Settings/Control Center panels use **`Clear`** (`= 1`). The earlier light/white direction was also wrong: references are dark panels over a picture background.
-- Added `configure_macos_glass()` in `player_ui/liquid_glass.py`. Called from every place that applies native glass (main window, `SettingsDialog`, track-properties dialog, startup, and both Glass Opacity sliders). It:
-  - sets `NSGlassEffectView.style = 1` (`Clear`) for `macos27_glass`; original `Glass` keeps `Regular (0)`,
+- Added `configure_macos_glass()` in `player_ui/liquid_glass.py`. Called from every place that applies native glass (main window, `SettingsDialog`, track-properties dialog, startup, and the Glass Material selector). It:
+  - maps `Clear`/`Tinted` to `NSGlassEffectViewStyleClear (1)` and `Default`/`Dark` to `Regular (0)`; original `Glass` always keeps `Regular (0)`,
   - sets the `NSWindow` appearance to `DarkAqua` for `macos27_glass` (less bright/blue than `VibrantDark`) and `VibrantDark` for original `Glass`,
-  - keeps `NSGlassEffectView.alphaValue = 1.0` — lowering it suppresses the material and makes the window flat; the slider varies the QSS veil instead,
+  - keeps `NSGlassEffectView.alphaValue = 1.0` — lowering it suppresses the material and makes the window flat; each mode varies native `tintColor` plus a thin QSS veil instead,
   - sets a `14pt` corner radius and calls `setNeedsDisplay_` after style changes,
   - restores the default appearance/alpha/style when leaving glass themes.
-- `Glass Opacity` now switches the **actual native material**: `<50` uses `NSGlassEffectViewStyleClear (1)`, `>=50` uses `NSGlassEffectViewStyleRegular (0)`. Subtle `tintColor` and QSS veil scale inside each state. `alphaValue` remains `1.0`. macOS has no public blur-radius API, so the slider is a real material/frost switch, not a smooth radius control.
-- `macos27_glass` QSS is now a **thin dark veil** matched to that native state:
-  - card fill `rgba(26,26,28,6→36)` in Clear state, `36→146` in Regular/frosted state,
-  - list fill `rgba(20,20,22,4→30)` in Clear state, `30→130` in frosted state,
+- `Glass Opacity` was replaced by `Glass Material`: `Automatic / Default / Dark / Clear / Tinted`. macOS has no public blur-radius API and no public read for the exact native mode, so these are closest public AppKit mappings, not private API reads. Legacy numeric `glass_clarity` is kept in `session.json` as the Automatic/system-sync fallback.
+- `macos27_glass` QSS is now a **thin dark veil** matched to the selected mode:
+  - card fill `rgba(26,26,28,~11)` for Clear, `~19` for Tinted, `~54` for Default, `~115` for Dark,
+  - list fill follows the same Clear/Regular split,
   - white text (`#f5f5f7`), thin white rim, dark combo popup, white spectrum axis labels,
   - main window/settings root are fully transparent so no square gradient layer cuts across the rounded native glass corners,
   - ambient/lava overlay is static (no timer) and much fainter in `macos27_glass` (`peak alpha 0.015 * glow`, no dither tile) so it does not muddy the native blur.
@@ -44,14 +44,14 @@
 - Offscreen tests pass: theme switching, settings combo, dark QSS values, neutral accent at zero glow, lens visibility rules.
 
 ### Manual system-glass sync (new)
-- Double-click **Glass Opacity:** or its slider in Settings to call `read_system_glass_preferences()` in `player_ui/liquid_glass.py` and set `glass_clarity` from the OS.
-- macOS mapping (public APIs only): effective `NSApp.effectiveAppearance`, `AppleInterfaceStyle` + `AppleInterfaceStyleSwitchesAutomatically`, `NSWorkspace.accessibilityDisplayShouldReduceTransparency()`, and main wallpaper luminance (QImage can read macOS HEIC wallpapers in this environment). Reduce Transparency On → `100`; otherwise light/dark base plus wallpaper brightness → `12..94`.
-- Windows mapping: registry `AppsUseLightTheme` + `EnableTransparency`. Transparency Off → `100`; On → `68` for dark, `48` for light. The existing DWM acrylic path already gives a native glass layer on Windows 11; the QSS veil supplies the clear→frosted range on every platform.
-- macOS does **not** publicly expose the exact `Automatic / Default / Dark / Clear / Tinted` choice. The double-click sync is an explicit approximation and shows the detected signals in a tooltip. Android is paused/experimental; it uses the in-app slider only until desktop parity work resumes.
-- Offscreen tests pass: helper returns a macOS suggestion, `SettingsDialog` slider updates from it, and both label/slider double-click events emit the sync signal.
+- Double-click **Glass Material:** in Settings to call `read_system_glass_preferences()` in `player_ui/liquid_glass.py`, select `Automatic`, and set the legacy `glass_clarity` fallback from OS signals.
+- macOS mapping (public APIs only): effective `NSApp.effectiveAppearance`, `AppleInterfaceStyle` + `AppleInterfaceStyleSwitchesAutomatically`, `NSWorkspace.accessibilityDisplayShouldReduceTransparency()`, and main wallpaper luminance (QImage can read macOS HEIC wallpapers in this environment). Reduce Transparency On → Dark + `100`; otherwise a best-effort mode (`automatic`/`dark`/`clear`/`tinted`/`default`) plus `12..94`.
+- Windows mapping: registry `AppsUseLightTheme` + `EnableTransparency`. Transparency Off → Dark + `100`; On → Dark + `68` or Default + `48`. The existing DWM acrylic path already gives a native glass layer on Windows 11; the QSS veil supplies the mode look on every platform.
+- macOS does **not** publicly expose the exact `Automatic / Default / Dark / Clear / Tinted` choice. The double-click sync is an explicit approximation and shows the detected signals in a tooltip. Android is paused/experimental; it uses the in-app selector only until desktop parity work resumes.
+- Offscreen tests pass: helper returns a macOS suggestion, `SettingsDialog` switches to Automatic from it, and the label double-click event emits the sync signal.
 
 ### Still unresolved
-- User is testing the native Clear material now. If it is too transparent or still mushy, next suspects are: `NSGlassEffectView` needing `setTintColor_` / custom `contentStyle`, the QSS veil ramp, or material tint not following the system’s exact Clear/Tinted choice. More reference screenshots with picture backgrounds are welcome.
+- User is testing the discrete `Glass Material` presets now. If a preset is too transparent or still mushy, next suspects are: per-mode `tintColor`, the QSS veil ramp, or the lack of a public exact native mode API. More reference screenshots with picture backgrounds are welcome.
 - Earlier REXA screenshot was whiteish (`mean ≈ [159,160,163]`); reference panels are dark (`mean ≈ [26–41]`).
 
 ## Important constraints / gotchas

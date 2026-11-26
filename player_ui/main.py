@@ -106,7 +106,13 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
 from PySide6.QtCore import Qt, QTimer, Signal, QObject, QThread, QSize, QEvent, QVariantAnimation, QEasingCurve, QPointF, QPoint
 from PySide6.QtGui import QPixmap, QIcon, QColor, QPainter, QPalette
 from dsp_bridge import RustDspBridge
-from liquid_glass import make_glass_card, sample_ambient_rgb, sample_ambient_palette, LavaLampOverlay, build_liquid_qss, apply_seamless_titlebar, apply_windows_glass, configure_macos_glass, windows_transparency_enabled, read_system_glass_preferences, WindowDragFilter
+from liquid_glass import (make_glass_card, sample_ambient_rgb, sample_ambient_palette,
+                          LavaLampOverlay, build_liquid_qss, apply_seamless_titlebar,
+                          apply_windows_glass, configure_macos_glass,
+                          windows_transparency_enabled, read_system_glass_preferences,
+                          WindowDragFilter, GLASS_MATERIALS, GLASS_MATERIAL_LABELS,
+                          canonical_glass_material, glass_material_clarity,
+                          material_from_opacity)
 from glass_lens import GlassLensOverlay
 
 GLASS_THEMES = ("liquid_glass", "macos27_glass")
@@ -2016,18 +2022,25 @@ class SettingsDialog(QDialog):
         self.s_glow.valueChanged.connect(mw.update_ambient_opacity)
         g.addWidget(self.s_glow, 3, 1)
 
-        self.lbl_trans = SystemSyncLabel("Glass Opacity:")
-        self.lbl_trans.setCursor(Qt.PointingHandCursor)
-        self._glass_sync_tip = "Double-click to sync from macOS/Windows system appearance."
-        self.lbl_trans.setToolTip(self._glass_sync_tip)
-        self.lbl_trans.systemSyncRequested.connect(self._sync_glass_from_system)
-        g.addWidget(self.lbl_trans, 4, 0)
-        self.s_trans = SystemSyncSlider(45, Qt.Horizontal)
-        self.s_trans.setRange(0, 100)
-        self.s_trans.setToolTip("macOS 27: 0–49 = native Clear glass, 50–100 = native Regular frosted material. macOS has no numeric blur-radius API. Double-click to sync from system.")
-        self.s_trans.valueChanged.connect(self._on_glass)
-        self.s_trans.systemSyncRequested.connect(self._sync_glass_from_system)
-        g.addWidget(self.s_trans, 4, 1)
+        self.lbl_material = SystemSyncLabel("Glass Material:")
+        self.lbl_material.setCursor(Qt.PointingHandCursor)
+        self._glass_sync_tip = "Double-click to sync Automatic from macOS/Windows system appearance."
+        self.lbl_material.setToolTip(self._glass_sync_tip)
+        self.lbl_material.systemSyncRequested.connect(self._sync_glass_from_system)
+        g.addWidget(self.lbl_material, 4, 0)
+        self.combo_glass_material = QComboBox()
+        self.combo_glass_material.addItems([GLASS_MATERIAL_LABELS[m] for m in GLASS_MATERIALS])
+        for i, mode in enumerate(GLASS_MATERIALS):
+            self.combo_glass_material.setItemData(i, mode)
+        self._glass_material_tip = (
+            "macOS 27: Automatic follows system sync; Clear/Default/Dark/Tinted "
+            "are discrete native-style material presets. macOS has no public "
+            "numeric blur-radius API."
+        )
+        self.combo_glass_material.setToolTip(self._glass_material_tip)
+        self.combo_glass_material.currentIndexChanged.connect(self._on_glass)
+        g.addWidget(self.combo_glass_material, 4, 1)
+        self.lbl_trans = self.lbl_material  # legacy name used by older smoke tests
 
         self.lbl_rim = QLabel("Glass Border Rim:")
         g.addWidget(self.lbl_rim, 5, 0)
@@ -2232,9 +2245,14 @@ class SettingsDialog(QDialog):
         self.combo_bg_mode.blockSignals(False)
         self.combo_theme.blockSignals(False)
         for s, val in ((self.s_glow, int(self.mw.ambient_opacity * 100)),
-                       (self.s_trans, self.mw.glass_clarity),
                        (self.s_rim, self.mw.glass_rim)):
             s.blockSignals(True); s.setValue(val); s.blockSignals(False)
+        material_idx = self.combo_glass_material.findData(
+            canonical_glass_material(getattr(self.mw, "glass_material", "automatic"))
+        )
+        self.combo_glass_material.blockSignals(True)
+        self.combo_glass_material.setCurrentIndex(max(0, material_idx))
+        self.combo_glass_material.blockSignals(False)
         self.chk_low_cpu.blockSignals(True)
         self.chk_low_cpu.setChecked(self.mw.engine.low_end_mode)
         self.chk_low_cpu.blockSignals(False)
@@ -2256,16 +2274,18 @@ class SettingsDialog(QDialog):
             self.lbl_scrob_status.setText(f"Connected as {cfg.get('lfm_user') or 'Last.fm user'}")
         is_g = is_glass_theme(self.mw.current_theme)
         self.s_glow.default_value = 30 if is_g else (20 if self.mw.current_theme == "classic" else 30)
-        self.lbl_trans.setEnabled(is_g)
+        self.lbl_material.setEnabled(is_g)
+        self.combo_glass_material.setEnabled(is_g)
         self.lbl_rim.setEnabled(is_g)
-        self.s_trans.setEnabled(is_g)
         self.s_rim.setEnabled(is_g)
         if self.isVisible():
             if is_g:
                 if glass and self._glass_id is None:
                     self._glass_id = glass.apply_glass_to_window(self)
                 if glass:
-                    configure_macos_glass(self, self.mw.current_theme, True, getattr(self.mw, "glass_clarity", 45) / 100.0)
+                    configure_macos_glass(self, self.mw.current_theme, True,
+                                          getattr(self.mw, "glass_clarity", 45) / 100.0,
+                                          material=getattr(self.mw, "glass_material", None))
                 apply_windows_glass(self, True, False)
                 apply_seamless_titlebar(self)
             else:
@@ -2291,11 +2311,18 @@ class SettingsDialog(QDialog):
         self.sync_from_main()
 
     def _on_glass(self, _=None):
-        self.mw.glass_clarity = self.s_trans.value()
+        self.mw.glass_material = canonical_glass_material(self.combo_glass_material.currentData())
+        self.mw.glass_clarity = glass_material_clarity(
+            self.mw.glass_material, getattr(self.mw, "glass_clarity", 45)
+        )
         self.mw.glass_rim = self.s_rim.value()
         if glass and is_glass_theme(self.mw.current_theme):
-            configure_macos_glass(self.mw, self.mw.current_theme, True, self.mw.glass_clarity / 100.0)
-            configure_macos_glass(self, self.mw.current_theme, True, self.mw.glass_clarity / 100.0)
+            configure_macos_glass(self.mw, self.mw.current_theme, True,
+                                  self.mw.glass_clarity / 100.0,
+                                  material=self.mw.glass_material)
+            configure_macos_glass(self, self.mw.current_theme, True,
+                                  self.mw.glass_clarity / 100.0,
+                                  material=self.mw.glass_material)
         self.mw._on_ambient_color_changed(self.mw._current_ambient_color)
         self.mw.save_session_state()
 
@@ -2303,14 +2330,18 @@ class SettingsDialog(QDialog):
         info = read_system_glass_preferences()
         opacity = info.get("suggested_opacity")
         if opacity is not None and is_glass_theme(self.mw.current_theme):
-            self.s_trans.blockSignals(True)
-            self.s_trans.setValue(int(opacity))
-            self.s_trans.blockSignals(False)
+            self.mw.glass_clarity = int(opacity)
+            self.combo_glass_material.blockSignals(True)
+            auto_idx = self.combo_glass_material.findData("automatic")
+            self.combo_glass_material.setCurrentIndex(max(0, auto_idx))
+            self.combo_glass_material.blockSignals(False)
             self._on_glass()
         summary = info.get("summary", "System sync unavailable.")
-        self.lbl_trans.setToolTip(f"{self._glass_sync_tip}\nLast sync: {summary}")
-        self.s_trans.setToolTip(f"Double-click to sync from system.\nLast sync: {summary}")
-        QToolTip.showText(self.lbl_trans.mapToGlobal(QPoint(0, self.lbl_trans.height())), summary, self.lbl_trans)
+        self.lbl_material.setToolTip(f"{self._glass_sync_tip}\nLast sync: {summary}")
+        self.combo_glass_material.setToolTip(
+            f"{self._glass_material_tip}\nLast sync: {summary}"
+        )
+        QToolTip.showText(self.lbl_material.mapToGlobal(QPoint(0, self.lbl_material.height())), summary, self.lbl_material)
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -2385,6 +2416,7 @@ class MainWindow(QMainWindow):
         self.current_accent, self.current_accent_end = "#0a84ff", "#64d2ff"
         self.theme_glow = {"classic": 0.20, "light": 0.30, "liquid_glass": 1.00, "macos27_glass": 1.00}
         self.ambient_opacity = self.theme_glow["liquid_glass"]
+        self.glass_material = "automatic"
         self.glass_clarity = 45
         self.glass_rim = 20
         self.spectrum_fill_enabled = True
@@ -2405,10 +2437,14 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(120, self._deferred_startup)
 
     def _on_glass_tuned(self, _=None):
-        self.glass_clarity = self.slider_glass_clarity.value()
-        self.glass_rim = self.slider_glass_rim.value()
+        # Legacy hook from the old compact slider row; the discrete material
+        # selector lives in SettingsDialog and updates these values directly.
+        if hasattr(self, "slider_glass_rim"):
+            self.glass_rim = self.slider_glass_rim.value()
         if glass and is_glass_theme(self.current_theme):
-            configure_macos_glass(self, self.current_theme, True, self.glass_clarity / 100.0)
+            configure_macos_glass(self, self.current_theme, True,
+                                  self.glass_clarity / 100.0,
+                                  material=getattr(self, "glass_material", None))
         if hasattr(self, 'lava_overlay'): self.lava_overlay.sync_active()
         self._on_ambient_color_changed(self._current_ambient_color)
         self.save_session_state()
@@ -2532,7 +2568,9 @@ class MainWindow(QMainWindow):
             if glass and getattr(self, "glass_effect_id", None) is None:
                 self.glass_effect_id = glass.apply_glass_to_window(self)
             if glass:
-                configure_macos_glass(self, self.current_theme, True, getattr(self, "glass_clarity", 45) / 100.0)
+                configure_macos_glass(self, self.current_theme, True,
+                                      getattr(self, "glass_clarity", 45) / 100.0,
+                                      material=getattr(self, "glass_material", None))
             apply_windows_glass(self, True, False)
             apply_seamless_titlebar(self)
         else:
@@ -2558,7 +2596,8 @@ class MainWindow(QMainWindow):
             accent=getattr(self, 'current_accent', '#0a84ff'), 
             accent_end=getattr(self, 'current_accent_end', '#64d2ff'),
             glass_clarity=self.glass_clarity,
-            glass_rim=self.glass_rim
+            glass_rim=self.glass_rim,
+            glass_material=getattr(self, "glass_material", None)
         ))
         
         # Force layout recalculation and repaint
@@ -2577,7 +2616,7 @@ class MainWindow(QMainWindow):
         self.current_accent, self.current_accent_end = self._get_accent_color(
             color.red(), color.green(), color.blue()
         )
-        self.setStyleSheet(build_liquid_qss(color.red(), color.green(), color.blue(), theme=self.current_theme, ambient_opacity=self.ambient_opacity, accent=self.current_accent, accent_end=self.current_accent_end, glass_clarity=self.glass_clarity, glass_rim=self.glass_rim))
+        self.setStyleSheet(build_liquid_qss(color.red(), color.green(), color.blue(), theme=self.current_theme, ambient_opacity=self.ambient_opacity, accent=self.current_accent, accent_end=self.current_accent_end, glass_clarity=self.glass_clarity, glass_rim=self.glass_rim, glass_material=getattr(self, "glass_material", None)))
         if getattr(self, "_settings_dlg", None) and self._settings_dlg.isVisible():
             self._settings_dlg.setStyleSheet(self.styleSheet())
 
@@ -4844,7 +4883,9 @@ class MainWindow(QMainWindow):
         dlg.setStyleSheet(self.styleSheet())
         if is_glass_theme(self.current_theme) and glass:
             glass.apply_glass_to_window(dlg)
-            configure_macos_glass(dlg, self.current_theme, True, getattr(self, "glass_clarity", 45) / 100.0)
+            configure_macos_glass(dlg, self.current_theme, True,
+                                  getattr(self, "glass_clarity", 45) / 100.0,
+                                  material=getattr(self, "glass_material", None))
         apply_windows_glass(dlg, is_glass_theme(self.current_theme), self.current_theme == "light")
         apply_seamless_titlebar(dlg)
         if getattr(self, "_props_dlg", None) is not None:
@@ -5006,6 +5047,7 @@ class MainWindow(QMainWindow):
                 "theme": getattr(self, "current_theme", "liquid_glass"),
                 "ambient_opacity": getattr(self, "ambient_opacity", 0.30),
                 "theme_glow": getattr(self, "theme_glow", {"classic": 0.20, "light": 0.30, "liquid_glass": 1.00, "macos27_glass": 1.00}),
+                "glass_material": getattr(self, "glass_material", "automatic"),
                 "glass_clarity": getattr(self, "glass_clarity", 45),
                 "glass_rim": getattr(self, "glass_rim", 20),
                 "low_end_mode": self.engine.low_end_mode,
@@ -5053,7 +5095,14 @@ class MainWindow(QMainWindow):
             if isinstance(saved_glow, dict):
                 self.theme_glow.update({k: float(v) for k, v in saved_glow.items() if k in self.theme_glow})
             self.ambient_opacity = self.theme_glow.get(theme, float(state.get("ambient_opacity", 1.0 if is_glass_theme(theme) else 0.30)))
-            self.glass_clarity = int(state.get("glass_clarity", 45))
+            legacy_clarity = int(state.get("glass_clarity", 45))
+            self.glass_clarity = legacy_clarity
+            if "glass_material" in state:
+                self.glass_material = canonical_glass_material(state.get("glass_material"))
+            else:
+                # Old sessions only have the numeric slider; infer the closest
+                # preset but keep their original numeric look.
+                self.glass_material = material_from_opacity(legacy_clarity / 100.0)
             self.glass_rim = int(state.get("glass_rim", 20))
             if hasattr(self, "slider_glass_clarity"):
                 self.slider_glass_clarity.blockSignals(True); self.slider_glass_clarity.setValue(self.glass_clarity); self.slider_glass_clarity.blockSignals(False)
@@ -5200,7 +5249,8 @@ class MainWindow(QMainWindow):
                     current_color.red(), current_color.green(), current_color.blue(),
                     theme=self.current_theme, ambient_opacity=self.ambient_opacity,
                     accent=self.current_accent, accent_end=self.current_accent_end,
-                    glass_clarity=self.glass_clarity, glass_rim=self.glass_rim
+                    glass_clarity=self.glass_clarity, glass_rim=self.glass_rim,
+                    glass_material=getattr(self, "glass_material", None)
                 ))
                 
                 self.ambient_anim.start()
@@ -5282,7 +5332,9 @@ if __name__ == "__main__":
         if glass and getattr(window, "glass_effect_id", None) is None:
             window.glass_effect_id = glass.apply_glass_to_window(window)
         if glass:
-            configure_macos_glass(window, window.current_theme, True, getattr(window, "glass_clarity", 45) / 100.0)
+            configure_macos_glass(window, window.current_theme, True,
+                                  getattr(window, "glass_clarity", 45) / 100.0,
+                                  material=getattr(window, "glass_material", None))
         apply_windows_glass(window, True, False)
         c = window._current_ambient_color
         window.setStyleSheet(build_liquid_qss(
@@ -5292,7 +5344,8 @@ if __name__ == "__main__":
             accent=window.current_accent,
             accent_end=window.current_accent_end,
             glass_clarity=window.glass_clarity,
-            glass_rim=window.glass_rim
+            glass_rim=window.glass_rim,
+            glass_material=getattr(window, "glass_material", None)
         ))
     apply_seamless_titlebar(window)
     window.raise_()

@@ -22,16 +22,88 @@ def windows_transparency_enabled():
 
 
 def glass_opacity_state(opacity):
-    """Map 0..1 opacity to a native material state plus local 0..1 progress.
+    """Split 0..1 opacity into native Clear/Regular state + local progress.
 
-    macOS only exposes Clear and Regular materials; there is no public
-    numeric blur-radius API. Below 0.5 stays Clear, at/above 0.5 switches to
-    Regular so the slider produces a real material/frost change.
+    macOS only exposes Clear and Regular materials publicly; there is no
+    numeric blur-radius API. Kept for legacy numeric sessions and Windows.
     """
     o = max(0.0, min(1.0, float(opacity if opacity is not None else 0.0)))
     if o < 0.5:
         return "clear", o / 0.5
     return "frosted", (o - 0.5) / 0.5
+
+
+GLASS_MATERIALS = ("automatic", "default", "dark", "clear", "tinted")
+GLASS_MATERIAL_LABELS = {
+    "automatic": "Automatic",
+    "default": "Default",
+    "dark": "Dark",
+    "clear": "Clear",
+    "tinted": "Tinted",
+}
+
+# AppKit only exposes Clear/Regular materials. These are the closest public
+# mappings for the native-looking mode names; they are not private API reads.
+_GLASS_MATERIAL_PROFILES = {
+    "automatic": {"opacity": 0.45, "style": "clear", "tint_alpha": 0.035,
+                  "tint_rgb": (0.08, 0.08, 0.09)},
+    "default": {"opacity": 0.58, "style": "regular", "tint_alpha": 0.07,
+                "tint_rgb": (0.08, 0.08, 0.09)},
+    "dark": {"opacity": 0.86, "style": "regular", "tint_alpha": 0.20,
+             "tint_rgb": (0.06, 0.06, 0.07)},
+    "clear": {"opacity": 0.08, "style": "clear", "tint_alpha": 0.02,
+              "tint_rgb": (0.08, 0.08, 0.09)},
+    "tinted": {"opacity": 0.22, "style": "clear", "tint_alpha": 0.09,
+               "tint_rgb": (0.12, 0.11, 0.15)},
+}
+
+
+def canonical_glass_material(material):
+    key = str(material or "").strip().lower()
+    return key if key in GLASS_MATERIALS else "automatic"
+
+
+def glass_material_profile(material, opacity=None):
+    """Return the public native mapping for a discrete Glass Material mode.
+
+    ``automatic`` follows the last system-synced opacity; explicit modes use
+    fixed material/tint profiles so the selector behaves like native presets.
+    """
+    key = canonical_glass_material(material)
+    if key == "automatic":
+        o = max(0.0, min(1.0, float(opacity if opacity is not None else 0.45)))
+        state, local = glass_opacity_state(o)
+        if state == "clear":
+            tint_alpha = 0.02 + 0.05 * local
+        else:
+            tint_alpha = 0.07 + 0.23 * local
+        return {
+            "material": key, "opacity": o, "style": "clear" if state == "clear" else "regular",
+            "tint_alpha": tint_alpha, "tint_rgb": (0.08, 0.08, 0.09),
+        }
+    profile = dict(_GLASS_MATERIAL_PROFILES[key])
+    profile["material"] = key
+    return profile
+
+
+def glass_material_clarity(material, fallback=45):
+    """Return the persisted numeric clarity for a discrete mode."""
+    key = canonical_glass_material(material)
+    if key == "automatic":
+        try:
+            return int(max(0, min(100, int(fallback))))
+        except (TypeError, ValueError):
+            return 45
+    return int(round(_GLASS_MATERIAL_PROFILES[key]["opacity"] * 100))
+
+
+def material_from_opacity(opacity):
+    """Infer a discrete mode from a legacy/system numeric opacity."""
+    o = max(0.0, min(1.0, float(opacity if opacity is not None else 0.45)))
+    state, _ = glass_opacity_state(o)
+    if state == "clear":
+        return "clear"
+    return "dark" if o >= 0.8 else "default"
 
 
 def _sample_wallpaper_luminance():
@@ -63,10 +135,10 @@ def _sample_wallpaper_luminance():
 
 
 def read_system_glass_preferences():
-    """Best-effort mapping from OS appearance settings to Glass Opacity.
+    """Best-effort mapping from OS appearance settings to Glass Material.
 
-    macOS does not expose the exact Default/Dark/Clear/Tinted choice publicly,
-    so we combine the public signals: effective appearance, Reduce
+    macOS does not expose the exact Automatic/Default/Dark/Clear/Tinted choice
+    publicly, so we combine public signals: effective appearance, Reduce
     Transparency, and wallpaper luminance. Windows uses registry values.
     """
     info = {
@@ -76,6 +148,7 @@ def read_system_glass_preferences():
         "reduce_transparency": None,
         "wallpaper_luminance": None,
         "suggested_opacity": None,
+        "suggested_material": None,
         "summary": "System glass sync is available on macOS and Windows only.",
     }
 
@@ -102,11 +175,22 @@ def read_system_glass_preferences():
             luma = _sample_wallpaper_luminance()
             if reduce:
                 opacity = 100
+                material = "dark"
             else:
                 base = 50 if dark else 38
                 spread = 28 if dark else 32
                 opacity = int(round(base + spread * (0.5 if luma is None else luma)))
                 opacity = max(12, min(94, opacity))
+                if auto:
+                    material = "automatic"
+                elif dark:
+                    material = "dark"
+                elif luma is not None and luma >= 0.55:
+                    material = "clear"
+                elif luma is not None and luma <= 0.25:
+                    material = "tinted"
+                else:
+                    material = "default"
 
             appearance_label = ("Dark" if dark else "Light") + (" (Auto)" if auto else "")
             parts = [
@@ -115,17 +199,20 @@ def read_system_glass_preferences():
             ]
             if luma is not None:
                 parts.append(f"wallpaper {int(luma * 100)}%")
-            parts.append(f"→ Glass Opacity {opacity}%")
+            parts.append(
+                f"→ Glass Material {GLASS_MATERIAL_LABELS[material]} (approx, {opacity}%)"
+            )
             info.update({
                 "available": True,
                 "appearance": "dark" if dark else "light",
                 "reduce_transparency": reduce,
                 "wallpaper_luminance": luma,
                 "suggested_opacity": opacity,
+                "suggested_material": material,
                 "summary": " · ".join(parts),
             })
         except Exception:
-            info["summary"] = "Could not read macOS appearance; kept current Glass Opacity."
+            info["summary"] = "Could not read macOS appearance; kept current Glass Material."
     elif sys.platform == "win32":
         try:
             import winreg
@@ -143,20 +230,22 @@ def read_system_glass_preferences():
                     transparent = False
 
             opacity = 100 if not transparent else (68 if dark else 48)
+            material = "dark" if (not transparent or dark) else "default"
             parts = [
                 f"Windows {'Dark' if dark else 'Light'}",
                 f"Transparency {'On' if transparent else 'Off'}",
-                f"→ Glass Opacity {opacity}%",
+                f"→ Glass Material {GLASS_MATERIAL_LABELS[material]} (approx, {opacity}%)",
             ]
             info.update({
                 "available": True,
                 "appearance": "dark" if dark else "light",
                 "reduce_transparency": not transparent,
                 "suggested_opacity": opacity,
+                "suggested_material": material,
                 "summary": " · ".join(parts),
             })
         except Exception:
-            info["summary"] = "Could not read Windows theme; kept current Glass Opacity."
+            info["summary"] = "Could not read Windows theme; kept current Glass Material."
 
     return info
 
@@ -197,14 +286,15 @@ def apply_windows_glass(window, enable=True, light_titlebar=False):
     except Exception:
         pass
 
-def configure_macos_glass(window, theme="macos27_glass", enable=True, opacity=None):
-    """Match the native glass material to the selected theme and opacity.
+def configure_macos_glass(window, theme="macos27_glass", enable=True, opacity=None,
+                          material=None):
+    """Match the native glass material to the selected theme and mode.
 
-    ``macos27_glass`` uses the native Clear material with DarkAqua appearance:
-    that is the gentle, neutral blur seen in macOS Settings/Control Center.
-    ``opacity`` below 0.5 selects the native Clear material; 0.5+ selects the
-    denser Regular material. Tint and a small QSS veil scale within each state.
-    The native view stays at full alpha so AppKit keeps rendering the material.
+    ``macos27_glass`` uses DarkAqua appearance and the public Clear/Regular
+    material selected by ``Glass Material``. Original ``Glass`` keeps the
+    denser Regular + VibrantDark look. ``opacity`` is only a fallback for old
+    numeric sessions and for Automatic mode's last system sync. The native
+    view stays at full alpha so AppKit keeps rendering the material.
     """
     if sys.platform != "darwin":
         return
@@ -218,11 +308,14 @@ def configure_macos_glass(window, theme="macos27_glass", enable=True, opacity=No
             NSGlassEffectViewStyleClear, NSGlassEffectViewStyleRegular = 1, 0
         from pyqt_liquidglass._bridge import get_nswindow_from_widget
 
+        is_m27 = theme == "macos27_glass"
+        profile = glass_material_profile(material, opacity) if is_m27 else None
+
         ns_window = get_nswindow_from_widget(window)
         if ns_window is not None:
             if not enable:
                 ns_window.setAppearance_(None)
-            elif theme == "macos27_glass":
+            elif is_m27:
                 # DarkAqua is the less-vibrant dark used by macOS Settings.
                 # VibrantDark made REXA read brighter/bluer than the panels
                 # in the user's references.
@@ -230,13 +323,11 @@ def configure_macos_glass(window, theme="macos27_glass", enable=True, opacity=No
             else:
                 ns_window.setAppearance_(NSAppearance.appearanceNamed_(NSAppearanceNameVibrantDark))
 
-        state, local = glass_opacity_state(opacity)
         glass_view = getattr(window, "_glass_view", None)
         if glass_view is not None and hasattr(glass_view, "setStyle_"):
-            # Below 50% use the gentle Clear material; 50%+ switches to the
-            # denser Regular material. That is the only real public blur/frost
-            # change NSGlassEffectView offers. Original Glass stays Regular.
-            use_clear = enable and theme == "macos27_glass" and state == "clear"
+            # Clear is the gentle material; Regular is denser/frosted. These
+            # are the only public blur/frost states NSGlassEffectView offers.
+            use_clear = enable and profile is not None and profile["style"] == "clear"
             glass_view.setStyle_(
                 NSGlassEffectViewStyleClear if use_clear
                 else NSGlassEffectViewStyleRegular
@@ -246,22 +337,22 @@ def configure_macos_glass(window, theme="macos27_glass", enable=True, opacity=No
             # leave a square edge / cut-off line under the QSS panels.
             glass_view.setCornerRadius_(14.0 if enable else 0.0)
         if glass_view is not None and hasattr(glass_view, "setTintColor_"):
-            # Keep tint subtle; the visible change now comes from the native
-            # material switch above, not from a dark QSS overlay.
-            if enable and theme == "macos27_glass" and opacity is not None:
-                tint_alpha = (0.02 + 0.05 * local) if state == "clear" else (0.07 + 0.23 * local)
+            if enable and profile is not None:
+                tr, tg, tb = profile["tint_rgb"]
+                tint_alpha = profile["tint_alpha"]
             else:
+                tr = tg = tb = 0.08
                 tint_alpha = 0.0
             glass_view.setTintColor_(
                 NSColor.colorWithCalibratedRed_green_blue_alpha_(
-                    0.08, 0.08, 0.09, tint_alpha
+                    tr, tg, tb, tint_alpha
                 )
             )
         if glass_view is not None and hasattr(glass_view, "setNeedsDisplay_"):
             glass_view.setNeedsDisplay_(True)
         # Do NOT lower NSGlassEffectView.alphaValue: AppKit then stops showing
         # the material and the window looks flat. Keep the native view at full
-        # strength; opacity is expressed through tintColor + a small QSS veil.
+        # strength; modes are expressed through material + tint + QSS veil.
         if glass_view is not None and hasattr(glass_view, "setAlphaValue_"):
             glass_view.setAlphaValue_(1.0)
     except Exception:
@@ -353,7 +444,7 @@ def sample_ambient_rgb(pixmap):
             
     return (best_rgb[0], best_rgb[1], best_rgb[2])
 
-def build_liquid_qss(r=26, g=36, b=58, glass_pct=50, theme="classic", ambient_opacity=0.3, accent="#0a84ff", accent_end="#64d2ff", glass_clarity=45, glass_rim=20):
+def build_liquid_qss(r=26, g=36, b=58, glass_pct=50, theme="classic", ambient_opacity=0.3, accent="#0a84ff", accent_end="#64d2ff", glass_clarity=45, glass_rim=20, glass_material=None):
     def hex_to_rgb(h):
         h = h.lstrip('#')
         return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
@@ -373,8 +464,10 @@ def build_liquid_qss(r=26, g=36, b=58, glass_pct=50, theme="classic", ambient_op
         # QSS only adds a thin veil and rim so the backdrop stays visible
         # instead of being buried under an opaque dark gradient.
         if is_m27:
-            # Native material switch (Clear -> Regular) is in
-            # configure_macos_glass(); QSS only adds a small matching veil.
+            # Native material/tint comes from configure_macos_glass(); QSS
+            # adds only a small veil matching the discrete Glass Material.
+            profile = glass_material_profile(glass_material, c_f)
+            c_f = profile["opacity"]
             state, local = glass_opacity_state(c_f)
             text_color = "#f5f5f7"
             secondary_text = "rgba(235, 235, 240, 190)"
