@@ -2024,7 +2024,7 @@ class SettingsDialog(QDialog):
         g.addWidget(self.lbl_trans, 4, 0)
         self.s_trans = SystemSyncSlider(45, Qt.Horizontal)
         self.s_trans.setRange(0, 100)
-        self.s_trans.setToolTip("macOS 27: lower = clear native glass, higher = frostier native tint (blur radius stays native). Double-click to sync from system.")
+        self.s_trans.setToolTip("macOS 27: 0–49 = native Clear glass, 50–100 = native Regular frosted material. macOS has no numeric blur-radius API. Double-click to sync from system.")
         self.s_trans.valueChanged.connect(self._on_glass)
         self.s_trans.systemSyncRequested.connect(self._sync_glass_from_system)
         g.addWidget(self.s_trans, 4, 1)

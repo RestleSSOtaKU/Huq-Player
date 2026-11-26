@@ -31,10 +31,10 @@
   - keeps `NSGlassEffectView.alphaValue = 1.0` — lowering it suppresses the material and makes the window flat; the slider varies the QSS veil instead,
   - sets a `14pt` corner radius and calls `setNeedsDisplay_` after style changes,
   - restores the default appearance/alpha/style when leaving glass themes.
-- `Glass Opacity` now drives the native material tint, not just a QSS dimmer. `setTintColor_` uses a neutral dark color with alpha `0.02 + 0.34 * opacity`; `alphaValue` remains `1.0`. macOS has no public blur-radius API, so the slider changes frost/tint strength while the native Clear blur radius stays fixed.
-- `macos27_glass` QSS is now a **thin dark veil** over the native Clear material, with a wide range driven by `glass_clarity` (`Glass Opacity` 0–100):
-  - card fill `rgba(26,26,28,6→126)`,
-  - list fill `rgba(20,20,22,4→114)`,
+- `Glass Opacity` now switches the **actual native material**: `<50` uses `NSGlassEffectViewStyleClear (1)`, `>=50` uses `NSGlassEffectViewStyleRegular (0)`. Subtle `tintColor` and QSS veil scale inside each state. `alphaValue` remains `1.0`. macOS has no public blur-radius API, so the slider is a real material/frost switch, not a smooth radius control.
+- `macos27_glass` QSS is now a **thin dark veil** matched to that native state:
+  - card fill `rgba(26,26,28,6→36)` in Clear state, `36→146` in Regular/frosted state,
+  - list fill `rgba(20,20,22,4→30)` in Clear state, `30→130` in frosted state,
   - white text (`#f5f5f7`), thin white rim, dark combo popup, white spectrum axis labels,
   - main window/settings root are fully transparent so no square gradient layer cuts across the rounded native glass corners,
   - ambient/lava overlay is static (no timer) and much fainter in `macos27_glass` (`peak alpha 0.015 * glow`, no dither tile) so it does not muddy the native blur.

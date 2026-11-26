@@ -21,6 +21,19 @@ def windows_transparency_enabled():
         return False
 
 
+def glass_opacity_state(opacity):
+    """Map 0..1 opacity to a native material state plus local 0..1 progress.
+
+    macOS only exposes Clear and Regular materials; there is no public
+    numeric blur-radius API. Below 0.5 stays Clear, at/above 0.5 switches to
+    Regular so the slider produces a real material/frost change.
+    """
+    o = max(0.0, min(1.0, float(opacity if opacity is not None else 0.0)))
+    if o < 0.5:
+        return "clear", o / 0.5
+    return "frosted", (o - 0.5) / 0.5
+
+
 def _sample_wallpaper_luminance():
     """Return main wallpaper luminance in 0..1, or None if unavailable."""
     if sys.platform != "darwin":
@@ -189,8 +202,9 @@ def configure_macos_glass(window, theme="macos27_glass", enable=True, opacity=No
 
     ``macos27_glass`` uses the native Clear material with DarkAqua appearance:
     that is the gentle, neutral blur seen in macOS Settings/Control Center.
-    ``opacity`` drives the native material tint and a small QSS veil. The
-    native view stays at full alpha so AppKit keeps rendering the material.
+    ``opacity`` below 0.5 selects the native Clear material; 0.5+ selects the
+    denser Regular material. Tint and a small QSS veil scale within each state.
+    The native view stays at full alpha so AppKit keeps rendering the material.
     """
     if sys.platform != "darwin":
         return
@@ -216,12 +230,15 @@ def configure_macos_glass(window, theme="macos27_glass", enable=True, opacity=No
             else:
                 ns_window.setAppearance_(NSAppearance.appearanceNamed_(NSAppearanceNameVibrantDark))
 
+        state, local = glass_opacity_state(opacity)
         glass_view = getattr(window, "_glass_view", None)
         if glass_view is not None and hasattr(glass_view, "setStyle_"):
-            # Regular is the dense/mushy material. macOS Settings panels use
-            # Clear; keep Original Glass on Regular so its UI stays readable.
+            # Below 50% use the gentle Clear material; 50%+ switches to the
+            # denser Regular material. That is the only real public blur/frost
+            # change NSGlassEffectView offers. Original Glass stays Regular.
+            use_clear = enable and theme == "macos27_glass" and state == "clear"
             glass_view.setStyle_(
-                NSGlassEffectViewStyleClear if (enable and theme == "macos27_glass")
+                NSGlassEffectViewStyleClear if use_clear
                 else NSGlassEffectViewStyleRegular
             )
         if glass_view is not None and hasattr(glass_view, "setCornerRadius_"):
@@ -229,13 +246,10 @@ def configure_macos_glass(window, theme="macos27_glass", enable=True, opacity=No
             # leave a square edge / cut-off line under the QSS panels.
             glass_view.setCornerRadius_(14.0 if enable else 0.0)
         if glass_view is not None and hasattr(glass_view, "setTintColor_"):
-            # NSGlassEffectView has no public blur-radius property. The native
-            # Clear material supplies the blur; tint alpha is the closest
-            # public equivalent to macOS' clear -> frosted range. Unlike
-            # alphaValue, tintColor does not suppress the material.
+            # Keep tint subtle; the visible change now comes from the native
+            # material switch above, not from a dark QSS overlay.
             if enable and theme == "macos27_glass" and opacity is not None:
-                o = max(0.0, min(1.0, float(opacity)))
-                tint_alpha = 0.02 + 0.34 * o
+                tint_alpha = (0.02 + 0.05 * local) if state == "clear" else (0.07 + 0.23 * local)
             else:
                 tint_alpha = 0.0
             glass_view.setTintColor_(
@@ -359,20 +373,23 @@ def build_liquid_qss(r=26, g=36, b=58, glass_pct=50, theme="classic", ambient_op
         # QSS only adds a thin veil and rim so the backdrop stays visible
         # instead of being buried under an opaque dark gradient.
         if is_m27:
-            # Dark native Clear material with a real clear -> frosted range.
-            # Glass Opacity (c_f) drives native tintColor (configure_macos_glass)
-            # plus this small QSS veil; the native view stays at full alpha.
+            # Native material switch (Clear -> Regular) is in
+            # configure_macos_glass(); QSS only adds a small matching veil.
+            state, local = glass_opacity_state(c_f)
             text_color = "#f5f5f7"
             secondary_text = "rgba(235, 235, 240, 190)"
-            # Keep the veil thin: native tintColor now carries most of the
-            # clear -> frosted range, so QSS must not just dim everything.
-            card_a = int(6 + 120 * c_f)
+            if state == "clear":
+                card_a = int(6 + 30 * local)
+                list_a = int(4 + 26 * local)
+            else:
+                card_a = int(36 + 110 * local)
+                list_a = int(30 + 100 * local)
             rim_a = int(10 + 46 * r_f)
             btn_a = int(18 + 170 * r_f)
             card_bg = f"rgba(26, 26, 28, {card_a})"
             card_hi = f"rgba(255, 255, 255, {rim_a})"
             card_lo = card_hi
-            list_bg = f"rgba(20, 20, 22, {int(4 + 110 * c_f)})"
+            list_bg = f"rgba(20, 20, 22, {list_a})"
             input_bg = f"rgba(255, 255, 255, {int(18 + 160 * r_f)})"
             btn_bg = f"rgba(255, 255, 255, {btn_a})"
             slider_bg = "rgba(255, 255, 255, 46)"
