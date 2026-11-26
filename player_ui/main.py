@@ -102,11 +102,11 @@ def _fast_sosfilt(sos, x):
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                                QHBoxLayout, QPushButton, QSlider, QLabel, 
                                QFileDialog, QCheckBox, QSpinBox, QMessageBox,
-                               QComboBox, QListWidget, QListWidgetItem, QSplitter, QLineEdit, QStyledItemDelegate, QStyle, QStyleOptionViewItem, QAbstractItemView)
-from PySide6.QtCore import Qt, QTimer, Signal, QObject, QThread, QSize, QEvent, QVariantAnimation, QEasingCurve, QPointF
+                               QComboBox, QListWidget, QListWidgetItem, QSplitter, QLineEdit, QStyledItemDelegate, QStyle, QStyleOptionViewItem, QAbstractItemView, QToolTip)
+from PySide6.QtCore import Qt, QTimer, Signal, QObject, QThread, QSize, QEvent, QVariantAnimation, QEasingCurve, QPointF, QPoint
 from PySide6.QtGui import QPixmap, QIcon, QColor, QPainter, QPalette
 from dsp_bridge import RustDspBridge
-from liquid_glass import make_glass_card, sample_ambient_rgb, sample_ambient_palette, LavaLampOverlay, build_liquid_qss, apply_seamless_titlebar, apply_windows_glass, configure_macos_glass, windows_transparency_enabled, WindowDragFilter
+from liquid_glass import make_glass_card, sample_ambient_rgb, sample_ambient_palette, LavaLampOverlay, build_liquid_qss, apply_seamless_titlebar, apply_windows_glass, configure_macos_glass, windows_transparency_enabled, read_system_glass_preferences, WindowDragFilter
 from glass_lens import GlassLensOverlay
 
 GLASS_THEMES = ("liquid_glass", "macos27_glass")
@@ -180,6 +180,26 @@ class ResetSlider(QSlider):
             event.accept()
         else:
             super().mouseDoubleClickEvent(event)
+
+class SystemSyncLabel(QLabel):
+    systemSyncRequested = Signal()
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.systemSyncRequested.emit()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
+class SystemSyncSlider(ResetSlider):
+    systemSyncRequested = Signal()
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.systemSyncRequested.emit()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
 
 class ClickSeekSlider(QSlider):
     def mousePressEvent(self, event):
@@ -1996,13 +2016,17 @@ class SettingsDialog(QDialog):
         self.s_glow.valueChanged.connect(mw.update_ambient_opacity)
         g.addWidget(self.s_glow, 3, 1)
 
-        self.lbl_trans = QLabel("Glass Opacity:")
-        self.lbl_trans.setToolTip("Raise to add more tint; lower to let the native macOS glass show through.")
+        self.lbl_trans = SystemSyncLabel("Glass Opacity:")
+        self.lbl_trans.setCursor(Qt.PointingHandCursor)
+        self._glass_sync_tip = "Double-click to sync from macOS/Windows system appearance."
+        self.lbl_trans.setToolTip(self._glass_sync_tip)
+        self.lbl_trans.systemSyncRequested.connect(self._sync_glass_from_system)
         g.addWidget(self.lbl_trans, 4, 0)
-        self.s_trans = ResetSlider(45, Qt.Horizontal)
+        self.s_trans = SystemSyncSlider(45, Qt.Horizontal)
         self.s_trans.setRange(0, 100)
-        self.s_trans.setToolTip("macOS 27: lower = clear glass, higher = frosted/opaque. Original Glass: lower = native blur, higher = stronger tint.")
+        self.s_trans.setToolTip("macOS 27: lower = clear glass, higher = frosted/opaque. Double-click to sync from system.")
         self.s_trans.valueChanged.connect(self._on_glass)
+        self.s_trans.systemSyncRequested.connect(self._sync_glass_from_system)
         g.addWidget(self.s_trans, 4, 1)
 
         self.lbl_rim = QLabel("Glass Border Rim:")
@@ -2274,6 +2298,19 @@ class SettingsDialog(QDialog):
             configure_macos_glass(self, self.mw.current_theme, True, self.mw.glass_clarity / 100.0)
         self.mw._on_ambient_color_changed(self.mw._current_ambient_color)
         self.mw.save_session_state()
+
+    def _sync_glass_from_system(self):
+        info = read_system_glass_preferences()
+        opacity = info.get("suggested_opacity")
+        if opacity is not None and is_glass_theme(self.mw.current_theme):
+            self.s_trans.blockSignals(True)
+            self.s_trans.setValue(int(opacity))
+            self.s_trans.blockSignals(False)
+            self._on_glass()
+        summary = info.get("summary", "System sync unavailable.")
+        self.lbl_trans.setToolTip(f"{self._glass_sync_tip}\nLast sync: {summary}")
+        self.s_trans.setToolTip(f"Double-click to sync from system.\nLast sync: {summary}")
+        QToolTip.showText(self.lbl_trans.mapToGlobal(QPoint(0, self.lbl_trans.height())), summary, self.lbl_trans)
 
 class MainWindow(QMainWindow):
     def __init__(self):

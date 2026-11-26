@@ -41,8 +41,15 @@
 - Cover lens pill is hidden in `macos27_glass` and never renders the accent-gradient fallback.
 - Offscreen tests pass: theme switching, settings combo, dark QSS values, neutral accent at zero glow, lens visibility rules.
 
+### Manual system-glass sync (new)
+- Double-click **Glass Opacity:** or its slider in Settings to call `read_system_glass_preferences()` in `player_ui/liquid_glass.py` and set `glass_clarity` from the OS.
+- macOS mapping (public APIs only): effective `NSApp.effectiveAppearance`, `AppleInterfaceStyle` + `AppleInterfaceStyleSwitchesAutomatically`, `NSWorkspace.accessibilityDisplayShouldReduceTransparency()`, and main wallpaper luminance (QImage can read macOS HEIC wallpapers in this environment). Reduce Transparency On → `100`; otherwise light/dark base plus wallpaper brightness → `12..94`.
+- Windows mapping: registry `AppsUseLightTheme` + `EnableTransparency`. Transparency Off → `100`; On → `68` for dark, `48` for light. The existing DWM acrylic path already gives a native glass layer on Windows 11; the QSS veil supplies the clear→frosted range on every platform.
+- macOS does **not** publicly expose the exact `Automatic / Default / Dark / Clear / Tinted` choice. The double-click sync is an explicit approximation and shows the detected signals in a tooltip. Android is paused/experimental; it uses the in-app slider only until desktop parity work resumes.
+- Offscreen tests pass: helper returns a macOS suggestion, `SettingsDialog` slider updates from it, and both label/slider double-click events emit the sync signal.
+
 ### Still unresolved
-- User is testing the dark clear→frosted range now. If it is still not matching the references, next suspects are: `NSGlassEffectView` needing `setTintColor_` / custom `contentStyle`, or the native view alpha not being honored on this macOS build. More reference screenshots with picture backgrounds are welcome.
+- User is testing the dark clear→frosted range now. If it is still not matching the references, next suspects are: `NSGlassEffectView` needing `setTintColor_` / custom `contentStyle`, or material tint not following the system’s exact Clear/Tinted choice. More reference screenshots with picture backgrounds are welcome.
 - Earlier REXA screenshot was whiteish (`mean ≈ [159,160,163]`); reference panels are dark (`mean ≈ [26–41]`).
 
 ## Important constraints / gotchas

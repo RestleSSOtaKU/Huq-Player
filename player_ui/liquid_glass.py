@@ -1,4 +1,4 @@
-import sys, time, ctypes
+import os, sys, time, ctypes
 from PySide6.QtWidgets import (QFrame, QAbstractButton, QAbstractSlider, QComboBox,
                                QLineEdit, QAbstractSpinBox, QAbstractItemView, QScrollBar)
 from PySide6.QtCore import QObject, QEvent, Qt, QTimer, QRect
@@ -19,6 +19,133 @@ def windows_transparency_enabled():
             return bool(val)
     except Exception:
         return False
+
+
+def _sample_wallpaper_luminance():
+    """Return main wallpaper luminance in 0..1, or None if unavailable."""
+    if sys.platform != "darwin":
+        return None
+    try:
+        from AppKit import NSWorkspace, NSScreen
+
+        ws = NSWorkspace.sharedWorkspace()
+        screen = NSScreen.mainScreen()
+        url = ws.desktopImageURLForScreen_(screen) if screen else None
+        path = url.path() if url else None
+        if not path or not os.path.exists(path):
+            return None
+
+        img = QImage(path)
+        if img.isNull():
+            return None
+        img = img.scaled(24, 24).convertToFormat(QImage.Format_RGB32)
+        total = 0.0
+        for y in range(24):
+            for x in range(24):
+                c = img.pixelColor(x, y)
+                total += 0.299 * c.red() + 0.587 * c.green() + 0.114 * c.blue()
+        return max(0.0, min(1.0, total / (24 * 24 * 255.0)))
+    except Exception:
+        return None
+
+
+def read_system_glass_preferences():
+    """Best-effort mapping from OS appearance settings to Glass Opacity.
+
+    macOS does not expose the exact Default/Dark/Clear/Tinted choice publicly,
+    so we combine the public signals: effective appearance, Reduce
+    Transparency, and wallpaper luminance. Windows uses registry values.
+    """
+    info = {
+        "available": False,
+        "platform": sys.platform,
+        "appearance": "unknown",
+        "reduce_transparency": None,
+        "wallpaper_luminance": None,
+        "suggested_opacity": None,
+        "summary": "System glass sync is available on macOS and Windows only.",
+    }
+
+    if sys.platform == "darwin":
+        try:
+            from AppKit import NSWorkspace, NSUserDefaults, NSApp
+
+            ws = NSWorkspace.sharedWorkspace()
+            reduce = bool(ws.accessibilityDisplayShouldReduceTransparency())
+            defaults = NSUserDefaults.standardUserDefaults()
+            style = str(defaults.stringForKey_("AppleInterfaceStyle") or "")
+            auto = bool(defaults.boolForKey_("AppleInterfaceStyleSwitchesAutomatically"))
+            dark = style.lower() == "dark"
+            try:
+                if NSApp is not None and hasattr(NSApp, "effectiveAppearance"):
+                    name = str(NSApp.effectiveAppearance().name())
+                    if "Dark" in name:
+                        dark = True
+                    elif "Aqua" in name or "Light" in name:
+                        dark = False
+            except Exception:
+                pass
+
+            luma = _sample_wallpaper_luminance()
+            if reduce:
+                opacity = 100
+            else:
+                base = 50 if dark else 38
+                spread = 28 if dark else 32
+                opacity = int(round(base + spread * (0.5 if luma is None else luma)))
+                opacity = max(12, min(94, opacity))
+
+            appearance_label = ("Dark" if dark else "Light") + (" (Auto)" if auto else "")
+            parts = [
+                f"macOS {appearance_label}",
+                f"Reduce Transparency {'On' if reduce else 'Off'}",
+            ]
+            if luma is not None:
+                parts.append(f"wallpaper {int(luma * 100)}%")
+            parts.append(f"→ Glass Opacity {opacity}%")
+            info.update({
+                "available": True,
+                "appearance": "dark" if dark else "light",
+                "reduce_transparency": reduce,
+                "wallpaper_luminance": luma,
+                "suggested_opacity": opacity,
+                "summary": " · ".join(parts),
+            })
+        except Exception:
+            info["summary"] = "Could not read macOS appearance; kept current Glass Opacity."
+    elif sys.platform == "win32":
+        try:
+            import winreg
+
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize") as k:
+                try:
+                    val, _ = winreg.QueryValueEx(k, "AppsUseLightTheme")
+                    dark = int(val) == 0
+                except OSError:
+                    dark = False
+                try:
+                    val, _ = winreg.QueryValueEx(k, "EnableTransparency")
+                    transparent = bool(int(val))
+                except OSError:
+                    transparent = False
+
+            opacity = 100 if not transparent else (68 if dark else 48)
+            parts = [
+                f"Windows {'Dark' if dark else 'Light'}",
+                f"Transparency {'On' if transparent else 'Off'}",
+                f"→ Glass Opacity {opacity}%",
+            ]
+            info.update({
+                "available": True,
+                "appearance": "dark" if dark else "light",
+                "reduce_transparency": not transparent,
+                "suggested_opacity": opacity,
+                "summary": " · ".join(parts),
+            })
+        except Exception:
+            info["summary"] = "Could not read Windows theme; kept current Glass Opacity."
+
+    return info
 
 def apply_windows_glass(window, enable=True, light_titlebar=False):
     if sys.platform != "win32":
